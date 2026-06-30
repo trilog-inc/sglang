@@ -174,6 +174,11 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG DEEPEP_COMMIT
 ARG TRITON_LANG_COMMIT
 ARG GITHUB_ARTIFACTORY
+ARG DEEPGEMM_SOURCE_REPO
+ARG DEEPGEMM_SOURCE_REF=2073ddb2814892014c33ef4cd1c7d4c148baf1fe
+ARG FLASHINFER_SOURCE_REPO
+ARG FLASHINFER_SOURCE_REF=5f2bdc41f9ffecef9d8ed590e688e7c0f108504f
+ARG FLASHINFER_CUDA_ARCH_LIST=12.0f
 
 WORKDIR /sgl-workspace
 
@@ -218,6 +223,45 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
+# Optional source overrides for SM120 support that has landed upstream but may
+# not be available in the pinned release wheels yet. The refs default to commits
+# validated on RTX PRO 6000; leave the repo args empty for normal wheel builds.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${DEEPGEMM_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/deepgemm_src && \
+        git clone --recursive "${DEEPGEMM_SOURCE_REPO}" /tmp/deepgemm_src && \
+        cd /tmp/deepgemm_src && \
+        git checkout --detach "${DEEPGEMM_SOURCE_REF}" && \
+        test "$(git rev-parse HEAD)" = "${DEEPGEMM_SOURCE_REF}" && \
+        git submodule update --init --recursive && \
+        echo "Building DeepGEMM from $(git rev-parse HEAD)" && \
+        DG_FORCE_BUILD=1 python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v . && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/deepgemm_src; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${FLASHINFER_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/flashinfer_src && \
+        git clone --recursive "${FLASHINFER_SOURCE_REPO}" /tmp/flashinfer_src && \
+        cd /tmp/flashinfer_src && \
+        git checkout --detach "${FLASHINFER_SOURCE_REF}" && \
+        test "$(git rev-parse HEAD)" = "${FLASHINFER_SOURCE_REF}" && \
+        git submodule update --init --recursive && \
+        echo "Building FlashInfer from $(git rev-parse HEAD) for ${FLASHINFER_CUDA_ARCH_LIST}" && \
+        python3 -m pip install --upgrade "setuptools>=77,<82" build && \
+        export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ".[cu13]" && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-cubin && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-jit-cache && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/flashinfer_src; \
+    fi
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2

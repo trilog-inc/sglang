@@ -1896,7 +1896,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
 
-        if backend_str not in [
+        sparse_mla_needs_autotune = (
+            self.server_args.nsa_decode_backend == "flashinfer_sparse_mla"
+        )
+
+        if not sparse_mla_needs_autotune and backend_str not in [
             "flashinfer_trtllm",
             "flashinfer_mxfp4",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.

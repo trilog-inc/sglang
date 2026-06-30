@@ -92,14 +92,8 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         elif self.use_mla_backend:
-            cell_size = (
-                (
-                    self.model_config.qk_nope_head_dim
-                    + self.model_config.qk_rope_head_dim
-                )
-                * num_layers
-                * kv_size
-            )
+            mla_kv_cache_dim = self.calculate_mla_kv_cache_dim()
+            cell_size = mla_kv_cache_dim * num_layers * kv_size
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
