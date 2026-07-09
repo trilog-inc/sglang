@@ -60,6 +60,13 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _deep_gemm_paged_mqa_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
+    """DeepGEMM nv_dev paged MQA APIs expect [batch, next_n] context lengths."""
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+    return context_lens.contiguous()
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -393,10 +400,11 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        context_lens_2d = _deep_gemm_paged_mqa_context_lens(seqlens_32)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                    context_lens_2d,
                     blocksize,
                     self.sm_count,
                 )
@@ -450,7 +458,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                context_lens_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,

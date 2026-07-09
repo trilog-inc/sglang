@@ -81,6 +81,13 @@ def _get_sgl_kernel_flash_attn():
     return _sgl_flash_attn_varlen_func, _sgl_flash_attn_with_kvcache
 
 
+def _deep_gemm_paged_mqa_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
+    """DeepGEMM nv_dev paged MQA APIs expect [batch, next_n] context lengths."""
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+    return context_lens.contiguous()
+
+
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -666,7 +673,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -948,7 +957,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1117,7 +1128,9 @@ class NativeSparseAttnBackend(
                     else metadata.cache_seqlens_int32
                 )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     metadata.paged_mqa_schedule_metadata = new_schedule
