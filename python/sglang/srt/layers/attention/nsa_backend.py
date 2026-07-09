@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     try:
@@ -86,6 +87,24 @@ def _deep_gemm_paged_mqa_context_lens(context_lens: torch.Tensor) -> torch.Tenso
     if context_lens.dim() == 1:
         context_lens = context_lens.unsqueeze(-1)
     return context_lens.contiguous()
+
+
+def _use_nsa_fused_topk(device: Optional[torch.device] = None) -> bool:
+    if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        return False
+
+    # sgl-kernel's fused top-k transform can fail launch setup on SM120. Use
+    # the existing unfused path there and keep the attention-side transform in
+    # sync with the indexer output.
+    if (
+        _is_cuda
+        and device is not None
+        and torch.device(device).type == "cuda"
+        and torch.cuda.get_device_capability(device) == (12, 0)
+    ):
+        return False
+
+    return True
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -270,7 +289,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        if not _use_nsa_fused_topk(logits.device):
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
@@ -1437,7 +1456,7 @@ class NativeSparseAttnBackend(
 
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _use_nsa_fused_topk(q_nope.device):
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1606,7 +1625,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _use_nsa_fused_topk(q_nope.device):
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -2051,7 +2070,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if _use_nsa_fused_topk(q.device):
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
