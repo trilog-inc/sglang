@@ -334,6 +334,7 @@ NSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -1356,16 +1357,33 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_nsa_backends(
+        self, kv_cache_dtype: str, major: int, model_arch: Optional[str] = None
+    ) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
         if kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            is_glm_sm12_fp8 = model_arch == "GlmMoeDsaForCausalLM" and major == 12
+            if is_glm_sm12_fp8:
+                # GLM-5.2 FP8 on SM120 needs the sparse MLA path for both prefill
+                # and decode because the supported backends use different KV
+                # layouts. Respect an explicit override, but keep both sides equal.
+                default_backend = (
+                    self.nsa_prefill_backend
+                    or self.nsa_decode_backend
+                    or "flashinfer_sparse_mla"
+                )
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = default_backend
+                if not user_set_decode:
+                    self.nsa_decode_backend = default_backend
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -1380,9 +1398,57 @@ class ServerArgs:
                 if not user_set_decode:
                     self.nsa_decode_backend = "fa3"
 
+        if (
+            model_arch == "GlmMoeDsaForCausalLM"
+            and major == 12
+            and kv_cache_dtype == "fp8_e4m3"
+        ):
+            backends = (self.nsa_prefill_backend, self.nsa_decode_backend)
+            supported_backends = {"flashinfer_sparse_mla", "trtllm"}
+            unsupported_backends = set(backends) - supported_backends
+            if unsupported_backends:
+                raise ValueError(
+                    "GLM NSA with FP8 KV cache on NVIDIA SM120/SM121 supports "
+                    "only flashinfer_sparse_mla or trtllm, but got "
+                    f"{sorted(unsupported_backends)}."
+                )
+            if self.nsa_prefill_backend != self.nsa_decode_backend:
+                raise ValueError(
+                    "GLM NSA with FP8 KV cache on NVIDIA SM120/SM121 must use "
+                    "the same NSA backend for prefill and decode because the "
+                    "supported backends use different KV cache layouts."
+                )
+
+        self._validate_flashinfer_sparse_mla_backend(kv_cache_dtype, major, model_arch)
         logger.warning(
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
         )
+
+    def _validate_flashinfer_sparse_mla_backend(
+        self, kv_cache_dtype: str, major: int, model_arch: Optional[str]
+    ) -> None:
+        backends = (self.nsa_prefill_backend, self.nsa_decode_backend)
+        if "flashinfer_sparse_mla" not in backends:
+            return
+        if is_hip() or major != 12:
+            raise ValueError(
+                "flashinfer_sparse_mla is only supported on NVIDIA SM120/SM121."
+            )
+        if model_arch != "GlmMoeDsaForCausalLM":
+            raise ValueError(
+                "flashinfer_sparse_mla currently supports GlmMoeDsaForCausalLM "
+                "only because SGLang's packed KV cache uses GLM arbitrary-FP32 "
+                "scale semantics."
+            )
+        if kv_cache_dtype != "fp8_e4m3":
+            raise ValueError(
+                "flashinfer_sparse_mla requires --kv-cache-dtype=fp8_e4m3."
+            )
+        if any(backend != "flashinfer_sparse_mla" for backend in backends):
+            raise ValueError(
+                "flashinfer_sparse_mla must be selected for both NSA prefill and "
+                "decode because NSA backends can require different KV cache layouts."
+            )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -1534,7 +1600,9 @@ class ServerArgs:
 
                     major, _ = torch.cuda.get_device_capability()
                     self._set_default_nsa_kv_cache_dtype(major)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_nsa_backends(
+                        self.kv_cache_dtype, major, model_arch
+                    )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (

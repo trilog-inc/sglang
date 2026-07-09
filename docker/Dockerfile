@@ -20,6 +20,11 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.3
+ARG DEEPGEMM_SOURCE_REPO
+ARG DEEPGEMM_SOURCE_REF=a6b593d2826719dcf4892609af7b84ee23aaf32a
+ARG FLASHINFER_SOURCE_REPO
+ARG FLASHINFER_SOURCE_REF=5f2bdc41f9ffecef9d8ed590e688e7c0f108504f
+ARG FLASHINFER_CUDA_ARCH_LIST=12.0f
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -169,6 +174,11 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG INSTALL_FLASHINFER_JIT_CACHE
 ARG FLASHINFER_VERSION
+ARG DEEPGEMM_SOURCE_REPO
+ARG DEEPGEMM_SOURCE_REF
+ARG FLASHINFER_SOURCE_REPO
+ARG FLASHINFER_SOURCE_REF
+ARG FLASHINFER_CUDA_ARCH_LIST
 ARG GRACE_BLACKWELL
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG DEEPEP_COMMIT
@@ -218,6 +228,46 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+
+# Optional source overrides for SM120 support that is newer than the pinned
+# wheels. The default refs match the RTX PRO 6000 / GLM-5.2 validation recipe;
+# leave the repo args empty for normal wheel-only builds.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${DEEPGEMM_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/deepgemm_src && \
+        git clone --recursive "${DEEPGEMM_SOURCE_REPO}" /tmp/deepgemm_src && \
+        cd /tmp/deepgemm_src && \
+        git checkout --detach "${DEEPGEMM_SOURCE_REF}" && \
+        test "$(git rev-parse HEAD)" = "${DEEPGEMM_SOURCE_REF}" && \
+        git submodule update --init --recursive && \
+        echo "Building DeepGEMM from $(git rev-parse HEAD)" && \
+        DG_FORCE_BUILD=1 python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v . && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/deepgemm_src; \
+    fi
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "${FLASHINFER_SOURCE_REPO}" ]; then \
+        rm -rf /tmp/flashinfer_src && \
+        git clone --recursive "${FLASHINFER_SOURCE_REPO}" /tmp/flashinfer_src && \
+        cd /tmp/flashinfer_src && \
+        git checkout --detach "${FLASHINFER_SOURCE_REF}" && \
+        test "$(git rev-parse HEAD)" = "${FLASHINFER_SOURCE_REF}" && \
+        git submodule update --init --recursive && \
+        echo "Building FlashInfer from $(git rev-parse HEAD) for ${FLASHINFER_CUDA_ARCH_LIST}" && \
+        python3 -m pip install --upgrade "setuptools>=77,<82" build && \
+        export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" && \
+        FLASHINFER_EXTRA="cu${CUDA_VERSION%%.*}" && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ".[${FLASHINFER_EXTRA}]" && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-cubin && \
+        python3 -m pip install \
+            --no-build-isolation --no-deps --force-reinstall -v ./flashinfer-jit-cache && \
+        cd /sgl-workspace && \
+        rm -rf /tmp/flashinfer_src; \
+    fi
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2

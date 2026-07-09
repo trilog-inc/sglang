@@ -2719,9 +2719,13 @@ def set_cuda_arch():
     if is_flashinfer_available():
         capability = torch.cuda.get_device_capability()
         arch = f"{capability[0]}.{capability[1]}"
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
-            f"{arch}{'a' if capability[0] >= 9 else ''}"
-        )
+        if capability[0] == 12:
+            suffix = "f"
+        elif capability[0] >= 9:
+            suffix = "a"
+        else:
+            suffix = ""
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = f"{arch}{suffix}"
 
 
 def cdiv(a: int, b: int) -> int:

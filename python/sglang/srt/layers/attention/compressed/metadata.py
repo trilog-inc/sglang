@@ -137,10 +137,9 @@ class PagedIndexerMetadata(IndexerMetadata):
         # Use the torch reference path (no deep_gemm metadata) when:
         #   - env SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 explicitly forces it, OR
         #   - env not set AND current capability is outside DEEPGEMM_CAPS
-        #     (e.g. consumer Blackwell SM_120, Ada SM_89, Ampere SM_8x).
-        # Without this, get_paged_mqa_logits_metadata invokes a deep_gemm
-        # CUDA op that crashes with "Unsupported architecture" on non-Hopper
-        # / non-DC-Blackwell hardware. Origin: sglang 本身.
+        #     (e.g. Ada SM_89, Ampere SM_8x).
+        # SM120 is enabled only for recent nv_dev/source DeepGEMM builds; older
+        # wheels should opt out via SGLANG_ENABLE_JIT_DEEPGEMM=0 or force torch.
         _cap = (
             torch.cuda.get_device_capability() if torch.cuda.is_available() else None
         )

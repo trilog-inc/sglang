@@ -266,11 +266,11 @@ def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available — gated by DEEPGEMM_CAPS)
-    # 2. FlashInfer TRTLLM (if SM_100 DC Blackwell + FlashInfer; the wheel
-    #    only ships sm100f, so consumer Blackwell SM_120 must skip).
+    # 2. FlashInfer TRTLLM (if SM_100 DC Blackwell + FlashInfer; SM120 uses
+    #    DeepGEMM when the nv_dev/source build is present, otherwise fallback).
     # 3. CUTLASS (if Hopper SM_90 or DC Blackwell SM_100 + CUDA 12.0+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. Triton (fallback — used on SM_120 / SM_89 / SM_8x)
+    # 5. Triton (fallback — used on SM_120 without DeepGEMM, SM_89, SM_8x)
     # Origin: sglang 本身 (was `is_blackwell_supported()` for trtllm/cutlass,
     # which incorrectly routed consumer Blackwell SM_120 to sm100f-only
     # binaries that crash with "Unsupported architecture").

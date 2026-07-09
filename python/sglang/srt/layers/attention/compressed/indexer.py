@@ -765,6 +765,9 @@ class C4IndexerBackend:
         #   - env SGLANG_OPT_USE_TILELANG_INDEXER=1 forces tilelang.
         #   - env SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 forces torch.
         #   - Otherwise: cap in DEEPGEMM_CAPS -> deep_gemm; else tilelang.
+        # SM120 is in DEEPGEMM_CAPS only when running a recent nv_dev/source
+        # build with RTX PRO 6000 kernels; older wheel builds should opt out via
+        # SGLANG_ENABLE_JIT_DEEPGEMM=0 or force torch/tilelang with the envs above.
         # Origin: sglang 本身.
         _has_dg_caps = (torch.cuda.get_device_capability() in DEEPGEMM_CAPS
                         if torch.cuda.is_available() else False)

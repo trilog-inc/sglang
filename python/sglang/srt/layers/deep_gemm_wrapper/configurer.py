@@ -8,13 +8,10 @@ from sglang.srt.utils import get_device_sm, is_blackwell_supported
 logger = logging.getLogger(__name__)
 
 
-# Capabilities where DeepGEMM's wgmma / tcgen05.mma kernels actually run.
-# Hopper (SM_90a) + DC Blackwell (SM_100f, SM_103a). NOT consumer Blackwell
-# (SM_120) which lacks both, NOT Ada (SM_89) / Ampere (SM_8x). Outside this
-# set, importing DeepGEMM may succeed but invoking its kernels raises
-# "Unsupported architecture" (verified on RTX 5090: deep_gemm.attention's
-# get_paged_mqa_logits_metadata crashes during CUDA Graph capture).
-DEEPGEMM_CAPS = {(9, 0), (10, 0), (10, 3)}
+# Capabilities where the configured DeepGEMM build has native kernels.
+# SM120 support requires a recent nv_dev/source build; the Docker source override
+# pins the validated commit used for RTX PRO 6000 / GLM-5.2.
+DEEPGEMM_CAPS = {(9, 0), (10, 0), (10, 3), (12, 0)}
 
 
 def _compute_enable_deep_gemm():
