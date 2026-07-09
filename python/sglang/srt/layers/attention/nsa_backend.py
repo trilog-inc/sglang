@@ -41,8 +41,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
-# from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -64,7 +62,23 @@ if _is_hip:
             "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
         )
 else:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    _sgl_flash_attn_varlen_func = None
+    _sgl_flash_attn_with_kvcache = None
+
+
+def _get_sgl_kernel_flash_attn():
+    """Import sgl-kernel FlashAttention only when the FA3 path is selected."""
+    if _is_hip:
+        raise RuntimeError("sgl-kernel FlashAttention is not available on HIP")
+
+    global _sgl_flash_attn_varlen_func, _sgl_flash_attn_with_kvcache
+    if _sgl_flash_attn_varlen_func is None or _sgl_flash_attn_with_kvcache is None:
+        from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+        _sgl_flash_attn_varlen_func = flash_attn_varlen_func
+        _sgl_flash_attn_with_kvcache = flash_attn_with_kvcache
+
+    return _sgl_flash_attn_varlen_func, _sgl_flash_attn_with_kvcache
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -1682,6 +1696,7 @@ class NativeSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        _, flash_attn_with_kvcache = _get_sgl_kernel_flash_attn()
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
@@ -1877,6 +1892,7 @@ class NativeSparseAttnBackend(
         # Use FA3 for SM90 (Hopper/H200)
         fa_version = 3
 
+        flash_attn_varlen_func, _ = _get_sgl_kernel_flash_attn()
         return flash_attn_varlen_func(
             q=q,
             k=k,
