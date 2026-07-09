@@ -111,49 +111,6 @@ def _use_nsa_fused_topk(device: Optional[torch.device] = None) -> bool:
     return True
 
 
-def _torch_topk_v2(
-    score: torch.Tensor,
-    lengths: torch.Tensor,
-    topk: int,
-    row_starts: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    score_len = score.shape[1]
-    k = min(topk, score_len)
-    positions = torch.arange(score_len, device=score.device).unsqueeze(0)
-    lengths = lengths.to(torch.int64).unsqueeze(1)
-
-    if row_starts is None:
-        valid_mask = positions < lengths
-        relative_positions = positions
-    else:
-        row_starts = row_starts.to(torch.int64).unsqueeze(1)
-        valid_mask = (positions >= row_starts) & (positions < row_starts + lengths)
-        relative_positions = positions - row_starts
-
-    masked_score = score.masked_fill(~valid_mask, float("-inf"))
-    topk_abs_indices = torch.topk(masked_score, k, dim=-1, sorted=False).indices
-    topk_relative_indices = torch.gather(
-        relative_positions.expand(score.shape[0], -1), 1, topk_abs_indices
-    )
-    valid_topk = torch.gather(valid_mask, 1, topk_abs_indices)
-    topk_indices = torch.where(
-        valid_topk,
-        topk_relative_indices,
-        torch.full_like(topk_relative_indices, -1),
-    ).to(torch.int32)
-
-    if k == topk:
-        return topk_indices
-
-    padding = torch.full(
-        (score.shape[0], topk - k),
-        -1,
-        dtype=torch.int32,
-        device=score.device,
-    )
-    return torch.cat([topk_indices, padding], dim=1)
-
-
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -331,9 +288,6 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             page_table_size_1 = self.attn_metadata.page_table_1
 
         if not _use_nsa_fused_topk(logits.device):
-            if _is_cuda_sm120_device(logits.device):
-                return _torch_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
