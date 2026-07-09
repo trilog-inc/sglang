@@ -102,6 +102,22 @@ class DeepGemmKernelType(IntEnum):
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
+@contextmanager
+def _deep_gemm_compile_mode(mode: int):
+    get_compile_mode = getattr(deep_gemm, "get_compile_mode", None)
+    set_compile_mode = getattr(deep_gemm, "set_compile_mode", None)
+    if not callable(get_compile_mode) or not callable(set_compile_mode):
+        yield
+        return
+
+    old_compile_mode = get_compile_mode()
+    set_compile_mode(mode)
+    try:
+        yield
+    finally:
+        set_compile_mode(old_compile_mode)
+
+
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -194,12 +210,10 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
         # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        with _deep_gemm_compile_mode(1):
+            for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
+                executor.execute(m=m)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
