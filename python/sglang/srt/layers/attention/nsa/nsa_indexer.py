@@ -60,6 +60,24 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _should_use_deep_gemm_for_weights_proj(
+    x: torch.Tensor, weight: torch.Tensor
+) -> bool:
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return False
+
+    # DeepGEMM nv_dev's SM120 BF16 GEMM can select an invalid tile for small-N
+    # indexer projections, e.g. GLM-5.2 head gates with N=32.
+    if (
+        x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (12, 0)
+        and weight.shape[0] <= 32
+    ):
+        return False
+
+    return True
+
+
 def _deep_gemm_paged_mqa_context_lens(context_lens: torch.Tensor) -> torch.Tensor:
     """DeepGEMM nv_dev paged MQA APIs expect [batch, next_n] context lengths."""
     if context_lens.dim() == 1:
@@ -243,8 +261,8 @@ class Indexer(MultiPlatformOp):
             yield
 
     def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
+        weight = self.weights_proj.weight
+        if _should_use_deep_gemm_for_weights_proj(x, weight):
             out = torch.empty(
                 (x.shape[0], weight.shape[0]),
                 dtype=torch.float32,
