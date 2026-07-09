@@ -423,7 +423,12 @@ void setup_kernel_smem_once() {
     return ::cudaFuncSetAttribute(
         reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #else
-    // CUDA: keep original behavior (no cast needed).
+    // CUDA only needs the opt-in attribute when dynamic shared memory exceeds
+    // the default per-block limit. The top-k kernels use 32KB, and setting the
+    // attribute for this small value can fail on SM120.
+    if constexpr (max_dynamic_smem <= 48 * 1024) {
+      return cudaSuccess;
+    }
     return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #endif
   }();
