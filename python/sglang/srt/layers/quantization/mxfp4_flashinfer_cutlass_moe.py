@@ -80,7 +80,24 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.moe_runner_config = moe_runner_config
 
-        E = layer.num_local_experts
+        # The runner config is the source of truth for the physical expert
+        # slots consumed by this backend.  Wrappers such as KTEPWrapperMethod
+        # keep ``layer.num_local_experts`` in the global routing space while
+        # replacing this value with the compact GPU-resident expert count.
+        E = moe_runner_config.num_local_experts
+        if E is None:
+            raise ValueError(
+                "Mxfp4FlashinferCutlassMoEMethod requires num_local_experts "
+                "in its runner config."
+            )
+        E = int(E)
+        weight_experts = int(layer.w13_weight.shape[0])
+        if E != weight_experts or int(layer.w2_weight.shape[0]) != weight_experts:
+            raise ValueError(
+                "MXFP4 FlashInfer expert metadata must match the physical weight "
+                f"slots (runner={E}, w13={weight_experts}, "
+                f"w2={int(layer.w2_weight.shape[0])})."
+            )
         device = layer.w13_weight.device
         if self._use_mxfp8_act_scaling:
             # FlashInfer's MXFP4 ABI requires a neutral per-expert global scale.

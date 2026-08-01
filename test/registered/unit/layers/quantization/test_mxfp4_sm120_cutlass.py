@@ -105,6 +105,47 @@ def test_dsv4_sm120_load_contract(monkeypatch):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
+def test_dsv4_sm120_runner_metadata_uses_physical_expert_count(monkeypatch):
+    import sglang.srt.layers.moe.moe_runner.runner as runner_module
+    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    monkeypatch.setattr(adapter_module, "is_flashinfer_available", lambda: True)
+    monkeypatch.setattr(adapter_module, "is_sm120_supported", lambda: True)
+
+    captured = {}
+
+    class _Runner:
+        def __init__(self, backend, config):
+            captured["backend"] = backend
+            captured["config"] = config
+
+    monkeypatch.setattr(runner_module, "MoeRunner", _Runner)
+
+    physical_experts = 96
+    layer = SimpleNamespace(
+        # KT keeps routing in the 256-expert logical space while allocating a
+        # compact physical weight tensor for the GPU-resident subset.
+        num_local_experts=256,
+        w13_weight=torch.empty((physical_experts, 1), dtype=torch.uint8),
+        w2_weight=torch.empty((physical_experts, 1), dtype=torch.uint8),
+    )
+    config = MoeRunnerConfig(
+        num_experts=256,
+        num_local_experts=physical_experts,
+        swiglu_limit=10,
+    )
+    method = adapter_module.Mxfp4FlashinferCutlassMoEMethod(
+        SimpleNamespace(), "test"
+    )
+
+    method.create_moe_runner(layer, config)
+
+    assert method._mxfp4_weight_global_scale_tensor.shape == (physical_experts,)
+    assert method._swiglu_limit_tensor.shape == (physical_experts,)
+    assert captured["config"] is config
+
+
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
