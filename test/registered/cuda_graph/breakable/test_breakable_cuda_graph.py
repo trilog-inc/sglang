@@ -8,6 +8,7 @@ Two test classes:
 """
 
 import unittest
+from typing import NamedTuple
 
 import torch
 
@@ -113,6 +114,38 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 16.0, device=self.device)))
+
+    def test_namedtuple_input_keeps_fields_during_replay(self):
+        """Weak-ref capture must preserve nested NamedTuple argument types."""
+
+        class Routing(NamedTuple):
+            weights: torch.Tensor
+
+        class DispatchOutput(NamedTuple):
+            hidden_states: torch.Tensor
+            topk_output: Routing
+
+        x = torch.zeros(4, device=self.device)
+        weights = torch.full((4,), 2.0, device=self.device)
+        y = torch.zeros(4, device=self.device)
+
+        @self.eager_on_graph(enable=True)
+        def eager_moe(dispatch_output):
+            self.assertIsInstance(dispatch_output, DispatchOutput)
+            self.assertIsInstance(dispatch_output.topk_output, Routing)
+            return dispatch_output.hidden_states * dispatch_output.topk_output.weights
+
+        graph = self.BreakableCUDAGraph()
+        stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=stream):
+            hidden_states = x + 1.0
+            output = eager_moe(DispatchOutput(hidden_states, Routing(weights)))
+            y.copy_(output)
+
+        x.fill_(10.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 22.0, device=self.device)))
 
     def test_eager_on_graph_disabled(self):
         """@eager_on_graph(enable=False) should be a no-op passthrough."""

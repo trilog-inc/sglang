@@ -170,7 +170,13 @@ def _weak_ref_if_tensor(x):
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
-        return tuple(_weak_ref_if_tensor(e) for e in x)
+        values = tuple(_weak_ref_if_tensor(e) for e in x)
+        # MoE dispatch/combine records and several model outputs are
+        # NamedTuples. Preserve their field-bearing type so eager replay sees
+        # the same API as capture instead of a plain tuple.
+        if hasattr(type(x), "_fields"):
+            return type(x)(*values)
+        return values
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
     return x
@@ -193,7 +199,11 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
+        if isinstance(dst, tuple):
+            if hasattr(type(dst), "_fields"):
+                return type(dst)(*copied)
+            return tuple(copied)
+        return copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
