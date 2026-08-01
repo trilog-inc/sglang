@@ -332,6 +332,21 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _should_use_breakable_attention(forward_batch: ForwardBatch) -> bool:
+    """Use the eager attention seam only when the prefill runner owns it.
+
+    Decode breakable graphs do not install a TcPiecewiseForwardContext.  In
+    particular, speculative TARGET_VERIFY is classified as an extend forward,
+    so checking ``is_extend()`` alone would route decode capture through the
+    prefill-only helper with no live ForwardBatch context.
+    """
+    return (
+        forward_batch.forward_mode.is_extend()
+        and is_in_breakable_cuda_graph()
+        and get_tc_piecewise_forward_context() is not None
+    )
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def deepseek_v4_attention_with_output(
@@ -344,6 +359,9 @@ def deepseek_v4_attention_with_output(
     save_kv_cache: bool,
 ) -> None:
     context = get_tc_piecewise_forward_context()
+    assert context is not None, (
+        "DeepSeek-V4 breakable attention requires a piecewise forward context"
+    )
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
@@ -1268,7 +1286,7 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if _should_use_breakable_attention(forward_batch):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
