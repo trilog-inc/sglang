@@ -90,6 +90,11 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
+# FlashInfer 0.6.15 SM120 DSV4 standalone-decode instantiations.  The prefill
+# path also supports these widths, while 192 (the natural DSpark width for a
+# 128-token SWA window plus a six-token draft block) is unsupported.
+_SM120_FLASHINFER_DSV4_TOPKS = (128, 512, 1024)
+
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
@@ -133,6 +138,25 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+
+
+def _dspark_swa_page_index_alignment(block_size: int) -> int:
+    """Choose a DSpark index width accepted by the selected SM120 backend."""
+    if not (
+        _is_sm120 and envs.SGLANG_SM120_FLASHMLA_BACKEND.get().lower() == "flashinfer"
+    ):
+        return PAGE_INDEX_ALIGNED_SIZE
+
+    required_topk = SWA_WINDOW + block_size
+    for flashinfer_topk in _SM120_FLASHINFER_DSV4_TOPKS:
+        if required_topk <= flashinfer_topk:
+            return flashinfer_topk
+    raise ValueError(
+        "DSpark's sparse-attention width exceeds the FlashInfer SM120 DSV4 "
+        f"decode envelope: required_topk={required_topk}, supported_topk="
+        f"{_SM120_FLASHINFER_DSV4_TOPKS}. Set "
+        "SGLANG_SM120_FLASHMLA_BACKEND=triton for larger draft blocks."
+    )
 
 
 def _create_flashmla_metadata():
@@ -2034,7 +2058,10 @@ class DeepseekV4AttnBackend(
             context_lens=gather.context_lens,
             block_size=block_size,
             swa_window=SWA_WINDOW,
-            page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            # Build directly at a FlashInfer-instantiated width.  Doing this in
+            # metadata prep avoids padding/copying the indices once per draft
+            # layer and preserves the logical length in swa_topk_lengths.
+            page_index_aligned_size=_dspark_swa_page_index_alignment(block_size),
         )
         return swa_page_indices, swa_topk_lengths
 
