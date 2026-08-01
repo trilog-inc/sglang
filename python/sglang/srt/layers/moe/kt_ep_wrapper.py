@@ -132,6 +132,11 @@ def _unwrap_text_config(hf_config):
     return getattr(hf_config, "text_config", None) or hf_config
 
 
+def _get_hf_config(server_args: "ServerArgs"):
+    """Resolve the Hugging Face config through ServerArgs' public API."""
+    return _unwrap_text_config(server_args.get_model_config().hf_config)
+
+
 def _moe_layer_indices(hf_config) -> list[int]:
     num_layers = int(getattr(hf_config, "num_hidden_layers"))
     num_hash_layers = int(
@@ -184,7 +189,7 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
     if _KT_GPU_EXPERTS_MASKS is not None:
         return _KT_GPU_EXPERTS_MASKS
 
-    hf_config = _unwrap_text_config(server_args.get_hf_config())
+    hf_config = _get_hf_config(server_args)
     num_layers = getattr(hf_config, "num_hidden_layers", None)
     num_experts = (
         getattr(hf_config, "n_routed_experts", None)
@@ -299,7 +304,7 @@ def create_kt_config_from_server_args(
             "available through --kt-expert-placement-strategy frequency."
         )
 
-    hf_config = _unwrap_text_config(server_args.get_hf_config())
+    hf_config = _get_hf_config(server_args)
     method = server_args.kt_method.upper()
     is_deepseek_v4 = bool(
         getattr(hf_config, "num_hash_layers", 0)
