@@ -384,6 +384,35 @@ def mask_and_remap_expert_ids(
     return torch.where(is_gpu, logical_to_gpu_index[safe_ids], -1)
 
 
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    # This helper runs inside an outer breakable CUDA graph and one output is
+    # consumed on a side stream.  An inner Inductor CUDA graph may recycle its
+    # static outputs on the next call even while the side-stream copy is live.
+    options={"triton.cudagraphs": False},
+)
+def partition_and_remap_expert_ids(
+    topk_ids: torch.Tensor,
+    gpu_experts_mask: torch.Tensor,
+    logical_to_gpu_index: torch.Tensor,
+    logical_to_cpu_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partition logical routing IDs into stable CPU and GPU outputs.
+
+    Producing both tensors in one compiled invocation is important for hybrid
+    replay.  The CPU result is consumed asynchronously on ``_cpu_stream``; a
+    second invocation of the same compiled function on the main stream may
+    reuse its output storage before that copy completes.
+    """
+    valid = (topk_ids >= 0) & (topk_ids < gpu_experts_mask.numel())
+    safe_ids = topk_ids.clamp(0, gpu_experts_mask.numel() - 1)
+    on_gpu = valid & gpu_experts_mask[safe_ids]
+    gpu_ids = torch.where(on_gpu, logical_to_gpu_index[safe_ids], -1)
+    cpu_ids = torch.where(valid & ~on_gpu, logical_to_cpu_index[safe_ids], -1)
+    return cpu_ids, gpu_ids
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Run a routed-expert subset on SM120 and the complement in KT-Kernel."""
 
@@ -557,19 +586,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
         staged = None
 
+        assert self.gpu_experts_mask_cuda is not None
+        assert self.logical_to_gpu_index_cuda is not None
+        assert self.logical_to_cpu_index_cuda is not None
+        cpu_topk_ids, gpu_topk_ids = partition_and_remap_expert_ids(
+            topk_ids,
+            self.gpu_experts_mask_cuda,
+            self.logical_to_gpu_index_cuda,
+            self.logical_to_cpu_index_cuda,
+        )
+
         if self.tp_rank == 0:
             assert self.wrapper is not None
             assert self._cpu_stream is not None
             assert self._staging is not None
-            assert self.cpu_experts_mask_cuda is not None
-            assert self.logical_to_cpu_index_cuda is not None
             staged = self._staging.get_slice(x.reshape(-1, x.shape[-1]).shape[0])
             staged.copy_(x.reshape_as(staged), non_blocking=True)
-            cpu_topk_ids = mask_and_remap_expert_ids(
-                topk_ids,
-                self.cpu_experts_mask_cuda,
-                self.logical_to_cpu_index_cuda,
-            )
             self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
             with torch.cuda.stream(self._cpu_stream):
                 self.wrapper.submit_forward(
@@ -580,14 +612,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 )
 
         if self.num_gpu_experts > 0:
-            assert self.gpu_experts_mask_cuda is not None
-            assert self.logical_to_gpu_index_cuda is not None
-            remapped_ids = mask_and_remap_expert_ids(
-                topk_ids,
-                self.gpu_experts_mask_cuda,
-                self.logical_to_gpu_index_cuda,
-            )
-            gpu_topk_output = topk_output._replace(topk_ids=remapped_ids)
+            gpu_topk_output = topk_output._replace(topk_ids=gpu_topk_ids)
             gpu_dispatch_output = dispatch_output._replace(
                 topk_output=gpu_topk_output
             )

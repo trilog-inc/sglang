@@ -7,6 +7,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     _moe_layer_indices,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
+    partition_and_remap_expert_ids,
 )
 
 
@@ -28,6 +29,21 @@ def test_mask_and_remap_compact_cpu_complement():
     actual = mask_and_remap_expert_ids(logical_ids, cpu_mask, logical_to_cpu)
 
     torch.testing.assert_close(actual, torch.tensor([[0, -1, -1, 3, -1, -1]]))
+
+
+def test_partition_and_remap_produces_distinct_complementary_outputs():
+    gpu_mask = torch.tensor([False, False, True, False, False, True])
+    logical_to_gpu = torch.tensor([-1, -1, 0, -1, -1, 1])
+    logical_to_cpu = torch.tensor([0, 1, -1, 2, 3, -1])
+    logical_ids = torch.tensor([[0, 2, 5, 4, -1, 6]])
+
+    cpu_ids, gpu_ids = partition_and_remap_expert_ids(
+        logical_ids, gpu_mask, logical_to_gpu, logical_to_cpu
+    )
+
+    torch.testing.assert_close(cpu_ids, torch.tensor([[0, -1, -1, 3, -1, -1]]))
+    torch.testing.assert_close(gpu_ids, torch.tensor([[-1, 0, 1, -1, -1, -1]]))
+    assert cpu_ids.data_ptr() != gpu_ids.data_ptr()
 
 
 def test_dsv4_hash_prefix_is_included_in_moe_layers():
