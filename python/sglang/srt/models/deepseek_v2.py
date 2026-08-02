@@ -894,6 +894,23 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
+        kt_graph_method = (
+            self.experts.quant_method
+            if (
+                forward_batch is not None
+                and forward_batch.forward_mode.is_target_verify()
+                and is_in_breakable_cuda_graph()
+                and isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            )
+            else None
+        )
+        if kt_graph_method is not None:
+            # ``hidden_states`` is also consumed after the KT break by the
+            # shared-expert path.  Make that cross-segment input graph-stable.
+            hidden_states = kt_graph_method.bridge_cuda_graph_tensor(
+                "moe_input", hidden_states
+            )
+
         if not self._enable_a2a_moe:
             server_args = get_server_args()
             if self._can_dual_stream_graph(hidden_states, server_args):
@@ -929,6 +946,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    kt_graph_method=kt_graph_method,
                 )
         else:
             return self.forward_deepep(
@@ -1056,6 +1074,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        kt_graph_method: Optional[KTEPWrapperMethod] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1080,6 +1099,15 @@ class DeepseekV2MoE(nn.Module):
                 if skip_shared_experts
                 else self._maybe_quant_moe_input_once(hidden_states)
             )
+            if kt_graph_method is not None and pre_quant_input is not None:
+                pre_quant_input = (
+                    kt_graph_method.bridge_cuda_graph_tensor(
+                        "moe_input_quant", pre_quant_input[0]
+                    ),
+                    kt_graph_method.bridge_cuda_graph_tensor(
+                        "moe_input_scale", pre_quant_input[1]
+                    ),
+                )
             if (
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
@@ -1090,6 +1118,13 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
+                if kt_graph_method is not None:
+                    # With an in-place routed runner the shared expert is
+                    # produced before KT and combined after it, so it crosses
+                    # the same graph break as the DSV4 residual state.
+                    shared_output = kt_graph_method.bridge_cuda_graph_tensor(
+                        "shared_output", shared_output
+                    )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (

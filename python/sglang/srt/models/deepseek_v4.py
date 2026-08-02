@@ -84,6 +84,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -1771,6 +1772,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+
+        kt_graph_method = getattr(
+            getattr(self.mlp, "experts", None), "quant_method", None
+        )
+        if (
+            isinstance(kt_graph_method, KTEPWrapperMethod)
+            and forward_batch.forward_mode.is_target_verify()
+            and is_in_breakable_cuda_graph()
+        ):
+            # These MHC values are produced before KT's eager graph break and
+            # consumed after it.  They are not KT call arguments, so BCG cannot
+            # discover their lifetime automatically.  Stable owner-retained
+            # buffers prevent later graph captures from recycling the addresses.
+            residual = kt_graph_method.bridge_cuda_graph_tensor(
+                "ffn_residual", residual
+            )
+            post = kt_graph_method.bridge_cuda_graph_tensor("ffn_post", post)
+            comb = kt_graph_method.bridge_cuda_graph_tensor("ffn_comb", comb)
 
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,

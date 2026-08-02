@@ -4,11 +4,40 @@ import torch
 
 from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import (
+    KTGraphStateBridge,
     _moe_layer_indices,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
     partition_and_remap_expert_ids,
 )
+
+
+def test_graph_state_bridge_reuses_largest_stable_buffer():
+    bridge = KTGraphStateBridge()
+    large = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    large_view = bridge.copy("residual", large)
+    stable_ptr = large_view.data_ptr()
+    assert stable_ptr != large.data_ptr()
+    torch.testing.assert_close(large_view, large)
+
+    small = torch.full((2, 3), 7.0)
+    small_view = bridge.copy("residual", small)
+    assert small_view.data_ptr() == stable_ptr
+    assert small_view.shape == small.shape
+    torch.testing.assert_close(small_view, small)
+
+
+def test_graph_state_bridge_keeps_replaced_buffers_alive():
+    bridge = KTGraphStateBridge()
+    old_view = bridge.copy("residual", torch.zeros((2, 3)))
+    old_ptr = old_view.data_ptr()
+
+    grown_view = bridge.copy("residual", torch.ones((4, 3)))
+
+    assert grown_view.data_ptr() != old_ptr
+    assert bridge._retired_buffers[0].data_ptr() == old_ptr
+    torch.testing.assert_close(grown_view, torch.ones((4, 3)))
 
 
 def test_mask_and_remap_arbitrary_gpu_experts_and_padding():

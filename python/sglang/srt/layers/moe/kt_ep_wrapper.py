@@ -96,6 +96,47 @@ class SharedStagingBuffer:
         return self.buffer[:num_tokens]
 
 
+class KTGraphStateBridge:
+    """Persistent buffers for tensors that span a KT breakable-graph seam.
+
+    A CUDA graph records raw addresses.  DSV4 keeps several layer-local tensors
+    alive across its MoE call, but those tensors are not arguments to KT's
+    ``eager_on_graph`` break and therefore are invisible to the generic bridge.
+    Copying them into these owner-retained buffers before the break gives both
+    adjacent graph segments stable addresses.  Buffers are shared by all graph
+    batch shapes for one layer and sized to the largest shape observed.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: dict[str, torch.Tensor] = {}
+        # Capture sizes are normally visited largest-first.  Keep an old buffer
+        # alive if that invariant ever changes, because an already captured graph
+        # may still contain its address.
+        self._retired_buffers: list[torch.Tensor] = []
+
+    def copy(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim == 0:
+            raise ValueError(f"KT graph bridge {name!r} requires a row dimension")
+
+        buffer = self._buffers.get(name)
+        compatible = (
+            buffer is not None
+            and buffer.device == tensor.device
+            and buffer.dtype == tensor.dtype
+            and buffer.shape[1:] == tensor.shape[1:]
+            and buffer.shape[0] >= tensor.shape[0]
+        )
+        if not compatible:
+            if buffer is not None:
+                self._retired_buffers.append(buffer)
+            buffer = tensor.new_empty(tensor.shape)
+            self._buffers[name] = buffer
+
+        view = buffer[: tensor.shape[0]]
+        view.copy_(tensor)
+        return view
+
+
 def _get_or_create_staging_buffer(
     *,
     max_tokens: int,
@@ -469,6 +510,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._cpu_stream: Optional[torch.cuda.Stream] = None
         self._cpu_done_event: Optional[torch.cuda.Event] = None
         self._staging: Optional[SharedStagingBuffer] = None
+        self.graph_state_bridge = KTGraphStateBridge()
+
+    def bridge_cuda_graph_tensor(
+        self, name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        return self.graph_state_bridge.copy(name, tensor)
 
     def gpu_weight_index(self, logical_expert_id: int) -> Optional[int]:
         if logical_expert_id < 0 or logical_expert_id >= self.logical_to_gpu_index.numel():
