@@ -37,7 +37,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_bool_env_var, get_device_module, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,20 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
+def _format_break_label(inner: Callable, args: tuple[Any, ...]) -> str:
+    """Return a useful capture/replay label without retaining layer objects."""
+    name = getattr(inner, "__qualname__", getattr(inner, "__name__", repr(inner)))
+    if not args:
+        return name
+
+    owner = args[0]
+    kt_config = getattr(owner, "kt_config", None)
+    layer_idx = getattr(kt_config, "layer_idx", None)
+    if layer_idx is not None:
+        return f"{name}[layer={layer_idx}]"
+    return name
+
+
 def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     def decorator(inner: Callable):
         if not enable:
@@ -274,6 +288,7 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
+            capture.cuda_graph._break_labels.append(_format_break_label(inner, args))
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
@@ -288,19 +303,79 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(self, deduped_cuda_graph=None) -> None:
+    def __init__(
+        self, deduped_cuda_graph=None, debug_name: str | None = None
+    ) -> None:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
+        self._break_labels: list[str] = []
         self._deduped_cuda_graph = deduped_cuda_graph
+        self._debug_name = debug_name or "unnamed"
+        self._debug_replay = get_bool_env_var("SGLANG_BCG_DEBUG_REPLAY")
+
+    def _segment_label(self, index: int) -> str:
+        after = "model entry" if index == 0 else self._break_labels[index - 1]
+        before = (
+            self._break_labels[index]
+            if index < len(self._break_labels)
+            else "model output"
+        )
+        return f"after {after}, before {before}"
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
-                seg.replay()
+                segment_label = self._segment_label(i)
+                if self._debug_replay:
+                    logger.warning(
+                        "BCG replay %s segment %d/%d begin (%s)",
+                        self._debug_name,
+                        i,
+                        len(self._segments) - 1,
+                        segment_label,
+                    )
+                try:
+                    seg.replay()
+                    if self._debug_replay:
+                        # cudaGraphLaunch is one host operation, so launch blocking
+                        # cannot identify an individual graph segment on its own.
+                        # Synchronize at every BCG boundary while debugging to make
+                        # the segment that raised an asynchronous device fault exact.
+                        stream.synchronize()
+                except Exception:
+                    logger.exception(
+                        "BCG replay %s failed in segment %d/%d (%s)",
+                        self._debug_name,
+                        i,
+                        len(self._segments) - 1,
+                        segment_label,
+                    )
+                    raise
                 if i < len(self._break_fns):
-                    self._break_fns[i]()
+                    break_label = self._break_labels[i]
+                    if self._debug_replay:
+                        logger.warning(
+                            "BCG replay %s break %d/%d begin (%s)",
+                            self._debug_name,
+                            i,
+                            len(self._break_fns) - 1,
+                            break_label,
+                        )
+                    try:
+                        self._break_fns[i]()
+                        if self._debug_replay:
+                            stream.synchronize()
+                    except Exception:
+                        logger.exception(
+                            "BCG replay %s failed in break %d/%d (%s)",
+                            self._debug_name,
+                            i,
+                            len(self._break_fns) - 1,
+                            break_label,
+                        )
+                        raise
         finally:
             _current_stream_var.reset(token)
 

@@ -80,6 +80,11 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             broken = eager_op(intermediate)
             y.copy_(broken + 3.0)
 
+        self.assertEqual(
+            graph._break_labels,
+            ["TestBreakableCUDAGraphBasic.test_single_break.<locals>.eager_op"],
+        )
+
         # Replay with new input
         x.fill_(10.0)
         graph.replay()
@@ -108,6 +113,12 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             t3 = t2 + 1.0  # graph segment 2
             t4 = double(t3)  # break 2: eager
             y.copy_(t4)  # graph segment 3
+
+        self.assertEqual(
+            graph._segment_label(1),
+            "after TestBreakableCUDAGraphBasic.test_multiple_breaks.<locals>.add_one, "
+            "before TestBreakableCUDAGraphBasic.test_multiple_breaks.<locals>.double",
+        )
 
         # Replay: x=5 -> +1=6 -> add_one=7 -> +1=8 -> double=16
         x.fill_(5.0)
