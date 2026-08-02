@@ -1666,6 +1666,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        kt_graph_method = getattr(
+            getattr(self.mlp, "experts", None), "quant_method", None
+        )
+        use_kt_graph_checkpoints = isinstance(kt_graph_method, KTEPWrapperMethod)
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
@@ -1712,7 +1716,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        debug_break_graph(f"dsv4_attention_input[layer={self.layer_id}]")
+        if use_kt_graph_checkpoints:
+            debug_break_graph(f"dsv4_attention_input[layer={self.layer_id}]")
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -1722,7 +1727,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant=x_quant,
             )
 
-        debug_break_graph(f"dsv4_attention_output[layer={self.layer_id}]")
+        if use_kt_graph_checkpoints:
+            debug_break_graph(f"dsv4_attention_output[layer={self.layer_id}]")
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1778,11 +1784,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        kt_graph_method = getattr(
-            getattr(self.mlp, "experts", None), "quant_method", None
-        )
         if (
-            isinstance(kt_graph_method, KTEPWrapperMethod)
+            use_kt_graph_checkpoints
             and forward_batch.forward_mode.is_target_verify()
             and is_in_breakable_cuda_graph()
         ):
@@ -1796,7 +1799,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             post = kt_graph_method.bridge_cuda_graph_tensor("ffn_post", post)
             comb = kt_graph_method.bridge_cuda_graph_tensor("ffn_comb", comb)
 
-        debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
+        if use_kt_graph_checkpoints:
+            debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
 
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
@@ -1807,7 +1811,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
-            debug_break_graph(f"dsv4_decoder_output[layer={self.layer_id}]")
+            if use_kt_graph_checkpoints:
+                debug_break_graph(f"dsv4_decoder_output[layer={self.layer_id}]")
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with

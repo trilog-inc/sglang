@@ -1226,7 +1226,8 @@ class DeepseekV2MoE(nn.Module):
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
-        debug_break_graph(f"deepseek_moe_output[layer={self.layer_id}]")
+        if kt_graph_method is not None:
+            debug_break_graph(f"deepseek_moe_output[layer={self.layer_id}]")
         return final_hidden_states
 
     def forward_cpu(
