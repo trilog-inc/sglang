@@ -48,7 +48,10 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
+    "debug_break_graph",
 ]
+
+_debug_graph_breaks = get_bool_env_var("SGLANG_BCG_DEBUG_BREAKS")
 
 
 def _check_cuda_bindings():
@@ -229,6 +232,8 @@ def _copy_output(dst: Any, src: Any) -> Any:
 def _format_break_label(inner: Callable, args: tuple[Any, ...]) -> str:
     """Return a useful capture/replay label without retaining layer objects."""
     name = getattr(inner, "__qualname__", getattr(inner, "__name__", repr(inner)))
+    if inner.__name__ == "break_graph" and args and isinstance(args[0], str):
+        return f"checkpoint[{args[0]}]"
     if not args:
         return name
 
@@ -491,7 +496,13 @@ class BreakableCUDAGraphCapture:
 
 
 @eager_on_graph(True)
-def break_graph() -> None:
+def break_graph(label: str | None = None) -> None:
     """Insert a graph break. The @eager_on_graph decorator does the actual
     segment split; this function body intentionally does nothing."""
-    pass
+    del label
+
+
+def debug_break_graph(label: str) -> None:
+    """Insert a labeled BCG checkpoint when diagnostic breaks are enabled."""
+    if _debug_graph_breaks:
+        break_graph(label)

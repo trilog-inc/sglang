@@ -321,8 +321,10 @@ class TestBreakGraphHelper(CustomTestCase):
         stream = torch.cuda.Stream(self.device)
         with self.BreakableCUDAGraphCapture(graph, stream=stream):
             t = x + 1.0
-            self.break_graph()
+            self.break_graph("test checkpoint")
             y.copy_(t + 2.0)
+
+        self.assertEqual(graph._break_labels, ["checkpoint[test checkpoint]"])
 
         x.fill_(10.0)
         graph.replay()

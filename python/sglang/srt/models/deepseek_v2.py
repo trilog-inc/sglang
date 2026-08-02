@@ -151,6 +151,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    debug_break_graph,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -1223,6 +1226,7 @@ class DeepseekV2MoE(nn.Module):
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
+        debug_break_graph(f"deepseek_moe_output[layer={self.layer_id}]")
         return final_hidden_states
 
     def forward_cpu(

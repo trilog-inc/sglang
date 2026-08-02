@@ -111,6 +111,7 @@ from sglang.srt.model_executor.runner import (
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    debug_break_graph,
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -1711,6 +1712,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        debug_break_graph(f"dsv4_attention_input[layer={self.layer_id}]")
+
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -1718,6 +1721,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=x_quant,
             )
+
+        debug_break_graph(f"dsv4_attention_output[layer={self.layer_id}]")
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1791,6 +1796,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             post = kt_graph_method.bridge_cuda_graph_tensor("ffn_post", post)
             comb = kt_graph_method.bridge_cuda_graph_tensor("ffn_comb", comb)
 
+        debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
+
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
@@ -1800,6 +1807,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            debug_break_graph(f"dsv4_decoder_output[layer={self.layer_id}]")
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
