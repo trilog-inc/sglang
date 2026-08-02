@@ -929,6 +929,12 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                # KT is an eager BCG seam and completes before this branch
+                # launches the shared expert, so the alternate stream cannot
+                # overlap routed work.  Capturing that side stream in the graph
+                # segment after KT also gives capture and eager execution
+                # different MoE schedules and is unsafe on SM120.
+                and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
                 and not (
                     get_flags().capture.enable_torch_compile
                     and hidden_states.shape[0]
