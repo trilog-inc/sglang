@@ -46,8 +46,9 @@ python scripts/tune_dsv4_dspark_kt.py \
   --output-dir tuning-smoke
 ```
 
-Then run the balanced sweep. The default bounded OFAT search uses at most 24
-server configurations and stress-tests three finalists:
+Then run the balanced sweep. The default bounded OFAT search includes the
+four-thread CPUInfer sweep, adds at most eight mixed configurations, uses a
+hard ceiling of 128 server configurations, and stress-tests three finalists:
 
 ```bash
 python scripts/tune_dsv4_dspark_kt.py \
@@ -112,19 +113,31 @@ For every comma-separated option, the first value is the baseline. Defaults:
 --ragged-verify-modes     static
 ```
 
-The script also tests automatically detected all-NUMA physical/logical thread
-layouts and, on a multi-NUMA host, GPU-local physical/logical layouts. Override
-them with repeatable `LABEL:THREADS:NODE,NODE` values:
+The automatic CPU search keeps all online logical CPUs as the baseline, then
+tests `--kt-cpuinfer` at 4-thread intervals (`4,8,12,...`) on the same all-NUMA
+layout. On a multi-NUMA host it also tests GPU-local physical/logical endpoint
+layouts. Change or bound the interval sweep with:
+
+```bash
+--cpuinfer-step 4 --cpuinfer-min 4 --cpuinfer-max 128
+```
+
+`--cpuinfer-max` defaults to the number of online logical CPUs. The detected
+thread counts are printed by `--dry-run`. Make sure `--max-configs` is large
+enough to include the desired high thread counts; its default is 128.
+
+Override the automatic sweep completely with repeatable
+`LABEL:THREADS:NODE,NODE` values:
 
 ```bash
 --cpu-layout all-physical:112:0,1 \
 --cpu-layout gpu-local:56:0
 ```
 
-The OFAT strategy measures each individual change and fills the remaining
-`--max-configs` budget with deterministic mixed configurations. A Cartesian
-search is available, but should be bounded because every candidate reloads the
-model:
+The OFAT strategy measures each individual change and adds up to
+`--mixed-configs 8` deterministic mixed configurations without exceeding
+`--max-configs`. A Cartesian search is available, but should be bounded because
+every candidate reloads the model:
 
 ```bash
 --search-strategy cartesian --max-configs 48

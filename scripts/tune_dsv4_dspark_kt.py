@@ -251,20 +251,47 @@ def detect_gpu_numa_node(nvidia_smi_gpu: str) -> int | None:
     return node if node >= 0 else None
 
 
-def auto_cpu_layouts(nvidia_smi_gpu: str) -> list[CpuLayout]:
+def auto_cpu_layouts(
+    nvidia_smi_gpu: str,
+    *,
+    cpuinfer_step: int,
+    cpuinfer_min: int,
+    cpuinfer_max: int | None,
+) -> list[CpuLayout]:
     topology = detect_cpu_topology()
     nodes: dict[int, list[int]] = topology["nodes"]
     node_ids = tuple(sorted(nodes))
     logical = int(topology["logical_cpus"])
-    physical = int(topology["physical_cores"])
     local_node = detect_gpu_numa_node(nvidia_smi_gpu)
     if local_node not in nodes:
         local_node = node_ids[0]
 
-    candidates = [
-        CpuLayout("all_logical", logical, len(node_ids), node_ids),
-        CpuLayout("all_physical", physical, len(node_ids), node_ids),
-    ]
+    threadpool_count = len(node_ids)
+    upper = min(cpuinfer_max if cpuinfer_max is not None else logical, logical)
+    lower = max(cpuinfer_min, threadpool_count)
+    first_step = ((lower + cpuinfer_step - 1) // cpuinfer_step) * cpuinfer_step
+    if first_step > upper and logical < lower:
+        raise ValueError(
+            f"CPUInfer lower bound {cpuinfer_min} exceeds the {logical} online CPUs"
+        )
+
+    # Keep the historical all-logical configuration as the baseline. Sweep
+    # the same all-NUMA layout at four-thread intervals (or the requested
+    # step), which isolates --kt-cpuinfer from NUMA placement changes.
+    candidates = [CpuLayout("all_logical", logical, threadpool_count, node_ids)]
+    label_width = max(2, len(str(logical)))
+    for threads in range(first_step, upper + 1, cpuinfer_step):
+        if threads == logical:
+            continue
+        candidates.append(
+            CpuLayout(
+                f"all_numa_cpuinfer_{threads:0{label_width}d}",
+                threads,
+                threadpool_count,
+                node_ids,
+            )
+        )
+
     if len(node_ids) > 1:
         local_logical = len(nodes[local_node])
         local_physical = int(topology["physical_cores_by_node"][local_node])
@@ -300,7 +327,12 @@ def replace_config(config: ServerConfig, label: str, **changes: Any) -> ServerCo
 
 
 def build_candidates(args: argparse.Namespace) -> list[ServerConfig]:
-    cpu_layouts = args.cpu_layout or auto_cpu_layouts(args.nvidia_smi_gpu)
+    cpu_layouts = args.cpu_layout or auto_cpu_layouts(
+        args.nvidia_smi_gpu,
+        cpuinfer_step=args.cpuinfer_step,
+        cpuinfer_min=args.cpuinfer_min,
+        cpuinfer_max=args.cpuinfer_max,
+    )
     if not cpu_layouts:
         raise RuntimeError("no CPU layouts were detected or supplied")
 
@@ -348,7 +380,10 @@ def build_candidates(args: argparse.Namespace) -> list[ServerConfig]:
         # interactions (for example gamma x concurrency x CPU layout) are not
         # completely missed by the OFAT pass.
         mixed_index = 0
-        while len(candidates) < args.max_configs:
+        mixed_target = min(
+            args.max_configs, len(candidates) + args.mixed_configs
+        )
+        while len(candidates) < mixed_target:
             changes: dict[str, Any] = {}
             for knob_index, (name, values) in enumerate(spaces):
                 if len(values) == 1:
@@ -375,6 +410,20 @@ def build_candidates(args: argparse.Namespace) -> list[ServerConfig]:
         deduped.append(candidate)
         if len(deduped) >= args.max_configs:
             break
+    represented_cpu_layouts = {config.cpu_layout.label for config in deduped}
+    omitted_cpu_layouts = [
+        layout.label
+        for layout in cpu_layouts
+        if layout.label not in represented_cpu_layouts
+    ]
+    if omitted_cpu_layouts and args.search_strategy == "ofat":
+        print(
+            f"WARNING: --max-configs={args.max_configs} omits "
+            f"{len(omitted_cpu_layouts)} CPUInfer/NUMA candidates. Raise "
+            "--max-configs or lower --cpuinfer-max. First omitted: "
+            + ",".join(omitted_cpu_layouts[:8]),
+            file=sys.stderr,
+        )
     return deduped[args.config_start : args.config_end]
 
 
@@ -1345,6 +1394,13 @@ def print_plan(
     stress_workloads: Sequence[Workload],
 ) -> None:
     print(f"Server candidates ({len(candidates)}):")
+    cpuinfer_values = unique_preserving_order(
+        config.cpu_layout.cpuinfer_threads for config in candidates
+    )
+    print(
+        "KT CPUInfer thread counts represented: "
+        + ",".join(str(value) for value in cpuinfer_values)
+    )
     for index, config in enumerate(candidates):
         print(
             f"  {index:02d} {config.config_id} {config.label}: "
@@ -1380,7 +1436,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--search-strategy", choices=("ofat", "cartesian"), default="ofat")
-    parser.add_argument("--max-configs", type=int, default=24)
+    parser.add_argument("--max-configs", type=int, default=128)
+    parser.add_argument(
+        "--mixed-configs",
+        type=int,
+        default=8,
+        help="Maximum mixed/interacting configurations added after the OFAT sweep",
+    )
     parser.add_argument("--config-start", type=int, default=0)
     parser.add_argument("--config-end", type=int, default=None)
     parser.add_argument("--finalists", type=int, default=3)
@@ -1408,10 +1470,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dspark-multistream", default="true,false")
     parser.add_argument("--ragged-verify-modes", default="static")
     parser.add_argument(
+        "--cpuinfer-step",
+        type=int,
+        default=4,
+        help="Thread increment for the automatic all-NUMA --kt-cpuinfer sweep",
+    )
+    parser.add_argument(
+        "--cpuinfer-min",
+        type=int,
+        default=4,
+        help="Minimum thread count for the automatic --kt-cpuinfer sweep",
+    )
+    parser.add_argument(
+        "--cpuinfer-max",
+        type=int,
+        default=None,
+        help="Maximum automatic --kt-cpuinfer threads; defaults to online logical CPUs",
+    )
+    parser.add_argument(
         "--cpu-layout",
         action="append",
         type=parse_custom_cpu_layout,
-        help="Repeatable LABEL:THREADS:NODE,NODE; default auto-detects useful layouts",
+        help=(
+            "Repeatable LABEL:THREADS:NODE,NODE; supplying one disables the "
+            "automatic four-thread CPUInfer sweep"
+        ),
     )
 
     parser.add_argument("--concurrencies", default="1,2,4,8,16,32")
@@ -1440,6 +1523,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.extra_server_args = args.extra_server_args[1:]
     if args.max_configs <= 0 or args.finalists <= 0:
         parser.error("--max-configs and --finalists must be positive")
+    if args.mixed_configs < 0:
+        parser.error("--mixed-configs must be non-negative")
+    if args.cpuinfer_step <= 0 or args.cpuinfer_min <= 0:
+        parser.error("--cpuinfer-step and --cpuinfer-min must be positive")
+    if args.cpuinfer_max is not None and args.cpuinfer_max <= 0:
+        parser.error("--cpuinfer-max must be positive")
+    if (
+        args.cpuinfer_max is not None
+        and args.cpuinfer_min > args.cpuinfer_max
+    ):
+        parser.error("--cpuinfer-min must be <= --cpuinfer-max")
     if args.config_end is not None and args.config_end < args.config_start:
         parser.error("--config-end must be >= --config-start")
     return args

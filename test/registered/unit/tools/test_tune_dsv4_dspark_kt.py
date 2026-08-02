@@ -3,6 +3,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
@@ -43,7 +44,7 @@ class TestDSparkKTTuner(unittest.TestCase):
         )
 
     def test_bounded_search_covers_each_knob(self):
-        args = self.make_args("--max-configs", "24")
+        args = self.make_args("--max-configs", "24", "--mixed-configs", "9")
         candidates = self.tuner.build_candidates(args)
 
         self.assertEqual(len(candidates), 24)
@@ -62,6 +63,28 @@ class TestDSparkKTTuner(unittest.TestCase):
                 "dspark_multistream",
             }.issubset(labels)
         )
+
+    def test_auto_cpuinfer_sweep_uses_four_thread_intervals(self):
+        topology = {
+            "nodes": {0: list(range(32)), 1: list(range(32, 64))},
+            "logical_cpus": 64,
+            "physical_cores": 32,
+            "physical_cores_by_node": {0: 16, 1: 16},
+        }
+        with (
+            patch.object(self.tuner, "detect_cpu_topology", return_value=topology),
+            patch.object(self.tuner, "detect_gpu_numa_node", return_value=0),
+        ):
+            layouts = self.tuner.auto_cpu_layouts(
+                "0", cpuinfer_step=4, cpuinfer_min=4, cpuinfer_max=32
+            )
+
+        all_numa_threads = [
+            layout.cpuinfer_threads
+            for layout in layouts
+            if layout.numa_nodes == (0, 1)
+        ]
+        self.assertEqual(all_numa_threads, [64, 4, 8, 12, 16, 20, 24, 28, 32])
 
     def test_long_context_matrix_respects_token_budget(self):
         args = self.make_args("--profile", "exhaustive")
