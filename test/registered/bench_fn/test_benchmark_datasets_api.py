@@ -117,7 +117,10 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
 
             flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
             post.assert_called_once_with(
-                "http://127.0.0.1:30000/flush_cache", headers={}
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 60.0},
+                timeout=65.0,
             )
 
 

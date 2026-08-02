@@ -60,7 +60,9 @@ python scripts/tune_dsv4_dspark_kt.py \
 ```
 
 Run the same command again to resume after an interruption. Pass `--no-resume`
-to rotate the old `results.jsonl` and start a fresh measurement set.
+to rotate the old `results.jsonl` and start a fresh measurement set. Successful
+trials are skipped and failed trials are retried by default; pass
+`--skip-failed` only when known-bad configurations should remain skipped.
 
 The generated `tuning-balanced/launch_best.sh` contains the selected settings
 and explicitly unsets launch-blocking/BCG diagnostic variables before starting

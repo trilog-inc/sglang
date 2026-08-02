@@ -456,6 +456,9 @@ def config_environment(
     base: dict[str, str], config: ServerConfig, cuda_visible_devices: str
 ) -> dict[str, str]:
     env = dict(base)
+    legacy_repo = env.pop("SGL_REPO", None)
+    if legacy_repo is not None and "SGLANG_REPO" not in env:
+        env["SGLANG_REPO"] = legacy_repo
     for name in DEBUG_ENV_VARS:
         env.pop(name, None)
     env.update(
@@ -729,7 +732,7 @@ def build_benchmark_command(
         "--random-output-len",
         str(workload.output_len),
         "--random-range-ratio",
-        "0",
+        "1",
         "--request-rate",
         "inf",
         "--max-concurrency",
@@ -939,6 +942,14 @@ def check_log_for_fatal_errors(path: Path) -> str | None:
     return None
 
 
+def should_run_trial(previous: dict[str, Any] | None, skip_failed: bool) -> bool:
+    if previous is None:
+        return True
+    if previous.get("status") == "ok":
+        return False
+    return not skip_failed
+
+
 def run_config(
     args: argparse.Namespace,
     config: ServerConfig,
@@ -947,12 +958,13 @@ def run_config(
     results_path: Path,
     result_index: dict[tuple[str, str, str], dict[str, Any]],
 ) -> None:
-    pending = [
-        workload
-        for workload in workloads
-        if result_key(config.config_id, stage, workload.workload_id)
-        not in result_index
-    ]
+    pending: list[Workload] = []
+    for workload in workloads:
+        previous = result_index.get(
+            result_key(config.config_id, stage, workload.workload_id)
+        )
+        if should_run_trial(previous, args.skip_failed):
+            pending.append(workload)
     if not pending:
         print(f"[{config.label}/{stage}] already complete; skipping")
         return
@@ -1317,7 +1329,7 @@ def write_best_config(
         json.dumps(payload, indent=2, sort_keys=True) + "\n"
     )
     lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    lines.append("unset " + " ".join(DEBUG_ENV_VARS))
+    lines.append("unset " + " ".join((*DEBUG_ENV_VARS, "SGL_REPO")))
     lines.append("")
     for name, value in sorted(env.items()):
         lines.append(f"export {name}={shlex.quote(value)}")
@@ -1377,6 +1389,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--skip-failed",
+        action="store_true",
+        help="Do not retry failed trials when resuming (successful trials are always skipped)",
+    )
     parser.add_argument("--require-output-match", action="store_true")
 
     # The first value of every list defines the baseline.

@@ -974,10 +974,27 @@ _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
 def flush_server_cache(base_url: str, backend: str) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
-    cache_endpoint = (
-        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
-    )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    if backend.startswith("vllm"):
+        response = requests.post(
+            base_url + "/reset_prefix_cache", headers=get_auth_headers()
+        )
+    elif backend.startswith("sglang"):
+        # A streamed warmup response can finish at the HTTP layer just before
+        # the scheduler removes the request from its running batch. SGLang's
+        # no-wait flush returns HTTP 400 in that small window. Ask the deferred
+        # flush endpoint to wait for scheduler idle instead of failing an
+        # otherwise valid benchmark run.
+        flush_timeout_s = 60.0
+        response = requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            params={"timeout": flush_timeout_s},
+            timeout=flush_timeout_s + 5.0,
+        )
+    else:
+        response = requests.post(
+            base_url + "/flush_cache", headers=get_auth_headers()
+        )
     response.raise_for_status()
 
 

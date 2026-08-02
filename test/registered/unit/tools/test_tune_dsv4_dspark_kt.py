@@ -85,6 +85,7 @@ class TestDSparkKTTuner(unittest.TestCase):
             {
                 "SGLANG_BCG_DEBUG_REPLAY": "1",
                 "CUDA_LAUNCH_BLOCKING": "1",
+                "SGL_REPO": "/tmp/sglang",
             },
             config,
             "0",
@@ -95,7 +96,19 @@ class TestDSparkKTTuner(unittest.TestCase):
         self.assertIn("breakable", command)
         self.assertNotIn("SGLANG_BCG_DEBUG_REPLAY", environment)
         self.assertNotIn("CUDA_LAUNCH_BLOCKING", environment)
+        self.assertNotIn("SGL_REPO", environment)
+        self.assertEqual(environment["SGLANG_REPO"], "/tmp/sglang")
         self.assertEqual(environment["KT_MXFP4_BACKEND"], "amx")
+
+    def test_benchmark_uses_exact_requested_token_lengths(self):
+        args = self.make_args()
+        workload = self.tuner.Workload("fixed", 128, 256, 4, 8)
+        command = self.tuner.build_benchmark_command(
+            args, workload, Path("benchmark.jsonl")
+        )
+
+        ratio_index = command.index("--random-range-ratio") + 1
+        self.assertEqual(command[ratio_index], "1")
 
     def test_arguments_are_json_serializable(self):
         args = self.make_args()
@@ -107,6 +120,18 @@ class TestDSparkKTTuner(unittest.TestCase):
 
         self.assertEqual(smoke.name, balanced.name)
         self.assertNotEqual(smoke.workload_id, balanced.workload_id)
+
+    def test_resume_retries_failures_but_not_successes(self):
+        self.assertTrue(self.tuner.should_run_trial(None, skip_failed=False))
+        self.assertTrue(
+            self.tuner.should_run_trial({"status": "failed"}, skip_failed=False)
+        )
+        self.assertFalse(
+            self.tuner.should_run_trial({"status": "failed"}, skip_failed=True)
+        )
+        self.assertFalse(
+            self.tuner.should_run_trial({"status": "ok"}, skip_failed=False)
+        )
 
     def test_ranking_rewards_throughput_and_latency(self):
         args = self.make_args("--max-configs", "2")
