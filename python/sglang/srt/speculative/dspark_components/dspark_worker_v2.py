@@ -8,6 +8,9 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.quantization.fp8_utils import (
     fp8_gemm_runner_backend_context,
@@ -427,6 +430,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_context,
             speculative_moe_backend_context(),
             fp8_gemm_runner_backend_context(self._draft_fp8_gemm_backend),
+            # EPLB/stat counters describe target routing and live on the target
+            # device.  Recording DSpark's auxiliary model would both pollute
+            # those statistics and, for a remote draft, mix CUDA devices.
+            get_global_expert_distribution_recorder().disable_this_region(),
         ):
             yield
 

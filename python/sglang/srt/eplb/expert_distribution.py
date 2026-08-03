@@ -173,6 +173,14 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         outputs = {}
+        # A speculative/MTP model can have its own ModelRunner nested inside a
+        # target forward.  When that region is disabled, suppress the whole
+        # recorder lifecycle as well as the individual routing hooks.  Merely
+        # suppressing _on_hook is insufficient: an actively recording nested
+        # runner would otherwise reset and collect the target gatherers.
+        if self._disable_all:
+            yield outputs
+            return
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
             try:

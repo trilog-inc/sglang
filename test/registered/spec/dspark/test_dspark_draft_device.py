@@ -3,11 +3,14 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+import sglang.srt.speculative.dspark_components.dspark_worker_v2 as dspark_worker_module
+from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
 from sglang.srt.layers.quantization.fp8_utils import (
     Fp8GemmRunnerBackend,
     fp8_gemm_runner_backend_context,
@@ -18,6 +21,7 @@ from sglang.srt.speculative.draft_worker_common import (
     ensure_flashinfer_sampling_multiarch,
     resolve_speculative_draft_device,
 )
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,6 +66,64 @@ class TestResolveSpeculativeDraftDevice(CustomTestCase):
             self.assertEqual(
                 get_fp8_gemm_runner_backend(), Fp8GemmRunnerBackend.CUTLASS
             )
+
+    def test_draft_context_disables_target_expert_distribution_recorder(self):
+        class FakeRecorder:
+            disabled_depth = 0
+
+            @contextmanager
+            def disable_this_region(self):
+                self.disabled_depth += 1
+                try:
+                    yield
+                finally:
+                    self.disabled_depth -= 1
+
+        recorder = FakeRecorder()
+        worker = object.__new__(DSparkWorkerV2)
+        worker._draft_dp_context_enabled = False
+        worker.draft_gpu_id = 1
+        worker._draft_fp8_gemm_backend = "auto"
+
+        with (
+            patch.object(
+                dspark_worker_module,
+                "draft_cuda_device_context",
+                side_effect=lambda *_args: nullcontext(),
+            ),
+            patch.object(
+                dspark_worker_module,
+                "speculative_moe_backend_context",
+                side_effect=nullcontext,
+            ),
+            patch.object(
+                dspark_worker_module,
+                "fp8_gemm_runner_backend_context",
+                side_effect=lambda *_args: nullcontext(),
+            ),
+            patch.object(
+                dspark_worker_module,
+                "get_global_expert_distribution_recorder",
+                return_value=recorder,
+            ),
+        ):
+            with worker._draft_context():
+                self.assertEqual(recorder.disabled_depth, 1)
+
+        self.assertEqual(recorder.disabled_depth, 0)
+
+    def test_disabled_recorder_skips_nested_forward_lifecycle(self):
+        recorder = object.__new__(_ExpertDistributionRecorderReal)
+        recorder._disable_all = False
+        events = []
+        recorder._on_forward_pass_start = lambda _batch: events.append("start")
+        recorder._on_forward_pass_end = lambda _pass_id, _outputs: events.append("end")
+
+        with recorder.disable_this_region():
+            with recorder.with_forward_pass(1, SimpleNamespace()) as outputs:
+                self.assertEqual(outputs, {})
+
+        self.assertEqual(events, [])
 
     def test_flashinfer_sampling_is_forced_to_multiarch_jit(self):
         fake_flashinfer = ModuleType("flashinfer")
