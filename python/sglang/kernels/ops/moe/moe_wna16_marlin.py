@@ -160,41 +160,45 @@ def moe_wna16_marlin_gemm(
         if c_tmp.numel() > 0:
             c_tmp.zero_()
 
-    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
-    module.moe_wna16_marlin_gemm(
-        a,
-        c,
-        b_q_weight,
-        b_bias_t,
-        b_scales,
-        global_scale_t,
-        b_zeros_t,
-        g_idx_t,
-        perm_t,
-        workspace,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        a_tmp,
-        c_tmp,
-        moe_block_size,
-        top_k,
-        mul_topk_weights,
-        is_ep,
-        b_q_type.id,
-        size_m,
-        size_n,
-        size_k,
-        has_act_order,
-        has_bias,
-        is_k_full,
-        has_zp,
-        num_groups,
-        group_size,
-        use_atomic_add,
-        use_fp32_reduce,
-        is_zp_float,
-    )
+    # Make both the architecture-partitioned module lookup and launch follow
+    # the activation tensor, not whichever heterogeneous DSpark GPU happened
+    # to be current previously.
+    with torch.cuda.device(a.device):
+        module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+        module.moe_wna16_marlin_gemm(
+            a,
+            c,
+            b_q_weight,
+            b_bias_t,
+            b_scales,
+            global_scale_t,
+            b_zeros_t,
+            g_idx_t,
+            perm_t,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights,
+            a_tmp,
+            c_tmp,
+            moe_block_size,
+            top_k,
+            mul_topk_weights,
+            is_ep,
+            b_q_type.id,
+            size_m,
+            size_n,
+            size_k,
+            has_act_order,
+            has_bias,
+            is_k_full,
+            has_zp,
+            num_groups,
+            group_size,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
 
     return c

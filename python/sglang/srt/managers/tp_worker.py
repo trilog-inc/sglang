@@ -540,6 +540,22 @@ class TpModelWorker(BaseTpWorker):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
+        # A target and a remote speculative draft share this scheduler process.
+        # Third-party and SGL JIT kernels may select/compile code for the
+        # process's current CUDA device rather than infer it from their tensor
+        # arguments. Re-assert this worker's device at the complete
+        # forward+sample boundary so a draft call can never make the target
+        # compile or launch an SM8x kernel on SM120 (or vice versa).
+        if torch.device(self.device).type == "cuda":
+            current_device = torch.cuda.current_device()
+            if current_device != self.gpu_id:
+                logger.debug(
+                    "Restoring TpModelWorker CUDA device from cuda:%d to cuda:%d.",
+                    current_device,
+                    self.gpu_id,
+                )
+                torch.cuda.set_device(self.gpu_id)
+
         # Get forward batch from schedule batch
         if batch is not None:
             # update the consumer index of hicache to the running batch

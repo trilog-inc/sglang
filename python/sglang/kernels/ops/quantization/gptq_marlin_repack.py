@@ -43,8 +43,11 @@ def gptq_marlin_repack(
         device=b_q_weight.device,
     )
 
-    module = _jit_gptq_marlin_repack_module()
-    module.gptq_marlin_repack(b_q_weight, perm, out, size_k, size_n, num_bits)
+    # JIT architecture detection is based on the current CUDA device. This
+    # op can coexist with a remote DSpark draft of a different architecture.
+    with torch.cuda.device(b_q_weight.device):
+        module = _jit_gptq_marlin_repack_module()
+        module.gptq_marlin_repack(b_q_weight, perm, out, size_k, size_n, num_bits)
     return out
 
 
@@ -85,6 +88,7 @@ def mxfp4_marlin_repack(
             f"out must be int32 {expected_shape}, got {out.dtype} {tuple(out.shape)}"
         )
 
-    module = _jit_gptq_marlin_repack_module()
-    module.mxfp4_marlin_repack(b_q_weight, out, size_k, size_n)
+    with torch.cuda.device(b_q_weight.device):
+        module = _jit_gptq_marlin_repack_module()
+        module.mxfp4_marlin_repack(b_q_weight, out, size_k, size_n)
     return out
