@@ -16,6 +16,9 @@ KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUMA_NODES="${KT_NUMA_NODES:-}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-96}"
 KT_AMX_MIN_TOKENS_PER_EXPERT="${KT_AMX_MIN_TOKENS_PER_EXPERT:-4}"
+KT_GPU_PREFILL_TOKEN_THRESHOLD="${KT_GPU_PREFILL_TOKEN_THRESHOLD:-4096}"
+KT_MXFP4_PREFILL_SLOTS="${KT_MXFP4_PREFILL_SLOTS:-auto}"
+KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS="${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS:-8}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.86}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 HOST="${HOST:-0.0.0.0}"
@@ -84,6 +87,9 @@ serve() {
     --kt-method MXFP4 \
     --kt-mxfp4-backend amx \
     --kt-mxfp4-amx-min-tokens-per-expert "${KT_AMX_MIN_TOKENS_PER_EXPERT}" \
+    --kt-gpu-prefill-token-threshold "${KT_GPU_PREFILL_TOKEN_THRESHOLD}" \
+    --kt-mxfp4-prefill-slots "${KT_MXFP4_PREFILL_SLOTS}" \
+    --kt-mxfp4-prefill-host-staging-experts "${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS}" \
     --kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS}" \
     --kt-expert-placement-strategy uniform \
     --kt-cpuinfer "${KT_CPU_THREADS}" \
@@ -92,6 +98,8 @@ serve() {
     --disable-shared-experts-fusion \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
+    --cuda-graph-backend-decode breakable \
+    --cuda-graph-backend-prefill disabled \
     --swa-full-tokens-ratio 0.1 \
     --host "${HOST}" \
     --port "${PORT}" \

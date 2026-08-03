@@ -55,6 +55,9 @@ class TestDSparkKTTuner(unittest.TestCase):
             {
                 "gpu_experts",
                 "amx_min_tokens",
+                "gpu_prefill_threshold",
+                "mxfp4_prefill_slots",
+                "prefill_host_staging_experts",
                 "dspark_block_size",
                 "chunked_prefill_size",
                 "max_running_requests",
@@ -80,9 +83,7 @@ class TestDSparkKTTuner(unittest.TestCase):
             )
 
         all_numa_threads = [
-            layout.cpuinfer_threads
-            for layout in layouts
-            if layout.numa_nodes == (0, 1)
+            layout.cpuinfer_threads for layout in layouts if layout.numa_nodes == (0, 1)
         ]
         self.assertEqual(all_numa_threads, [64, 4, 8, 12, 16, 20, 24, 28, 32])
 
@@ -117,6 +118,9 @@ class TestDSparkKTTuner(unittest.TestCase):
         self.assertIn("MXFP4", command)
         self.assertNotIn("AMXINT4", command)
         self.assertIn("breakable", command)
+        self.assertIn("--kt-gpu-prefill-token-threshold", command)
+        self.assertIn("--kt-mxfp4-prefill-slots", command)
+        self.assertIn("--kt-mxfp4-prefill-host-staging-experts", command)
         self.assertNotIn("SGLANG_BCG_DEBUG_REPLAY", environment)
         self.assertNotIn("CUDA_LAUNCH_BLOCKING", environment)
         self.assertNotIn("SGL_REPO", environment)

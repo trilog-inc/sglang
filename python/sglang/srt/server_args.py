@@ -2933,6 +2933,21 @@ class ServerArgs:
         "[ktransformers parameter] Per-expert token crossover for native AMX-BF16 tiles; smaller batches use AVX512-BF16. Set 0 to force AMX.",
         NS("exec.moe"),
     ] = 4
+    kt_gpu_prefill_token_threshold: A[
+        int,
+        "[ktransformers parameter] Use a full-GPU layerwise native-MXFP4 Marlin path when a prefill MoE batch reaches this token count. 0 disables it.",
+        NS("exec.moe"),
+    ] = 0
+    kt_mxfp4_prefill_slots: A[
+        str,
+        "[ktransformers parameter] Prepared layer slots for MXFP4 prefill: auto, 1, or 2. Auto falls back to one slot when VRAM is limited.",
+        NS("exec.moe"),
+    ] = "auto"
+    kt_mxfp4_prefill_host_staging_experts: A[
+        int,
+        "[ktransformers parameter] Number of pinned one-expert host staging buffers used to overlap kt-kernel packing with layerwise GPU prefill.",
+        NS("exec.moe"),
+    ] = 8
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",

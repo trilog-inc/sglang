@@ -11,6 +11,7 @@ scales directly.  It never converts the model to AMXINT4.
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 from dataclasses import dataclass, replace
@@ -46,6 +47,9 @@ except ImportError:
 logger = logging.getLogger(__name__)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 _SHARED_STAGING_BUFFER: Optional["SharedStagingBuffer"] = None
+_MXFP4_PREFILL_LAYER_REGISTRY: dict[tuple, dict[int, tuple]] = {}
+_MXFP4_LAYERWISE_MANAGERS: dict[tuple, "_Mxfp4LayerwisePrefillManager"] = {}
+_MXFP4_LAYERWISE_DISABLED_REASONS: dict[tuple, str] = {}
 
 
 @dataclass
@@ -58,6 +62,9 @@ class KTConfig:
     chunked_prefill_size: int
     max_deferred_experts_per_token: Optional[int]
     method: str
+    gpu_prefill_token_threshold: int = 0
+    mxfp4_prefill_slots: str = "auto"
+    mxfp4_prefill_host_staging_experts: int = 8
     numa_nodes: Optional[list[int]] = None
     num_layers: Optional[int] = None
 
@@ -76,9 +83,7 @@ class SharedStagingBuffer:
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.device = device
-        self.buffer = torch.empty(
-            (max_tokens, hidden_size), dtype=dtype, device=device
-        )
+        self.buffer = torch.empty((max_tokens, hidden_size), dtype=dtype, device=device)
         logger.info(
             "KT shared staging buffer: shape=%s dtype=%s device=%s size=%.1f MiB",
             tuple(self.buffer.shape),
@@ -193,9 +198,7 @@ def _moe_layer_indices(hf_config) -> list[int]:
     else:
         frequency = max(1, int(frequency or 1))
         routed = {
-            i
-            for i in range(first_moe, num_layers)
-            if (i - first_moe) % frequency == 0
+            i for i in range(first_moe, num_layers) if (i - first_moe) % frequency == 0
         }
 
     # DeepSeek-V4 hash layers are routed MoE layers even though inherited HF
@@ -257,9 +260,7 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
     else:
         per_layer = int(per_layer or 0)
         if not 0 <= per_layer <= num_experts:
-            raise ValueError(
-                f"--kt-num-gpu-experts must be in [0, {num_experts}]"
-            )
+            raise ValueError(f"--kt-num-gpu-experts must be in [0, {num_experts}]")
         num_gpu_experts = per_layer * len(moe_layers)
 
     masks = torch.zeros((num_layers, num_experts), dtype=torch.bool, device="cpu")
@@ -281,7 +282,10 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
             str(freq_path), num_layers=num_layers, num_experts=num_experts
         )
         flat_scores = torch.tensor(
-            [float(scores[layer_idx, expert_idx]) for layer_idx, expert_idx in positions]
+            [
+                float(scores[layer_idx, expert_idx])
+                for layer_idx, expert_idx in positions
+            ]
         )
         selected = torch.topk(
             flat_scores,
@@ -362,15 +366,29 @@ def create_kt_config_from_server_args(
         raise ValueError("--kt-mxfp4-backend must be amx, auto, or avx2")
     threshold = server_args.kt_mxfp4_amx_min_tokens_per_expert
     if not 0 <= threshold <= 1024:
-        raise ValueError(
-            "--kt-mxfp4-amx-min-tokens-per-expert must be in [0, 1024]"
-        )
+        raise ValueError("--kt-mxfp4-amx-min-tokens-per-expert must be in [0, 1024]")
     if method == "MXFP4":
         if backend == "auto":
             os.environ.pop("KT_MXFP4_BACKEND", None)
         else:
             os.environ["KT_MXFP4_BACKEND"] = backend
         os.environ["KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT"] = str(threshold)
+
+    gpu_prefill_threshold = int(
+        getattr(server_args, "kt_gpu_prefill_token_threshold", 0)
+    )
+    if gpu_prefill_threshold < 0:
+        raise ValueError("--kt-gpu-prefill-token-threshold must be non-negative")
+    if gpu_prefill_threshold > 0 and get_parallel().tp_size != 1:
+        raise ValueError("KT native-MXFP4 layerwise prefill currently requires --tp 1")
+    prefill_slots = str(getattr(server_args, "kt_mxfp4_prefill_slots", "auto")).lower()
+    if prefill_slots not in ("auto", "1", "2"):
+        raise ValueError("--kt-mxfp4-prefill-slots must be auto, 1, or 2")
+    host_staging_experts = int(
+        getattr(server_args, "kt_mxfp4_prefill_host_staging_experts", 8)
+    )
+    if not 2 <= host_staging_experts <= 64:
+        raise ValueError("--kt-mxfp4-prefill-host-staging-experts must be in [2, 64]")
 
     masks = _build_gpu_expert_masks(server_args)
     if masks is None or layer_idx >= masks.shape[0]:
@@ -393,9 +411,7 @@ def create_kt_config_from_server_args(
         )
     numa_nodes = server_args.kt_numa_nodes
     if numa_nodes is not None and len(numa_nodes) != threadpool_count:
-        raise ValueError(
-            "--kt-numa-nodes length must equal --kt-threadpool-count"
-        )
+        raise ValueError("--kt-numa-nodes length must equal --kt-threadpool-count")
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -406,6 +422,9 @@ def create_kt_config_from_server_args(
         weight_path=server_args.kt_weight_path,
         chunked_prefill_size=int(server_args.chunked_prefill_size or 8192),
         method=method,
+        gpu_prefill_token_threshold=gpu_prefill_threshold,
+        mxfp4_prefill_slots=prefill_slots,
+        mxfp4_prefill_host_staging_experts=host_staging_experts,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=int(getattr(hf_config, "num_hidden_layers")),
     )
@@ -457,9 +476,7 @@ def partition_and_remap_expert_ids(
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Run a routed-expert subset on SM120 and the complement in KT-Kernel."""
 
-    def __init__(
-        self, gpu_method: FusedMoEMethodBase, kt_config: KTConfig
-    ) -> None:
+    def __init__(self, gpu_method: FusedMoEMethodBase, kt_config: KTConfig) -> None:
         if not KTRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "kt_kernel is required for --kt-weight-path; install the matching "
@@ -511,14 +528,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._cpu_done_event: Optional[torch.cuda.Event] = None
         self._staging: Optional[SharedStagingBuffer] = None
         self.graph_state_bridge = KTGraphStateBridge()
+        self._mxfp4_pipeline_signature: Optional[tuple] = None
 
-    def bridge_cuda_graph_tensor(
-        self, name: str, tensor: torch.Tensor
-    ) -> torch.Tensor:
+    def bridge_cuda_graph_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         return self.graph_state_bridge.copy(name, tensor)
 
     def gpu_weight_index(self, logical_expert_id: int) -> Optional[int]:
-        if logical_expert_id < 0 or logical_expert_id >= self.logical_to_gpu_index.numel():
+        if (
+            logical_expert_id < 0
+            or logical_expert_id >= self.logical_to_gpu_index.numel()
+        ):
             return None
         index = int(self.logical_to_gpu_index[logical_expert_id])
         return index if index >= 0 else None
@@ -602,6 +621,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.kt_config.gpu_prefill_token_threshold > 0:
+            # FlashInfer SM120 interleaves E8M0 scales in-place. Marlin needs
+            # the checkpoint order, so retain only the compact resident scale
+            # payload in ordinary host memory; keeping these copies on every
+            # layer's GPU would consume several GiB. FP4 weights themselves
+            # remain in native layout.
+            layer._kt_mxfp4_raw_w13_scale_inv = layer.w13_weight_scale_inv.detach().to(
+                device="cpu", copy=True
+            )
+            layer._kt_mxfp4_raw_w2_scale_inv = layer.w2_weight_scale_inv.detach().to(
+                device="cpu", copy=True
+            )
+
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
@@ -612,13 +644,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # static for the lifetime of the server.
             self.wrapper.load_weights(self.cpu_index_to_logical.contiguous())
 
+        _register_mxfp4_prefill_layer(self, layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ) -> None:
         self.moe_runner_config = moe_runner_config
-        gpu_config = replace(
-            moe_runner_config, num_local_experts=self.gpu_weight_slots
-        )
+        gpu_config = replace(moe_runner_config, num_local_experts=self.gpu_weight_slots)
         self.gpu_method.create_moe_runner(layer, gpu_config)
 
     def _apply_impl(
@@ -632,6 +664,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
         staged = None
+
+        if (
+            self.kt_config.gpu_prefill_token_threshold > 0
+            and x.shape[0] >= self.kt_config.gpu_prefill_token_threshold
+            and self._mxfp4_pipeline_signature is not None
+        ):
+            manager = _MXFP4_LAYERWISE_MANAGERS.get(self._mxfp4_pipeline_signature)
+            if manager is not None:
+                return manager.apply(self, layer, dispatch_output)
 
         assert self.gpu_experts_mask_cuda is not None
         assert self.logical_to_gpu_index_cuda is not None
@@ -660,9 +701,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         if self.num_gpu_experts > 0:
             gpu_topk_output = topk_output._replace(topk_ids=gpu_topk_ids)
-            gpu_dispatch_output = dispatch_output._replace(
-                topk_output=gpu_topk_output
-            )
+            gpu_dispatch_output = dispatch_output._replace(topk_output=gpu_topk_output)
             gpu_result = self.gpu_method.apply(layer, gpu_dispatch_output)
             output = gpu_result.hidden_states
         else:
@@ -704,3 +743,487 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if name in ("gpu_method", "wrapper", "kt_config"):
             raise AttributeError(name)
         return getattr(self.gpu_method, name)
+
+
+class _Mxfp4PrefillSlot:
+    def __init__(self, index: int, prepared) -> None:
+        self.index = index
+        self.prepared = prepared
+        self.layer_idx: Optional[int] = None
+        self.epoch = -1
+        self.state = "EMPTY"
+        self.ready_event = torch.cuda.Event()
+        self.consumed_event = torch.cuda.Event()
+        self.has_consumed_event = False
+
+
+class _Mxfp4LayerwisePrefillManager:
+    """Stream one native-MXFP4 expert at a time into prepared Marlin slots."""
+
+    _RAW_NAMES = (
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    )
+
+    def __init__(self, signature: tuple, first_method, first_layer, slot_count: int):
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
+            allocate_v4_mxfp4_marlin,
+        )
+
+        self.signature = signature
+        self.device = first_layer.w13_weight.device
+        self.num_experts = first_method.global_num_experts
+        self.hidden_size = int(first_layer.w13_weight.shape[2]) * 2
+        self.intermediate_size = int(first_layer.w2_weight.shape[2]) * 2
+        self.transfer_stream = torch.cuda.Stream(device=self.device)
+        self.V4MarlinPreparedWeights = V4MarlinPreparedWeights
+        self.slots = [
+            _Mxfp4PrefillSlot(
+                index,
+                allocate_v4_mxfp4_marlin(
+                    num_experts=self.num_experts,
+                    hidden_size=self.hidden_size,
+                    intermediate_size=self.intermediate_size,
+                    device=self.device,
+                ),
+            )
+            for index in range(slot_count)
+        ]
+
+        expert_shapes = {
+            "w13_weight": tuple(first_layer.w13_weight.shape[1:]),
+            "w13_weight_scale_inv": tuple(
+                first_layer._kt_mxfp4_raw_w13_scale_inv.shape[1:]
+            ),
+            "w2_weight": tuple(first_layer.w2_weight.shape[1:]),
+            "w2_weight_scale_inv": tuple(
+                first_layer._kt_mxfp4_raw_w2_scale_inv.shape[1:]
+            ),
+        }
+        raw_dtypes = {
+            "w13_weight": first_layer.w13_weight.dtype,
+            "w13_weight_scale_inv": torch.float8_e8m0fnu,
+            "w2_weight": first_layer.w2_weight.dtype,
+            "w2_weight_scale_inv": torch.float8_e8m0fnu,
+        }
+        host_slots = first_method.kt_config.mxfp4_prefill_host_staging_experts
+        # One stream owns this reusable raw window. Batching preparation cuts
+        # four repack/swizzle launches per expert down to four per window while
+        # keeping raw storage far below a complete DSV4 layer image.
+        self.raw_batch_experts = min(host_slots, 16)
+        self.raw_staging = {
+            name: torch.empty(
+                (self.raw_batch_experts, *shape),
+                dtype=raw_dtypes[name],
+                device=self.device,
+            )
+            for name, shape in expert_shapes.items()
+        }
+
+        host_dtypes = dict(raw_dtypes)
+        host_dtypes["w13_weight_scale_inv"] = torch.bfloat16
+        host_dtypes["w2_weight_scale_inv"] = torch.bfloat16
+        try:
+            self.host_staging = {
+                name: torch.empty(
+                    (host_slots, *shape),
+                    dtype=host_dtypes[name],
+                    device="cpu",
+                    pin_memory=True,
+                )
+                for name, shape in expert_shapes.items()
+            }
+            self.gpu_scale_staging = {
+                "w13_weight_scale_inv": torch.empty(
+                    (self.raw_batch_experts, *expert_shapes["w13_weight_scale_inv"]),
+                    dtype=torch.float8_e8m0fnu,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "w2_weight_scale_inv": torch.empty(
+                    (self.raw_batch_experts, *expert_shapes["w2_weight_scale_inv"]),
+                    dtype=torch.float8_e8m0fnu,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+            }
+            self.host_is_pinned = True
+        except RuntimeError:
+            gc.collect()
+            self.host_staging = {
+                name: torch.empty(
+                    (host_slots, *shape), dtype=host_dtypes[name], device="cpu"
+                )
+                for name, shape in expert_shapes.items()
+            }
+            self.gpu_scale_staging = {
+                name: torch.empty(
+                    (self.raw_batch_experts, *expert_shapes[name]),
+                    dtype=torch.float8_e8m0fnu,
+                    device="cpu",
+                )
+                for name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            }
+            self.host_is_pinned = False
+            logger.warning(
+                "KT MXFP4 prefill could not allocate pinned host staging; "
+                "falling back to synchronous pageable transfers"
+            )
+        self.host_slots = host_slots
+        self.host_free_events = [torch.cuda.Event() for _ in range(host_slots)]
+        self.host_slot_used = [False] * host_slots
+        self.gpu_scale_free_events = [
+            torch.cuda.Event() for _ in range(self.raw_batch_experts)
+        ]
+        self.gpu_scale_slot_used = [False] * self.raw_batch_experts
+        self.current_slot_index: Optional[int] = None
+        self.epoch = -1
+        self.last_position: Optional[int] = None
+
+    @property
+    def registry(self):
+        return _MXFP4_PREFILL_LAYER_REGISTRY[self.signature]
+
+    @property
+    def layer_order(self) -> list[int]:
+        return sorted(self.registry)
+
+    def _prepared_range_view(self, slot: _Mxfp4PrefillSlot, start: int, count: int):
+        prepared = slot.prepared
+        return self.V4MarlinPreparedWeights(
+            w13=prepared.w13[start : start + count],
+            w13_scale=prepared.w13_scale[start : start + count],
+            w2=prepared.w2[start : start + count],
+            w2_scale=prepared.w2_scale[start : start + count],
+            hidden_size=prepared.hidden_size,
+            intermediate_size=prepared.intermediate_size,
+            num_experts=count,
+        )
+
+    def _submit_cpu_expert(self, method, logical_id: int, host_slot: int) -> None:
+        if method.wrapper is None:
+            raise RuntimeError("KT MXFP4 prefill has no CPU weight writer")
+        cpu_id = int(method.logical_to_cpu_index[logical_id])
+        if cpu_id < 0:
+            raise RuntimeError(f"logical expert {logical_id} is not CPU resident")
+        pointers = {
+            name: [int(self.host_staging[name][host_slot].data_ptr())]
+            for name in self._RAW_NAMES
+        }
+        method.wrapper.submit_write_weight_scale_to_buffer(
+            1,
+            cpu_id,
+            pointers["w13_weight"],
+            pointers["w13_weight_scale_inv"],
+            pointers["w2_weight"],
+            pointers["w2_weight_scale_inv"],
+        )
+        method.wrapper.sync_write_weight_scale_to_buffer()
+
+    def _stage_gpu_expert(self, method, layer, logical_id: int, raw_row: int) -> None:
+        gpu_id = int(method.logical_to_gpu_index[logical_id])
+        if gpu_id < 0:
+            raise RuntimeError(f"logical expert {logical_id} is not GPU resident")
+        intermediate = self.intermediate_size
+        dst_w13 = self.raw_staging["w13_weight"][raw_row]
+        src_w13 = layer.w13_weight[gpu_id]
+        # FlashInfer loads compact resident W13 as [up; gate]; Marlin and the
+        # KT writer use [gate; up].
+        dst_w13[:intermediate].copy_(src_w13[intermediate:], non_blocking=True)
+        dst_w13[intermediate:].copy_(src_w13[:intermediate], non_blocking=True)
+        dst_s13 = self.raw_staging["w13_weight_scale_inv"][raw_row]
+        src_s13 = self.gpu_scale_staging["w13_weight_scale_inv"][raw_row]
+        dst_s13[:intermediate].copy_(
+            src_s13[intermediate:], non_blocking=self.host_is_pinned
+        )
+        dst_s13[intermediate:].copy_(
+            src_s13[:intermediate], non_blocking=self.host_is_pinned
+        )
+        self.raw_staging["w2_weight"][raw_row].copy_(
+            layer.w2_weight[gpu_id], non_blocking=True
+        )
+        self.raw_staging["w2_weight_scale_inv"][raw_row].copy_(
+            self.gpu_scale_staging["w2_weight_scale_inv"][raw_row],
+            non_blocking=self.host_is_pinned,
+        )
+        self.gpu_scale_free_events[raw_row].record(self.transfer_stream)
+        self.gpu_scale_slot_used[raw_row] = True
+
+    def _stage_gpu_scales_on_host(
+        self, method, layer, logical_id: int, raw_row: int
+    ) -> None:
+        gpu_id = int(method.logical_to_gpu_index[logical_id])
+        if self.gpu_scale_slot_used[raw_row]:
+            self.gpu_scale_free_events[raw_row].synchronize()
+        self.gpu_scale_staging["w13_weight_scale_inv"][raw_row].copy_(
+            layer._kt_mxfp4_raw_w13_scale_inv[gpu_id]
+        )
+        self.gpu_scale_staging["w2_weight_scale_inv"][raw_row].copy_(
+            layer._kt_mxfp4_raw_w2_scale_inv[gpu_id]
+        )
+
+    def _stage_cpu_expert(self, host_slot: int, raw_row: int) -> None:
+        for name in self._RAW_NAMES:
+            self.raw_staging[name][raw_row].copy_(
+                self.host_staging[name][host_slot],
+                non_blocking=self.host_is_pinned,
+            )
+        self.host_free_events[host_slot].record(self.transfer_stream)
+        self.host_slot_used[host_slot] = True
+
+    def _prepare_raw_batch(
+        self, slot: _Mxfp4PrefillSlot, start: int, count: int
+    ) -> None:
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            prepare_v4_mxfp4_marlin,
+        )
+
+        prepare_v4_mxfp4_marlin(
+            self.raw_staging["w13_weight"][:count],
+            self.raw_staging["w13_weight_scale_inv"][:count],
+            self.raw_staging["w2_weight"][:count],
+            self.raw_staging["w2_weight_scale_inv"][:count],
+            out=self._prepared_range_view(slot, start, count),
+        )
+
+    def _load_slot(self, slot: _Mxfp4PrefillSlot, layer_idx: int, method, layer):
+        slot.state = "LOADING"
+        slot.layer_idx = layer_idx
+        slot.epoch = self.epoch
+        with torch.cuda.stream(self.transfer_stream):
+            if slot.has_consumed_event:
+                self.transfer_stream.wait_event(slot.consumed_event)
+
+        cpu_position = 0
+        for start in range(0, self.num_experts, self.raw_batch_experts):
+            count = min(self.raw_batch_experts, self.num_experts - start)
+            for raw_row, logical_id in enumerate(range(start, start + count)):
+                if bool(method.gpu_experts_mask[logical_id]):
+                    self._stage_gpu_scales_on_host(method, layer, logical_id, raw_row)
+                    with torch.cuda.stream(self.transfer_stream):
+                        self._stage_gpu_expert(method, layer, logical_id, raw_row)
+                    continue
+
+                host_slot = cpu_position % self.host_slots
+                if self.host_slot_used[host_slot]:
+                    self.host_free_events[host_slot].synchronize()
+                self._submit_cpu_expert(method, logical_id, host_slot)
+                with torch.cuda.stream(self.transfer_stream):
+                    self._stage_cpu_expert(host_slot, raw_row)
+                cpu_position += 1
+
+            with torch.cuda.stream(self.transfer_stream):
+                self._prepare_raw_batch(slot, start, count)
+
+        with torch.cuda.stream(self.transfer_stream):
+            slot.ready_event.record(self.transfer_stream)
+        slot.state = "READY"
+
+    def _advance_round(self, layer_idx: int) -> None:
+        position = self.layer_order.index(layer_idx)
+        if self.last_position is None or position <= self.last_position:
+            self.epoch += 1
+        self.last_position = position
+
+    def _acquire(self, layer_idx: int, method, layer):
+        self._advance_round(layer_idx)
+        for slot in self.slots:
+            if (
+                slot.state == "READY"
+                and slot.layer_idx == layer_idx
+                and slot.epoch == self.epoch
+            ):
+                return slot, True
+        index = (
+            0
+            if self.current_slot_index is None
+            else (self.current_slot_index + 1) % len(self.slots)
+        )
+        slot = self.slots[index]
+        self._load_slot(slot, layer_idx, method, layer)
+        return slot, False
+
+    def _prefetch_successor(self, current: _Mxfp4PrefillSlot) -> None:
+        order = self.layer_order
+        position = order.index(current.layer_idx)
+        if position + 1 >= len(order):
+            return
+        successor = order[position + 1]
+        method, layer = self.registry[successor]
+        target = self.slots[(current.index + 1) % len(self.slots)]
+        if (
+            target.state == "READY"
+            and target.layer_idx == successor
+            and target.epoch == self.epoch
+        ):
+            return
+        self._load_slot(target, successor, method, layer)
+
+    def apply(self, method, layer, dispatch_output):
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.quantization.v4_marlin_moe import apply_v4_marlin_moe
+
+        layer_idx = method.kt_config.layer_idx
+        slot, prefetch_hit = self._acquire(layer_idx, method, layer)
+        main_stream = torch.cuda.current_stream(self.device)
+        main_stream.wait_event(slot.ready_event)
+        for tensor in (
+            slot.prepared.w13,
+            slot.prepared.w13_scale,
+            slot.prepared.w2,
+            slot.prepared.w2_scale,
+        ):
+            tensor.record_stream(main_stream)
+
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        output = apply_v4_marlin_moe(
+            hidden_states=dispatch_output.hidden_states,
+            prepared=slot.prepared,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            # DSV4 applies routed_scaling_factor after the experts because the
+            # KT wrapper is not marked as a fused-RSF backend.
+            routed_scaling_factor=1.0,
+            swiglu_limit=method.moe_runner_config.swiglu_limit,
+        )
+        slot.consumed_event.record(main_stream)
+        slot.has_consumed_event = True
+        slot.state = "IN_USE"
+        self.current_slot_index = slot.index
+        self._prefetch_successor(slot)
+        if method.tp_rank == 0 and method.kt_config.layer_idx == self.layer_order[0]:
+            logger.info(
+                "KT MXFP4 layerwise prefill epoch=%d slot=%d %s tokens=%d",
+                self.epoch,
+                slot.index,
+                "prefetch-hit" if prefetch_hit else "prime",
+                dispatch_output.hidden_states.shape[0],
+            )
+        return StandardCombineInput(hidden_states=output)
+
+
+def _mxfp4_pipeline_signature(method, layer) -> tuple:
+    return (
+        str(layer.w13_weight.device),
+        method.kt_config.weight_path,
+        method.kt_config.num_layers,
+        method.global_num_experts,
+        tuple(layer.w13_weight.shape[1:]),
+        tuple(layer.w2_weight.shape[1:]),
+    )
+
+
+def _register_mxfp4_prefill_layer(method, layer) -> None:
+    if method.kt_config.gpu_prefill_token_threshold <= 0:
+        return
+    if method.kt_config.method.upper() != "MXFP4":
+        return
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(
+        layer.w13_weight.device
+    ) != (12, 0):
+        raise RuntimeError("KT native-MXFP4 layerwise prefill currently requires SM120")
+    if method.gpu_method.__class__.__name__ != "Mxfp4FlashinferCutlassMoEMethod":
+        raise RuntimeError(
+            "KT native-MXFP4 layerwise prefill requires the FlashInfer MXFP4 "
+            "GPU method on SM120"
+        )
+    signature = _mxfp4_pipeline_signature(method, layer)
+    method._mxfp4_pipeline_signature = signature
+    registry = _MXFP4_PREFILL_LAYER_REGISTRY.setdefault(signature, {})
+    registry[method.kt_config.layer_idx] = (method, layer)
+
+
+def finalize_mxfp4_layerwise_prefill() -> None:
+    """Reserve prepared slots before SGLang sizes the KV cache."""
+    for signature, registry in list(_MXFP4_PREFILL_LAYER_REGISTRY.items()):
+        if not registry or signature in _MXFP4_LAYERWISE_MANAGERS:
+            continue
+        first_idx = min(registry)
+        method, layer = registry[first_idx]
+        policy = method.kt_config.mxfp4_prefill_slots
+        requested = 2 if policy in ("auto", "2") else 1
+        manager = None
+        last_error_message: Optional[str] = None
+        for slot_count in range(requested, 0, -1):
+            if policy != "auto" and slot_count != requested:
+                break
+            try:
+                manager = _Mxfp4LayerwisePrefillManager(
+                    signature, method, layer, slot_count
+                )
+                break
+            except torch.cuda.OutOfMemoryError as exc:
+                # Do not retain the exception traceback: it owns the partially
+                # constructed manager and would keep an already-allocated slot
+                # alive while the auto policy attempts its one-slot fallback.
+                last_error_message = str(exc)
+                manager = None
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.warning(
+                    "KT MXFP4 prefill could not allocate %d prepared slot(s); %s",
+                    slot_count,
+                    "trying one slot" if policy == "auto" and slot_count == 2 else "",
+                )
+
+        if manager is None:
+            reason = "prepared Marlin slot allocation failed"
+            if policy == "auto":
+                _MXFP4_LAYERWISE_DISABLED_REASONS[signature] = reason
+                for _, registered_layer in registry.values():
+                    for name in (
+                        "_kt_mxfp4_raw_w13_scale_inv",
+                        "_kt_mxfp4_raw_w2_scale_inv",
+                    ):
+                        if hasattr(registered_layer, name):
+                            delattr(registered_layer, name)
+                gc.collect()
+                logger.warning(
+                    "KT MXFP4 layerwise prefill disabled; using hybrid MoE: %s",
+                    reason,
+                )
+                continue
+            if last_error_message:
+                reason = f"{reason}: {last_error_message}"
+            raise RuntimeError(reason)
+
+        _MXFP4_LAYERWISE_MANAGERS[signature] = manager
+        prepared_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for slot in manager.slots
+            for tensor in (
+                slot.prepared.w13,
+                slot.prepared.w13_scale,
+                slot.prepared.w2,
+                slot.prepared.w2_scale,
+            )
+        )
+        raw_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in manager.raw_staging.values()
+        )
+        preserved_scale_bytes = sum(
+            getattr(registered_layer, name).numel()
+            * getattr(registered_layer, name).element_size()
+            for _, registered_layer in registry.values()
+            for name in (
+                "_kt_mxfp4_raw_w13_scale_inv",
+                "_kt_mxfp4_raw_w2_scale_inv",
+            )
+        )
+        logger.info(
+            "KT MXFP4 layerwise prefill initialized %d prepared slot(s), "
+            "%d %s host stages, raw batch=%d experts, GPU prepared/raw/total="
+            "%.2f/%.2f/%.2f GiB, preserved host scales=%.2f GiB",
+            len(manager.slots),
+            manager.host_slots,
+            "pinned" if manager.host_is_pinned else "pageable",
+            manager.raw_batch_experts,
+            prepared_bytes / 1024**3,
+            raw_bytes / 1024**3,
+            (prepared_bytes + raw_bytes) / 1024**3,
+            preserved_scale_bytes / 1024**3,
+        )

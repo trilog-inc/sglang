@@ -70,6 +70,9 @@ class ServerConfig:
     label: str
     gpu_experts: int
     amx_min_tokens: int
+    gpu_prefill_threshold: int
+    mxfp4_prefill_slots: str
+    prefill_host_staging_experts: int
     dspark_block_size: int
     chunked_prefill_size: int
     max_running_requests: int
@@ -105,7 +108,9 @@ class Workload:
 
     @property
     def workload_id(self) -> str:
-        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode()
+        payload = json.dumps(
+            asdict(self), sort_keys=True, separators=(",", ":")
+        ).encode()
         return hashlib.sha256(payload).hexdigest()[:12]
 
 
@@ -318,7 +323,9 @@ def parse_custom_cpu_layout(value: str) -> CpuLayout:
     except (ValueError, argparse.ArgumentTypeError) as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
     if threads <= 0 or not nodes:
-        raise argparse.ArgumentTypeError("CPU layout needs positive threads and NUMA nodes")
+        raise argparse.ArgumentTypeError(
+            "CPU layout needs positive threads and NUMA nodes"
+        )
     return CpuLayout(label, threads, len(nodes), nodes)
 
 
@@ -339,6 +346,12 @@ def build_candidates(args: argparse.Namespace) -> list[ServerConfig]:
     spaces: list[tuple[str, list[Any]]] = [
         ("gpu_experts", parse_csv(args.gpu_experts, int)),
         ("amx_min_tokens", parse_csv(args.amx_min_tokens, int)),
+        ("gpu_prefill_threshold", parse_csv(args.gpu_prefill_thresholds, int)),
+        ("mxfp4_prefill_slots", parse_csv(args.mxfp4_prefill_slots)),
+        (
+            "prefill_host_staging_experts",
+            parse_csv(args.prefill_host_staging_experts, int),
+        ),
         ("dspark_block_size", parse_csv(args.dspark_block_sizes, int)),
         ("chunked_prefill_size", parse_csv(args.chunked_prefill_sizes, int)),
         ("max_running_requests", parse_csv(args.max_running_requests, int)),
@@ -380,18 +393,14 @@ def build_candidates(args: argparse.Namespace) -> list[ServerConfig]:
         # interactions (for example gamma x concurrency x CPU layout) are not
         # completely missed by the OFAT pass.
         mixed_index = 0
-        mixed_target = min(
-            args.max_configs, len(candidates) + args.mixed_configs
-        )
+        mixed_target = min(args.max_configs, len(candidates) + args.mixed_configs)
         while len(candidates) < mixed_target:
             changes: dict[str, Any] = {}
             for knob_index, (name, values) in enumerate(spaces):
                 if len(values) == 1:
                     changes[name] = values[0]
                     continue
-                offset = (mixed_index * (knob_index * 2 + 1) + knob_index) % len(
-                    values
-                )
+                offset = (mixed_index * (knob_index * 2 + 1) + knob_index) % len(values)
                 changes[name] = values[offset]
             candidates.append(
                 ServerConfig(label=f"mixed_{mixed_index + 1:02d}", **changes)
@@ -517,9 +526,7 @@ def config_environment(
             "KT_MXFP4_BACKEND": "amx",
             "KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT": str(config.amx_min_tokens),
             "SGLANG_OPT_USE_TILELANG_MHC_POST": "1",
-            "SGLANG_OPT_FUSE_MHC_POST_PRE": (
-                "1" if config.fuse_mhc_post_pre else "0"
-            ),
+            "SGLANG_OPT_FUSE_MHC_POST_PRE": ("1" if config.fuse_mhc_post_pre else "0"),
             "SGLANG_DSPARK_ENABLE_MULTI_STREAM": (
                 "1" if config.dspark_multistream else "0"
             ),
@@ -529,9 +536,7 @@ def config_environment(
     return env
 
 
-def build_server_command(
-    args: argparse.Namespace, config: ServerConfig
-) -> list[str]:
+def build_server_command(args: argparse.Namespace, config: ServerConfig) -> list[str]:
     command = [
         args.python,
         "-m",
@@ -555,6 +560,12 @@ def build_server_command(
         "amx",
         "--kt-mxfp4-amx-min-tokens-per-expert",
         str(config.amx_min_tokens),
+        "--kt-gpu-prefill-token-threshold",
+        str(config.gpu_prefill_threshold),
+        "--kt-mxfp4-prefill-slots",
+        config.mxfp4_prefill_slots,
+        "--kt-mxfp4-prefill-host-staging-experts",
+        str(config.prefill_host_staging_experts),
         "--kt-num-gpu-experts",
         str(config.gpu_experts),
         "--kt-expert-placement-strategy",
@@ -584,9 +595,7 @@ def build_server_command(
         str(args.port),
     ]
     if args.sps_table_path:
-        command.extend(
-            ["--speculative-dspark-sps-table-path", args.sps_table_path]
-        )
+        command.extend(["--speculative-dspark-sps-table-path", args.sps_table_path])
     if config.ragged_verify_mode == "compact" and args.align_verify_to_graph_tier:
         command.append("--speculative-dspark-align-verify-tokens-to-graph-tier")
     if args.expert_frequency_path and config.placement == "frequency":
@@ -704,9 +713,7 @@ class GpuSampler:
         return summarize_telemetry(self.samples)
 
     def _run(self) -> None:
-        fields = (
-            "utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm,clocks.mem"
-        )
+        fields = "utilization.gpu,memory.used,power.draw,temperature.gpu,clocks.sm,clocks.mem"
         while not self._stop.is_set():
             try:
                 output = subprocess.run(
@@ -815,12 +822,12 @@ def hash_outputs(result: dict[str, Any]) -> str | None:
 
 def read_single_jsonl(path: Path) -> dict[str, Any]:
     records = [
-        json.loads(line)
-        for line in path.read_text().splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
     ]
     if len(records) != 1:
-        raise RuntimeError(f"expected one benchmark record in {path}, got {len(records)}")
+        raise RuntimeError(
+            f"expected one benchmark record in {path}, got {len(records)}"
+        )
     return records[0]
 
 
@@ -905,9 +912,7 @@ def run_workload(
                 stderr=subprocess.STDOUT,
                 text=True,
                 timeout=args.benchmark_timeout,
-                env=config_environment(
-                    os.environ, config, args.cuda_visible_devices
-                ),
+                env=config_environment(os.environ, config, args.cuda_visible_devices),
             )
         if completed.returncode != 0:
             raise RuntimeError(
@@ -1028,15 +1033,21 @@ def run_config(
         "stage": stage,
         "config": asdict(config),
         "command": command,
-        "environment": {key: env.get(key) for key in sorted(set(DEBUG_ENV_VARS) | {
-            "CUDA_VISIBLE_DEVICES",
-            "KT_MXFP4_BACKEND",
-            "KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT",
-            "SGLANG_OPT_USE_TILELANG_MHC_POST",
-            "SGLANG_OPT_FUSE_MHC_POST_PRE",
-            "SGLANG_DSPARK_ENABLE_MULTI_STREAM",
-            "SGLANG_RAGGED_VERIFY_MODE",
-        })},
+        "environment": {
+            key: env.get(key)
+            for key in sorted(
+                set(DEBUG_ENV_VARS)
+                | {
+                    "CUDA_VISIBLE_DEVICES",
+                    "KT_MXFP4_BACKEND",
+                    "KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT",
+                    "SGLANG_OPT_USE_TILELANG_MHC_POST",
+                    "SGLANG_OPT_FUSE_MHC_POST_PRE",
+                    "SGLANG_DSPARK_ENABLE_MULTI_STREAM",
+                    "SGLANG_RAGGED_VERIFY_MODE",
+                }
+            )
+        },
     }
     (run_dir / f"metadata_{stage}.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n"
@@ -1072,19 +1083,19 @@ def run_config(
                 f"  {workload.name}: input={workload.input_len} "
                 f"output={workload.output_len} concurrency={workload.concurrency}"
             )
-            result = run_workload(
-                args, config, stage, workload, run_dir, process
-            )
+            result = run_workload(args, config, stage, workload, run_dir, process)
             record = asdict(result) | {
                 "recorded_at": utc_now(),
                 "server_startup_s": startup_s,
             }
             append_jsonl(results_path, record)
-            result_index[
-                result_key(config.config_id, stage, workload.workload_id)
-            ] = record
+            result_index[result_key(config.config_id, stage, workload.workload_id)] = (
+                record
+            )
             metric = result.metrics.get("output_throughput")
-            suffix = f" output_tps={metric:.2f}" if isinstance(metric, (int, float)) else ""
+            suffix = (
+                f" output_tps={metric:.2f}" if isinstance(metric, (int, float)) else ""
+            )
             print(f"    -> {result.status}{suffix}")
             if result.status != "ok" or process.poll() is not None:
                 workload_error = result.error or (
@@ -1179,7 +1190,9 @@ def rank_configs(
     require_output_match: bool,
 ) -> list[dict[str, Any]]:
     index = completed_result_index(results)
-    baseline_config = next((config for config in configs if config.label == "baseline"), configs[0])
+    baseline_config = next(
+        (config for config in configs if config.label == "baseline"), configs[0]
+    )
     baseline_results = {
         workload.name: index.get(
             result_key(baseline_config.config_id, stage, workload.workload_id)
@@ -1245,7 +1258,9 @@ def rank_configs(
                 "config": asdict(config),
             }
         )
-    return sorted(ranking, key=lambda item: (item["complete"], item["score"]), reverse=True)
+    return sorted(
+        ranking, key=lambda item: (item["complete"], item["score"]), reverse=True
+    )
 
 
 def safe_name(value: str) -> str:
@@ -1407,6 +1422,8 @@ def print_plan(
             f"gpu_experts={config.gpu_experts} gamma={config.dspark_block_size} "
             f"amx_min={config.amx_min_tokens} cpu={config.cpu_layout.label}/"
             f"{config.cpu_layout.cpuinfer_threads}t numa={config.cpu_layout.numa_nodes} "
+            f"prefill={config.gpu_prefill_threshold}/{config.mxfp4_prefill_slots}/"
+            f"host{config.prefill_host_staging_experts} "
             f"chunk={config.chunked_prefill_size} max_run={config.max_running_requests} "
             f"mhc_fuse={config.fuse_mhc_post_pre} multistream={config.dspark_multistream}"
         )
@@ -1435,7 +1452,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Physical GPU index/UUID used only for telemetry and NUMA detection",
     )
 
-    parser.add_argument("--search-strategy", choices=("ofat", "cartesian"), default="ofat")
+    parser.add_argument(
+        "--search-strategy", choices=("ofat", "cartesian"), default="ofat"
+    )
     parser.add_argument("--max-configs", type=int, default=128)
     parser.add_argument(
         "--mixed-configs",
@@ -1461,6 +1480,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # The first value of every list defines the baseline.
     parser.add_argument("--gpu-experts", default="96,80,64")
     parser.add_argument("--amx-min-tokens", default="4,0,2,8")
+    parser.add_argument("--gpu-prefill-thresholds", default="4096,2048,8192,0")
+    parser.add_argument("--mxfp4-prefill-slots", default="auto,1")
+    parser.add_argument("--prefill-host-staging-experts", default="8,16,4")
     parser.add_argument("--dspark-block-sizes", default="7,3,5")
     parser.add_argument("--chunked-prefill-sizes", default="4096,2048,8192")
     parser.add_argument("--max-running-requests", default="48,16,32")
@@ -1529,10 +1551,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--cpuinfer-step and --cpuinfer-min must be positive")
     if args.cpuinfer_max is not None and args.cpuinfer_max <= 0:
         parser.error("--cpuinfer-max must be positive")
-    if (
-        args.cpuinfer_max is not None
-        and args.cpuinfer_min > args.cpuinfer_max
-    ):
+    if args.cpuinfer_max is not None and args.cpuinfer_min > args.cpuinfer_max:
         parser.error("--cpuinfer-min must be <= --cpuinfer-max")
     if args.config_end is not None and args.config_end < args.config_start:
         parser.error("--config-end must be >= --config-start")

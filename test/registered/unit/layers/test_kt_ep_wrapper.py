@@ -5,6 +5,7 @@ import torch
 from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTGraphStateBridge,
+    _Mxfp4LayerwisePrefillManager,
     _moe_layer_indices,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
@@ -75,6 +76,78 @@ def test_partition_and_remap_produces_distinct_complementary_outputs():
     assert cpu_ids.data_ptr() != gpu_ids.data_ptr()
 
 
+def test_layerwise_prefill_reorders_flashinfer_up_gate_to_marlin_gate_up():
+    class Event:
+        def record(self, stream):
+            del stream
+
+    manager = object.__new__(_Mxfp4LayerwisePrefillManager)
+    manager.intermediate_size = 2
+    manager.raw_staging = {
+        "w13_weight": torch.empty((2, 4, 2), dtype=torch.int8),
+        "w13_weight_scale_inv": torch.empty((2, 4, 1), dtype=torch.uint8),
+        "w2_weight": torch.empty((2, 4, 1), dtype=torch.int8),
+        "w2_weight_scale_inv": torch.empty((2, 4, 1), dtype=torch.uint8),
+    }
+    manager.host_is_pinned = False
+    manager.transfer_stream = None
+    manager.gpu_scale_free_events = [Event(), Event()]
+    manager.gpu_scale_slot_used = [False, False]
+    manager.gpu_scale_staging = {
+        "w13_weight_scale_inv": torch.tensor(
+            [[[9], [10], [11], [12]], [[0], [0], [0], [0]]]
+        ),
+        "w2_weight_scale_inv": torch.tensor(
+            [[[17], [18], [19], [20]], [[0], [0], [0], [0]]]
+        ),
+    }
+    method = SimpleNamespace(logical_to_gpu_index=torch.tensor([0]))
+    layer = SimpleNamespace(
+        w13_weight=torch.tensor([[[1, 2], [3, 4], [5, 6], [7, 8]]]),
+        w2_weight=torch.tensor([[[13], [14], [15], [16]]]),
+    )
+
+    manager._stage_gpu_expert(method, layer, logical_id=0, raw_slot=0)
+
+    assert manager.raw_staging["w13_weight"][0].tolist() == [
+        [5, 6],
+        [7, 8],
+        [1, 2],
+        [3, 4],
+    ]
+    assert manager.raw_staging["w13_weight_scale_inv"][0].tolist() == [
+        [11],
+        [12],
+        [9],
+        [10],
+    ]
+
+
+def test_layerwise_prefill_upload_uses_compact_cpu_expert_id():
+    calls = []
+
+    class Wrapper:
+        def submit_write_weight_scale_to_buffer(self, *args):
+            calls.append(args)
+
+        def sync_write_weight_scale_to_buffer(self):
+            calls.append("sync")
+
+    manager = object.__new__(_Mxfp4LayerwisePrefillManager)
+    manager.host_staging = {
+        name: torch.empty((2, 1), dtype=torch.uint8)
+        for name in _Mxfp4LayerwisePrefillManager._RAW_NAMES
+    }
+    method = SimpleNamespace(
+        wrapper=Wrapper(), logical_to_cpu_index=torch.tensor([-1, 0, -1, 1])
+    )
+
+    manager._submit_cpu_expert(method, logical_id=3, host_slot=1)
+
+    assert calls[0][0:2] == (1, 1)
+    assert calls[1] == "sync"
+
+
 def test_dsv4_hash_prefix_is_included_in_moe_layers():
     config = SimpleNamespace(
         num_hidden_layers=43,
@@ -138,4 +211,6 @@ def test_create_config_uses_server_args_model_config(monkeypatch):
     assert config is not None
     assert config.num_layers == 6
     assert config.method == "MXFP4"
+    assert config.gpu_prefill_token_threshold == 0
+    assert config.mxfp4_prefill_slots == "auto"
     assert config.gpu_experts_mask.tolist() == [True, True, False, False]

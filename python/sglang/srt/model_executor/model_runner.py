@@ -609,6 +609,13 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        # Layerwise MXFP4 prepared weights must be reserved before KV-cache
+        # profiling consumes the remaining VRAM.
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            finalize_mxfp4_layerwise_prefill,
+        )
+
+        finalize_mxfp4_layerwise_prefill()
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

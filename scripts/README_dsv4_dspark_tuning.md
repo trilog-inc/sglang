@@ -103,6 +103,9 @@ For every comma-separated option, the first value is the baseline. Defaults:
 ```text
 --gpu-experts             96,80,64
 --amx-min-tokens          4,0,2,8
+--gpu-prefill-thresholds  4096,2048,8192,0
+--mxfp4-prefill-slots     auto,1
+--prefill-host-staging-experts 8,16,4
 --dspark-block-sizes      7,3,5
 --chunked-prefill-sizes   4096,2048,8192
 --max-running-requests    48,16,32
@@ -112,6 +115,15 @@ For every comma-separated option, the first value is the baseline. Defaults:
 --dspark-multistream      true,false
 --ragged-verify-modes     static
 ```
+
+The layerwise prefill path streams native MXFP4 experts into a prepared Marlin
+layer once a chunk reaches `--kt-gpu-prefill-token-threshold`. `auto` attempts
+two prepared slots for layer-to-layer overlap and falls back to one slot when
+VRAM is constrained. Unlike the upstream two-raw/two-prepared design, this
+branch stages a small raw expert window, so each slot needs only a prepared
+layer rather than a full raw plus prepared layer. Startup logs report the exact
+prepared/raw/total allocation for the loaded model. Set the threshold to `0`
+to measure the original hybrid CPU/GPU prefill path.
 
 The automatic CPU search keeps all online logical CPUs as the baseline, then
 tests `--kt-cpuinfer` at 4-thread intervals (`4,8,12,...`) on the same all-NUMA
