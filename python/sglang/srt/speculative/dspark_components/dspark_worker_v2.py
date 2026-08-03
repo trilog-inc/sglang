@@ -31,6 +31,7 @@ from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
     draft_cuda_device_context,
+    ensure_flashinfer_sampling_multiarch,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
     resolve_speculative_draft_device,
@@ -153,6 +154,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "GPUs. DSpark will use CUDA's host-staged copy path; only hidden "
                     "states, proposal metadata, and incremental KV indices cross it."
                 )
+            ensure_flashinfer_sampling_multiarch((gpu_id, self.draft_gpu_id))
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (

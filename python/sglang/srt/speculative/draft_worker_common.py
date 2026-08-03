@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -24,6 +27,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_FLASHINFER_MULTIARCH_SAMPLING_LOCK = threading.Lock()
+_FLASHINFER_MULTIARCH_SAMPLING_READY: set[tuple[str, ...]] = set()
 
 _SUPPORTED_DRAFT_BACKENDS = (
     "flashinfer",
@@ -72,6 +78,89 @@ def draft_cuda_device_context(gpu_id: int):
     """Make all implicit ``device='cuda'`` draft allocations device-local."""
     with torch.cuda.device(int(gpu_id)):
         yield
+
+
+def _flashinfer_arch_names(device_ids: tuple[int, ...]) -> tuple[str, ...]:
+    """Return FlashInfer's normalized CUDA architecture names."""
+    from flashinfer.compilation_context import CompilationContext
+
+    normalized = {
+        CompilationContext._normalize_cuda_arch(  # noqa: SLF001
+            *torch.cuda.get_device_capability(device_id)
+        )
+        for device_id in device_ids
+    }
+    return tuple(f"{major}.{minor}" for major, minor in sorted(normalized))
+
+
+def ensure_flashinfer_sampling_multiarch(device_ids: tuple[int, ...]) -> None:
+    """Load an architecture-complete sampling module for remote drafting.
+
+    FlashInfer 0.6.x caches its sampling module process-wide and prefers an
+    installed AOT/JIT-cache binary. If that binary lacks either member of a
+    heterogeneous target/draft pair, the first affected sampling primitive
+    fails with ``cudaErrorNoKernelImageForDevice``. Force only this module
+    through a dedicated JIT directory with every worker architecture enabled.
+    """
+    arch_names = _flashinfer_arch_names(tuple(sorted(set(device_ids))))
+    if len(arch_names) <= 1:
+        return
+
+    with _FLASHINFER_MULTIARCH_SAMPLING_LOCK:
+        if arch_names in _FLASHINFER_MULTIARCH_SAMPLING_READY:
+            return
+
+        import flashinfer
+        import flashinfer.sampling as flashinfer_sampling
+        from flashinfer.jit import env as flashinfer_jit_env
+
+        arch_key = "_".join(name.replace(".", "") for name in arch_names)
+        cache_root = (
+            Path(flashinfer_jit_env.FLASHINFER_CACHE_DIR)
+            / flashinfer.__version__
+            / f"sglang_multiarch_sampling_{arch_key}"
+        )
+        jit_dir = cache_root / "cached_ops"
+
+        old_arch_list = os.environ.get("FLASHINFER_CUDA_ARCH_LIST")
+        old_aot_dir = flashinfer_jit_env.FLASHINFER_AOT_DIR
+        old_jit_dir = flashinfer_jit_env.FLASHINFER_JIT_DIR
+
+        logger.info(
+            "Preparing FlashInfer sampling kernels for heterogeneous CUDA "
+            "architectures: %s.",
+            ", ".join(arch_names),
+        )
+        # Replace a wrapper that may already close over a single-architecture
+        # module. FlashInfer's 0.6.x registration decorators are intentionally
+        # no-ops, so reconstructing this cached namespace is safe.
+        flashinfer_sampling.get_sampling_module.cache_clear()
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = " ".join(arch_names)
+        flashinfer_jit_env.FLASHINFER_AOT_DIR = cache_root / "no_aot"
+        flashinfer_jit_env.FLASHINFER_JIT_DIR = jit_dir
+        try:
+            flashinfer_sampling.get_sampling_module()
+        except Exception as error:
+            flashinfer_sampling.get_sampling_module.cache_clear()
+            raise RuntimeError(
+                "Failed to build the heterogeneous FlashInfer sampling module "
+                f"for {arch_names}. Ensure nvcc from the CUDA toolkit is available."
+            ) from error
+        finally:
+            flashinfer_jit_env.FLASHINFER_AOT_DIR = old_aot_dir
+            flashinfer_jit_env.FLASHINFER_JIT_DIR = old_jit_dir
+            if old_arch_list is None:
+                os.environ.pop("FLASHINFER_CUDA_ARCH_LIST", None)
+            else:
+                os.environ["FLASHINFER_CUDA_ARCH_LIST"] = old_arch_list
+
+        _FLASHINFER_MULTIARCH_SAMPLING_READY.add(arch_names)
+        logger.info(
+            "FlashInfer heterogeneous sampling module ready: architectures=%s "
+            "cache=%s.",
+            ",".join(arch_names),
+            jit_dir,
+        )
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
