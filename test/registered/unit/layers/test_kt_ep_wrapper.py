@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.layers.moe import kt_ep_wrapper
@@ -170,6 +171,115 @@ def test_sparse_moe_frequency_is_respected():
     assert _moe_layer_indices(config) == [2, 4, 6]
 
 
+def test_frequency_placement_selects_top_experts_per_layer(tmp_path, monkeypatch):
+    scores = torch.tensor(
+        [
+            [1, 9, 3, 8],
+            [6, 2, 7, 0],
+            [4, 5, 1, 10],
+        ]
+    )
+    profile = tmp_path / "expert_distribution_recorder.pt"
+    torch.save({"logical_count": scores}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=3,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=4,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=2,
+        kt_expert_placement_strategy="frequency",
+        kt_expert_frequency_file=str(profile),
+        init_expert_location="trivial",
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+
+    masks = kt_ep_wrapper._build_gpu_expert_masks(server_args)
+
+    assert masks.tolist() == [
+        [False, True, False, True],
+        [True, False, True, False],
+        [False, True, False, True],
+    ]
+    assert masks.sum(dim=1).tolist() == [2, 2, 2]
+
+
+def test_frequency_placement_sums_recorder_buffer(tmp_path, monkeypatch):
+    samples = torch.tensor(
+        [
+            [[10, 0, 0], [0, 2, 1]],
+            [[0, 9, 0], [4, 0, 0]],
+        ]
+    )
+    profile = tmp_path / "buffered_distribution.pt"
+    torch.save({"logical_count": samples}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=3,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=1,
+        kt_expert_placement_strategy="frequency",
+        kt_expert_frequency_file=str(profile),
+        init_expert_location="trivial",
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+
+    masks = kt_ep_wrapper._build_gpu_expert_masks(server_args)
+
+    assert masks.tolist() == [[True, False, False], [True, False, False]]
+
+
+def test_frequency_placement_rejects_incomplete_profile(tmp_path, monkeypatch):
+    profile = tmp_path / "incomplete_distribution.pt"
+    torch.save({"logical_count": torch.tensor([[1, 2], [0, 0]])}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=2,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=1,
+        kt_expert_placement_strategy="frequency",
+        kt_expert_frequency_file=str(profile),
+        init_expert_location="trivial",
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0),
+    )
+
+    with pytest.raises(ValueError, match="no recorded routes"):
+        kt_ep_wrapper._build_gpu_expert_masks(server_args)
+
+
 def test_create_config_uses_server_args_model_config(monkeypatch):
     hf_config = SimpleNamespace(
         num_hidden_layers=6,
@@ -191,7 +301,8 @@ def test_create_config_uses_server_args_model_config(monkeypatch):
         kt_gpu_experts_ratio=None,
         kt_num_gpu_experts=2,
         kt_expert_placement_strategy="uniform",
-        init_expert_location=None,
+        kt_expert_frequency_file=None,
+        init_expert_location="trivial",
         kt_threadpool_count=1,
         kt_cpuinfer=8,
         kt_numa_nodes=[0],

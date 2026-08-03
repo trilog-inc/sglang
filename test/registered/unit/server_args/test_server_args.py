@@ -66,6 +66,50 @@ class TestPrepareServerArgs(CustomTestCase):
         finally:
             os.unlink(config_file)
 
+    def test_kt_frequency_file_cli_is_separate_from_expert_location(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--kt-expert-placement-strategy",
+                "frequency",
+                "--kt-expert-frequency-file",
+                "/tmp/recording.pt",
+            ]
+        )
+
+        self.assertEqual(parsed.kt_expert_frequency_file, "/tmp/recording.pt")
+        self.assertEqual(parsed.init_expert_location, "trivial")
+
+
+class TestKtExpertPlacementArgs(unittest.TestCase):
+    def test_frequency_profile_does_not_enable_expert_remapping(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency",
+            kt_expert_frequency_file="/profiles/recording.pt",
+        )
+
+        args._handle_moe_expert_placement()
+
+        self.assertEqual(args.init_expert_location, "trivial")
+        self.assertFalse(args.enable_eplb)
+
+    def test_nontrivial_expert_location_is_rejected_with_kt(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency",
+            kt_expert_frequency_file="/profiles/recording.pt",
+            init_expert_location="/profiles/recording.pt",
+        )
+
+        with self.assertRaisesRegex(ValueError, "logical expert ids"):
+            args._handle_moe_expert_placement()
+
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
     def test_logs_when_encoder_dp_has_no_parallelism(self):

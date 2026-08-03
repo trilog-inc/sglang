@@ -218,6 +218,11 @@ def _load_activation_frequency(
                 f"keys={sorted(loaded)}"
             )
         loaded = loaded["logical_count"]
+    if not isinstance(loaded, torch.Tensor):
+        raise ValueError(
+            f"KT frequency data in {path!r} must be a tensor, "
+            f"got {type(loaded).__name__}"
+        )
     if loaded.dim() == 3:
         loaded = loaded.sum(dim=0)
     if tuple(loaded.shape) != (num_layers, num_experts):
@@ -225,7 +230,12 @@ def _load_activation_frequency(
             f"KT frequency tensor must have shape {(num_layers, num_experts)}, "
             f"got {tuple(loaded.shape)}"
         )
-    return loaded.float().cpu()
+    loaded = loaded.to(dtype=torch.float64, device="cpu")
+    if not torch.isfinite(loaded).all():
+        raise ValueError(f"KT frequency tensor in {path!r} contains non-finite values")
+    if (loaded < 0).any():
+        raise ValueError(f"KT frequency tensor in {path!r} contains negative counts")
+    return loaded
 
 
 def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]:
@@ -263,6 +273,16 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
             raise ValueError(f"--kt-num-gpu-experts must be in [0, {num_experts}]")
         num_gpu_experts = per_layer * len(moe_layers)
 
+    # Preserve the requested total memory budget while ensuring latency-sensitive
+    # frequency placement has a GPU allocation in every routed layer.  The
+    # remainder only applies to ratio-based placement because the explicit count
+    # is already an exact per-layer value.
+    base_per_layer, remainder = divmod(num_gpu_experts, len(moe_layers))
+    per_layer_targets = {
+        layer_idx: base_per_layer + (offset < remainder)
+        for offset, layer_idx in enumerate(moe_layers)
+    }
+
     masks = torch.zeros((num_layers, num_experts), dtype=torch.bool, device="cpu")
     strategy = server_args.kt_expert_placement_strategy.lower()
     positions = [
@@ -272,27 +292,36 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
     ]
 
     if strategy == "frequency":
-        freq_path = server_args.init_expert_location
-        if not freq_path or not str(freq_path).endswith(".pt"):
+        freq_path = server_args.kt_expert_frequency_file
+        if not freq_path:
             raise ValueError(
                 "--kt-expert-placement-strategy frequency requires "
-                "--init-expert-location pointing to a .pt expert-count file."
+                "--kt-expert-frequency-file pointing to an "
+                "ExpertDistributionRecorder .pt file."
             )
         scores = _load_activation_frequency(
             str(freq_path), num_layers=num_layers, num_experts=num_experts
         )
-        flat_scores = torch.tensor(
-            [
-                float(scores[layer_idx, expert_idx])
-                for layer_idx, expert_idx in positions
-            ]
-        )
-        selected = torch.topk(
-            flat_scores,
-            k=min(num_gpu_experts, len(positions)),
-            largest=True,
-            sorted=False,
-        ).indices.tolist()
+        empty_layers = [
+            layer_idx for layer_idx in moe_layers if float(scores[layer_idx].sum()) <= 0
+        ]
+        if empty_layers:
+            raise ValueError(
+                "KT frequency profile has no recorded routes for MoE layers "
+                f"{empty_layers}. Recapture a complete target-model profile."
+            )
+
+        if get_parallel().tp_rank == 0:
+            for layer_idx in moe_layers:
+                target = per_layer_targets[layer_idx]
+                if target:
+                    # Stable sorting makes zero-count/tied experts reproducible
+                    # and favors lower logical ids only as a deterministic tie-break.
+                    expert_ids = torch.argsort(
+                        scores[layer_idx], descending=True, stable=True
+                    )[:target]
+                    masks[layer_idx, expert_ids] = True
+        selected = None
     elif strategy == "random":
         generator = torch.Generator(device="cpu")
         generator.manual_seed(42)
@@ -316,7 +345,7 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
             "uniform, front-loading, random, frequency"
         )
 
-    if get_parallel().tp_rank == 0:
+    if get_parallel().tp_rank == 0 and selected is not None:
         for position_idx in selected:
             layer_idx, expert_idx = positions[position_idx]
             masks[layer_idx, expert_idx] = True
@@ -334,6 +363,17 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
             total_slots,
             counts,
         )
+        if strategy == "frequency":
+            routed = scores[moe_layers].sum()
+            selected_routes = scores[masks].sum()
+            logger.info(
+                "KT frequency profile: file=%s selected_routes=%.0f/%.0f "
+                "coverage=%.2f%%",
+                freq_path,
+                float(selected_routes),
+                float(routed),
+                100.0 * float(selected_routes / routed),
+            )
     return masks
 
 
@@ -347,6 +387,12 @@ def create_kt_config_from_server_args(
             "KT compact GPU expert weights are incompatible with EPLB remapping. "
             "Disable --enable-eplb; frequency-based static placement remains "
             "available through --kt-expert-placement-strategy frequency."
+        )
+    if server_args.init_expert_location != "trivial":
+        raise ValueError(
+            "KT compact GPU expert weights require --init-expert-location trivial. "
+            "Use --kt-expert-frequency-file to load recorder counts without "
+            "remapping logical expert ids."
         )
 
     hf_config = _get_hf_config(server_args)
