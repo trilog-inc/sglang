@@ -112,6 +112,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    fp8_gemm_backend_override: Optional[str] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -153,6 +154,11 @@ def build_draft_tp_worker(
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
         cuda_graph_config=draft_cuda_graph_config,
+        fp8_gemm_runner_backend=(
+            fp8_gemm_backend_override
+            if fp8_gemm_backend_override is not None
+            else draft_server_args.fp8_gemm_runner_backend
+        ),
         # KT CPU/GPU expert offload belongs to the target only. In particular,
         # DSpark's bundled DeepSeek-V4 draft must remain GPU-resident: applying
         # target placement masks to it would load a second CPU model and put

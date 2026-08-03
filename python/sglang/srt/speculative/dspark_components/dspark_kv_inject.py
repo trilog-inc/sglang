@@ -7,6 +7,9 @@ from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_f
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
 )
+from sglang.srt.layers.quantization.fp8_utils import (
+    fp8_gemm_runner_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -23,6 +26,7 @@ class TargetHiddenKvInjector:
         block_pos_offsets: torch.Tensor,
         draft_device=None,
         remote_draft: bool = False,
+        fp8_gemm_backend: Optional[str] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -32,6 +36,7 @@ class TargetHiddenKvInjector:
         self._block_pos_offsets = block_pos_offsets
         self.draft_device = torch.device(draft_device or device)
         self.remote_draft = remote_draft
+        self.fp8_gemm_backend = fp8_gemm_backend
 
     def inject_target_hidden(
         self,
@@ -46,7 +51,7 @@ class TargetHiddenKvInjector:
             return
         device = self.draft_device
         context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
-        with context:
+        with context, fp8_gemm_runner_backend_context(self.fp8_gemm_backend):
             cache_loc = cache_loc.to(
                 device=device, dtype=torch.int64, non_blocking=True
             )

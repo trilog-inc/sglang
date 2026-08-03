@@ -2,6 +2,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+from sglang.srt.layers.quantization.fp8_utils import (
+    Fp8GemmRunnerBackend,
+    fp8_gemm_runner_backend_context,
+    get_fp8_gemm_runner_backend,
+)
 from sglang.srt.speculative.draft_worker_common import (
     resolve_speculative_draft_device,
 )
@@ -32,6 +38,23 @@ class TestResolveSpeculativeDraftDevice(CustomTestCase):
             ),
         ):
             self.assertEqual(resolve_speculative_draft_device(uuids[1]), 1)
+
+    def test_fp8_backend_override_is_scoped_to_draft_context(self):
+        with patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.CUTLASS,
+        ):
+            self.assertEqual(
+                get_fp8_gemm_runner_backend(), Fp8GemmRunnerBackend.CUTLASS
+            )
+            with fp8_gemm_runner_backend_context("triton"):
+                self.assertEqual(
+                    get_fp8_gemm_runner_backend(), Fp8GemmRunnerBackend.TRITON
+                )
+            self.assertEqual(
+                get_fp8_gemm_runner_backend(), Fp8GemmRunnerBackend.CUTLASS
+            )
 
 
 if __name__ == "__main__":

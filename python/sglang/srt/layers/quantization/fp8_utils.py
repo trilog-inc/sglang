@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -298,6 +300,9 @@ class Fp8GemmRunnerBackend(Enum):
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+_FP8_GEMM_RUNNER_BACKEND_OVERRIDE: ContextVar[Fp8GemmRunnerBackend | None] = ContextVar(
+    "sglang_fp8_gemm_runner_backend_override", default=None
+)
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -643,8 +648,29 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     FP8_GEMM_RUNNER_BACKEND = backend
 
 
+@contextmanager
+def fp8_gemm_runner_backend_context(backend: str | Fp8GemmRunnerBackend | None):
+    """Temporarily select an FP8 backend for one execution context.
+
+    Heterogeneous target/draft workers share a process but not a GPU
+    architecture. A ContextVar keeps their backend selection isolated without
+    changing the scheduler-wide target backend.
+    """
+    if backend is None:
+        yield
+        return
+    token = _FP8_GEMM_RUNNER_BACKEND_OVERRIDE.set(Fp8GemmRunnerBackend(backend))
+    try:
+        yield
+    finally:
+        _FP8_GEMM_RUNNER_BACKEND_OVERRIDE.reset(token)
+
+
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     """Get the current FP8 GEMM runner backend."""
+    override = _FP8_GEMM_RUNNER_BACKEND_OVERRIDE.get()
+    if override is not None:
+        return override
     global FP8_GEMM_RUNNER_BACKEND
     if FP8_GEMM_RUNNER_BACKEND is None:
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO

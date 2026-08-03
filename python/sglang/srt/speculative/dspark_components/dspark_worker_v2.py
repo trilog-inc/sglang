@@ -9,6 +9,9 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.quantization.fp8_utils import (
+    fp8_gemm_runner_backend_context,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -110,6 +113,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_device = torch.device("cuda", self.draft_gpu_id)
         self._remote_req_generation: dict[int, int] = {}
         self._remote_req_synced_len: dict[int, int] = {}
+        self._draft_fp8_gemm_backend: Optional[str] = None
         if self._remote_draft:
             draft_capability = torch.cuda.get_device_capability(self.draft_gpu_id)
             if draft_capability < (8, 0):
@@ -117,6 +121,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "--speculative-draft-device requires an SM80 or newer GPU, "
                     f"got SM{draft_capability[0]}{draft_capability[1]}."
                 )
+            # Backend defaults were resolved on the target SM120 device. Keep
+            # the SM8x draft on portable Triton FP8 kernels; newer remote GPUs
+            # can re-run automatic dispatch under their own device context.
+            self._draft_fp8_gemm_backend = (
+                "triton" if draft_capability[0] == 8 else "auto"
+            )
             if (
                 draft_capability[0] == 8
                 and server_args.speculative_moe_runner_backend != "marlin"
@@ -167,6 +177,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                fp8_gemm_backend_override=self._draft_fp8_gemm_backend,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -264,6 +275,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             block_pos_offsets=self._block_pos_offsets,
             draft_device=self.draft_device,
             remote_draft=self._remote_draft,
+            fp8_gemm_backend=self._draft_fp8_gemm_backend,
         )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
@@ -412,6 +424,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_cuda_device_context(self.draft_gpu_id),
             dp_context,
             speculative_moe_backend_context(),
+            fp8_gemm_runner_backend_context(self._draft_fp8_gemm_backend),
         ):
             yield
 
