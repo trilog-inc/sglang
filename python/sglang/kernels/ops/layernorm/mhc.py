@@ -7,7 +7,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -79,24 +79,53 @@ def _load_tilelang():
     return _real_tilelang
 
 
+def _current_tilelang_cuda_arch() -> str | None:
+    """Return TileLang's explicit target for the active NVIDIA device.
+
+    TileLang 0.1.11's ``target='auto'`` probes CUDA device 0.  DSpark may run
+    the draft on a different GPU, so relying on that default can compile an
+    SM120 cubin and then try to load it on an SM89 draft device.
+    """
+    if torch.version.cuda is None:
+        return None
+    arch = get_jit_cuda_arch()
+    if arch.major <= 0:
+        return None
+    # Match TileLang 0.1.11's nvcc.get_target_arch convention.
+    suffix = "a" if arch.major >= 9 else ""
+    return f"sm_{arch.major}{arch.minor}{suffix}"
+
+
+def _tilelang_target_kwargs(target_arch: str | None) -> dict:
+    if target_arch is None:
+        return {}
+    return {"target": {"kind": "cuda", "arch": target_arch}}
+
+
 class _LazyTilelang:
     PassConfigKey = _LazyTilelangAttr(("PassConfigKey",))
     layout = _LazyTilelangAttr(("layout",))
 
     def jit(self, func=None, **jit_kwargs):
         def decorate(fn):
-            compiled = None
+            compiled_by_target = {}
             compile_lock = threading.Lock()
 
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
-                nonlocal compiled
+                target_arch = _current_tilelang_cuda_arch()
+                target_key = target_arch or "auto"
+                compiled = compiled_by_target.get(target_key)
                 if compiled is None:
                     with compile_lock:
+                        compiled = compiled_by_target.get(target_key)
                         if compiled is None:
                             real_tilelang = _load_tilelang()
                             real_kwargs = _resolve_lazy_tilelang_value(jit_kwargs)
+                            if "target" not in real_kwargs:
+                                real_kwargs.update(_tilelang_target_kwargs(target_arch))
                             compiled = real_tilelang.jit(**real_kwargs)(fn)
+                            compiled_by_target[target_key] = compiled
                 return compiled(*args, **kwargs)
 
             return wrapper
@@ -412,7 +441,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
             T.pdl_trigger()
 
 
-@functools.cache
 def mhc_pre_gemm_sqrsum_splitk_kernel(
     hc_mult3: int,
     hc_hidden_size: int,
@@ -420,6 +448,27 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     token_block: int = 32,
     hidden_block: int = 256,
     threads: int = 128,
+):
+    return _mhc_pre_gemm_sqrsum_splitk_kernel_cached(
+        hc_mult3,
+        hc_hidden_size,
+        split_k,
+        token_block,
+        hidden_block,
+        threads,
+        _current_tilelang_cuda_arch(),
+    )
+
+
+@functools.cache
+def _mhc_pre_gemm_sqrsum_splitk_kernel_cached(
+    hc_mult3: int,
+    hc_hidden_size: int,
+    split_k: int,
+    token_block: int,
+    hidden_block: int,
+    threads: int,
+    target_arch: str | None,
 ):
     _load_tilelang()
     assert hc_mult3 <= 32
@@ -432,7 +481,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    @tilelang.jit
+    @tilelang.jit(**_tilelang_target_kwargs(target_arch))
     def mhc_pre_gemm_sqrsum_splitk_stage_0(
         x: T.Tensor[(num_tokens, hc_hidden_size), T.bfloat16],
         fn: T.Tensor[(hc_mult3, hc_hidden_size), T.float32],
@@ -499,7 +548,7 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_trigger()
 
-    @tilelang.jit
+    @tilelang.jit(**_tilelang_target_kwargs(target_arch))
     def mhc_pre_gemm_sqrsum_splitk_stage_1(
         out_partial: T.Tensor[(split_k, num_tokens, 32), T.float32],
         sqrsum_partial: T.Tensor[(split_k, num_tokens), T.float32],
@@ -543,7 +592,9 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     block_m, block_k = 64, 64
     grid_size = (num_tokens + block_m - 1) // block_m
     num_block_k = (hc_hidden_size + block_k - 1) // block_k
-    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    n_sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
