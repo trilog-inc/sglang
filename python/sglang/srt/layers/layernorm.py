@@ -150,8 +150,12 @@ if _is_cuda:
     from sglang.kernels.ops.layernorm.norm import (
         fused_add_rmsnorm as _jit_fused_add_rmsnorm,
     )
+    from sglang.kernels.ops.layernorm.norm import rmsnorm as _jit_rmsnorm
     from sglang.kernels.ops.layernorm.norm import (
         is_supported_jit_fused_add_rmsnorm_hidden_size,
+    )
+    from sglang.kernels.ops.layernorm.norm import (
+        is_supported_jit_rmsnorm_hidden_size,
     )
 
 
@@ -160,6 +164,34 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+
+
+@lru_cache(maxsize=None)
+def _use_arch_local_jit_rmsnorm(device_index: int) -> bool:
+    """Avoid process-global CuTe kernels on a heterogeneous secondary GPU."""
+    if not _is_cuda or device_index == 0:
+        return False
+    try:
+        device_capability = torch.cuda.get_device_capability(device_index)
+        primary_capability = torch.cuda.get_device_capability(0)
+        use_jit = device_capability != primary_capability
+        if use_jit:
+            logger.info(
+                "Using architecture-local JIT RMSNorm on cuda:%d (SM%d%d; "
+                "primary cuda:0 is SM%d%d).",
+                device_index,
+                *device_capability,
+                *primary_capability,
+            )
+        return use_jit
+    except Exception as error:
+        logger.warning(
+            "Could not compare cuda:%d with cuda:0 (%s); using the "
+            "architecture-local JIT RMSNorm path.",
+            device_index,
+            error,
+        )
+        return True
 
 
 @lru_cache(maxsize=1)
@@ -421,6 +453,7 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        use_arch_local_jit = _use_arch_local_jit_rmsnorm(x.device.index or 0)
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
@@ -475,6 +508,26 @@ class RMSNorm(MultiPlatformOp):
                     )
                     return x, residual
                 return self.forward_native(x, residual, post_residual_addition)
+            if use_arch_local_jit:
+                if (
+                    x.dtype in (torch.float16, torch.bfloat16)
+                    and self.weight.data.dtype == x.dtype
+                    and (
+                        post_residual_addition is None
+                        or post_residual_addition.dtype == x.dtype
+                    )
+                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
+                ):
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    _jit_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                    )
+                    return x, residual
+                return self.forward_native(x, residual, post_residual_addition)
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
@@ -483,6 +536,24 @@ class RMSNorm(MultiPlatformOp):
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
+        if use_arch_local_jit:
+            if (
+                x.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.data.dtype == x.dtype
+                and is_supported_jit_rmsnorm_hidden_size(x.shape[-1])
+            ):
+                out = torch.empty_like(x)
+                _jit_rmsnorm(
+                    x,
+                    self.weight.data,
+                    out,
+                    self.variance_epsilon,
+                )
+            else:
+                out = self.forward_native(x, None, None)
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)

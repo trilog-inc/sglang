@@ -43,6 +43,10 @@ def _is_supported_rmsnorm_hidden_size(d: int) -> bool:
     )
 
 
+def is_supported_jit_rmsnorm_hidden_size(hidden_size: int) -> bool:
+    return _is_supported_rmsnorm_hidden_size(hidden_size)
+
+
 def _rmsnorm_kernel_class(hidden_size: int) -> str:
     if hidden_size in _RMSNORM_WARP_SIZES:
         return "RMSNormWarpKernel"
@@ -134,7 +138,7 @@ def rmsnorm(
 ) -> None:
     out = out if out is not None else input
     hidden_size = input.size(-1)
-    if not _is_supported_rmsnorm_hidden_size(hidden_size):
+    if not is_supported_jit_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(
             f"jit rmsnorm: unsupported hidden_size={hidden_size}. "
             f"Supported: {sorted(_RMSNORM_WARP_SIZES)}, and multiples of 256 in "
