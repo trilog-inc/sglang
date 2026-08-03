@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -19,7 +20,7 @@ from sglang.srt.utils.common import get_cuda_version
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ArchInfo:
     major: int
     minor: int
@@ -52,13 +53,17 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
 
 
 @cache_once
-def _init_jit_cuda_arch_once():
-    global _CUDA_ARCH
+def _detect_jit_cuda_arch(device: int) -> ArchInfo:
+    """Detect and cache one device's JIT target.
+
+    Device identity must be part of the cache key: DSpark can run its target
+    and draft models on GPUs with different compute capabilities in one
+    process.
+    """
     try:
-        device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
     except Exception:
-        logger.warning("Cannot detect CUDA architecture.")
+        logger.warning("Cannot detect CUDA architecture for device %s.", device)
         major, minor = 0, 0  # invalid value to trigger compile error if used
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
@@ -68,7 +73,18 @@ def _init_jit_cuda_arch_once():
         if (is_hip_runtime() or is_musa_runtime())
         else _cuda_arch_suffix(major, minor)
     )
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    return ArchInfo(major, minor, suffix)
+
+
+@cache_once
+def _invalid_jit_cuda_arch() -> ArchInfo:
+    logger.warning("Cannot detect the current CUDA device.")
+    return ArchInfo(0, 0, "")
+
+
+_JIT_CUDA_ARCH_OVERRIDE: ContextVar[Optional[ArchInfo]] = ContextVar(
+    "sglang_jit_cuda_arch_override", default=None
+)
 
 
 def get_default_target_flags() -> List[str]:
@@ -97,22 +113,25 @@ def get_default_target_flags() -> List[str]:
 @contextmanager
 def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
     """A context manager to temporarily override CUDA architecture."""
-    global _CUDA_ARCH
-    old_value = get_jit_cuda_arch()
-    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    token = _JIT_CUDA_ARCH_OVERRIDE.set(ArchInfo(major, minor, suffix))
     try:
         yield
     finally:
-        _CUDA_ARCH = old_value
+        _JIT_CUDA_ARCH_OVERRIDE.reset(token)
 
 
 def get_jit_cuda_arch() -> ArchInfo:
-    """Get the current CUDA architecture info."""
-    _init_jit_cuda_arch_once()
-    return _CUDA_ARCH
+    """Get the active device's CUDA architecture info."""
+    override = _JIT_CUDA_ARCH_OVERRIDE.get()
+    if override is not None:
+        return override
+    try:
+        device = torch.cuda.current_device()
+    except Exception:
+        return _invalid_jit_cuda_arch()
+    return _detect_jit_cuda_arch(device)
 
 
-@cache_once
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
