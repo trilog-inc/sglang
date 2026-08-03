@@ -954,6 +954,19 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {"speculative_moe_runner_backend": "triton"},
         )
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None,
+                        moe_runner_backend="flashinfer_mxfp4",
+                        speculative_draft_device="2",
+                        speculative_algorithm="DSPARK",
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "marlin"},
+        )
         # user-set draft backend survives
         self.assertEqual(
             _speculative_moe_runner_default(

@@ -23,6 +23,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.86}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
+DSPARK_DRAFT_DEVICE="${DSPARK_DRAFT_DEVICE:-}"
 
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -72,9 +73,16 @@ serve() {
   check_host
 
   local numa_args=()
+  local draft_device_args=()
   if [[ -n "${KT_NUMA_NODES}" ]]; then
     read -r -a numa_nodes <<<"${KT_NUMA_NODES}"
     numa_args=(--kt-numa-nodes "${numa_nodes[@]}")
+  fi
+  if [[ -n "${DSPARK_DRAFT_DEVICE}" ]]; then
+    draft_device_args=(
+      --speculative-draft-device "${DSPARK_DRAFT_DEVICE}"
+      --speculative-moe-runner-backend marlin
+    )
   fi
 
   exec python3 -m sglang.launch_server \
@@ -83,6 +91,7 @@ serve() {
     --tp 1 \
     --moe-runner-backend flashinfer_mxfp4 \
     --speculative-algorithm DSPARK \
+    "${draft_device_args[@]}" \
     --kt-weight-path "${KT_WEIGHT_PATH}" \
     --kt-method MXFP4 \
     --kt-mxfp4-backend amx \

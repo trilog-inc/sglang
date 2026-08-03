@@ -234,10 +234,15 @@ class KVCacheConfigurator:
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
-            config = self.memory_pool_config
+            if self.memory_pool_config is not None:
+                config = self.memory_pool_config
+            elif self.server_args.speculative_draft_device is not None:
+                # A heterogeneous draft owns a different allocator on a GPU with
+                # a different memory budget. Profile that device after its weights
+                # are loaded instead of inheriting the target GPU's pool sizes.
+                config = self._resolve_memory_pool_config(pre_model_load_memory)
+            else:
+                raise AssertionError("Draft worker requires memory_pool_config")
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 

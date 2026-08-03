@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Optional
@@ -32,6 +33,45 @@ _SUPPORTED_DRAFT_BACKENDS = (
     "trtllm_mha",
     "ascend",
 )
+
+
+def _normalize_cuda_uuid(value: str) -> str:
+    return value.strip().lower().removeprefix("gpu-").replace("-", "")
+
+
+def resolve_speculative_draft_device(device: str) -> int:
+    """Resolve a logical CUDA index, ``cuda:N``, or CUDA UUID."""
+    raw = str(device).strip()
+    index_text = raw[5:] if raw.lower().startswith("cuda:") else raw
+    if index_text.isdecimal():
+        index = int(index_text)
+    else:
+        wanted = _normalize_cuda_uuid(raw)
+        index = -1
+        for candidate in range(torch.cuda.device_count()):
+            uuid = getattr(torch.cuda.get_device_properties(candidate), "uuid", None)
+            if uuid is not None and _normalize_cuda_uuid(str(uuid)) == wanted:
+                index = candidate
+                break
+        if index < 0:
+            raise ValueError(
+                "Could not resolve --speculative-draft-device "
+                f"{device!r} to a visible CUDA device."
+            )
+
+    if index < 0 or index >= torch.cuda.device_count():
+        raise ValueError(
+            "--speculative-draft-device resolved to logical CUDA index "
+            f"{index}, but only {torch.cuda.device_count()} CUDA devices are visible."
+        )
+    return index
+
+
+@contextmanager
+def draft_cuda_device_context(gpu_id: int):
+    """Make all implicit ``device='cuda'`` draft allocations device-local."""
+    with torch.cuda.device(int(gpu_id)):
+        yield
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):

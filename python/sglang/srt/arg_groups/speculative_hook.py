@@ -102,6 +102,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         kwargs=kwargs,
     )
 
+    if (
+        server_args.speculative_draft_device is not None
+        and server_args.speculative_algorithm != "DSPARK"
+    ):
+        raise ValueError(
+            "--speculative-draft-device is currently supported only with "
+            "--speculative-algorithm DSPARK."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:
@@ -278,6 +287,29 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("DSpark speculative decoding only supports CUDA device.")
+
+    if server_args.speculative_draft_device is not None:
+        if (
+            server_args.tp_size != 1
+            or server_args.dp_size != 1
+            or server_args.pp_size != 1
+        ):
+            raise ValueError(
+                "--speculative-draft-device currently requires "
+                "--tp-size 1 --dp-size 1 --pp-size 1; a single remote draft GPU "
+                "cannot participate in the target model's distributed groups."
+            )
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "--speculative-draft-device does not support DP attention yet."
+            )
+        if server_args.enable_hierarchical_cache or server_args.enable_lmcache:
+            raise ValueError(
+                "--speculative-draft-device does not yet support hierarchical or "
+                "LMCache prefix restoration because the remote draft KV must be "
+                "rebuilt alongside the target KV. In-memory radix-cache reuse is "
+                "supported."
+            )
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:

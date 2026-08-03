@@ -83,6 +83,15 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             "deepseek-ai/some-other-dspark-draft",
         )
 
+    def test_remote_draft_requires_single_rank(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_draft_device = "cuda:2"
+        server_args.tp_size = 2
+        with self.assertRaisesRegex(ValueError, "tp-size 1"):
+            _handle_dspark(server_args)
+
 
 if __name__ == "__main__":
     unittest.main()

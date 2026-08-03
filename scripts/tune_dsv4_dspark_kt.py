@@ -596,6 +596,15 @@ def build_server_command(args: argparse.Namespace, config: ServerConfig) -> list
     ]
     if args.sps_table_path:
         command.extend(["--speculative-dspark-sps-table-path", args.sps_table_path])
+    if args.speculative_draft_device:
+        command.extend(
+            [
+                "--speculative-draft-device",
+                args.speculative_draft_device,
+                "--speculative-moe-runner-backend",
+                "marlin",
+            ]
+        )
     if config.ragged_verify_mode == "compact" and args.align_verify_to_graph_tier:
         command.append("--speculative-dspark-align-verify-tokens-to-graph-tier")
     if args.expert_frequency_path and config.placement == "frequency":
@@ -1446,6 +1455,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--cuda-visible-devices", default="0")
+    parser.add_argument(
+        "--speculative-draft-device",
+        help=(
+            "Optional logical CUDA index or GPU UUID for the DSpark draft. "
+            "When CUDA_VISIBLE_DEVICES=0,2, the second visible GPU is cuda:1; "
+            "a UUID avoids remapping ambiguity."
+        ),
+    )
     parser.add_argument(
         "--nvidia-smi-gpu",
         default="0",

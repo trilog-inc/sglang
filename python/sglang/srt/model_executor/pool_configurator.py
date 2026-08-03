@@ -163,7 +163,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and kvc.server_args.speculative_draft_device is None
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -635,6 +639,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
         self.is_speculative = kvc.server_args.speculative_algorithm is not None
+        self.reserve_local_draft = (
+            self.is_speculative
+            and not kvc.is_draft_worker
+            and kvc.server_args.speculative_draft_device is None
+        )
         self.online_c128_mtp_max_draft_tokens = (
             kvc.server_args.max_speculative_num_draft_tokens or 0
         )
@@ -667,7 +676,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative:
+        if self.reserve_local_draft:
             # Reserve memory for the speculative draft worker by inflating
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to

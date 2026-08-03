@@ -2252,6 +2252,15 @@ def _speculative_moe_runner_default(view: Any) -> dict:
     target-model backend. Invoked at the head of the speculative-decoding
     hook, after the MoE kernel chain has resolved."""
     if view.speculative_moe_runner_backend is None:
+        if (
+            getattr(view, "speculative_draft_device", None) is not None
+            and str(getattr(view, "speculative_algorithm", None) or "").upper()
+            == "DSPARK"
+        ):
+            # A heterogeneous DSpark draft is most useful on an Ada auxiliary
+            # GPU. Ada has no native FP4 tensor-core GEMM, but Marlin consumes
+            # the checkpoint's native MXFP4/E8M0 representation efficiently.
+            return {"speculative_moe_runner_backend": "marlin"}
         return {"speculative_moe_runner_backend": view.moe_runner_backend}
     return {}
 

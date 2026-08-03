@@ -51,7 +51,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
-from functools import lru_cache, partial
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
@@ -251,62 +251,50 @@ def device_context(device: torch.device):
 
 
 def _check_cuda_device_version(
-    device_capability_majors: List[int], cuda_version: Tuple[int, int]
+    device_capability_majors: List[int],
+    cuda_version: Tuple[int, int],
+    device_id: Optional[int] = None,
 ):
     if not is_cuda():
         return False
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        torch.cuda.get_device_capability(device_id)[0] in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
+def _make_cuda_device_version_checker(
+    device_capability_majors: List[int], cuda_version: Tuple[int, int]
+):
+    # Architecture is device-local in a heterogeneous process. Cache by the
+    # current logical device instead of freezing the first GPU queried.
+    @lru_cache(maxsize=16)
+    def _cached(device_id: int) -> bool:
+        return _check_cuda_device_version(
+            device_capability_majors, cuda_version, device_id
+        )
+
+    def _check() -> bool:
+        if not is_cuda():
+            return False
+        return _cached(torch.cuda.current_device())
+
+    _check.cache_clear = _cached.cache_clear
+    return _check
+
+
+is_ampere_with_cuda_12_3 = _make_cuda_device_version_checker([8], (12, 3))
+is_hopper_with_cuda_12_3 = _make_cuda_device_version_checker([9], (12, 3))
+is_blackwell_supported = is_blackwell = _make_cuda_device_version_checker(
+    [10, 11, 12], (12, 8)
 )
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
-    )
-)
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
-    )
-)
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
-    )
-)
+is_sm120_supported = _make_cuda_device_version_checker([12], (12, 8))
+is_sm100_supported = _make_cuda_device_version_checker([10], (12, 8))
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
-    )
-)
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
-    )
-)
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
-    )
-)
+is_sm100_or_sm110_supported = _make_cuda_device_version_checker([10, 11], (12, 8))
+is_sm80_supported = _make_cuda_device_version_checker([8], (11, 0))
+is_sm90_supported = _make_cuda_device_version_checker([9], (12, 3))
 
 
 try:

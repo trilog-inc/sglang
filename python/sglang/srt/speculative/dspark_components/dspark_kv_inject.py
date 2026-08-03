@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -20,6 +21,8 @@ class TargetHiddenKvInjector:
         device,
         verify_num_draft_tokens: int,
         block_pos_offsets: torch.Tensor,
+        draft_device=None,
+        remote_draft: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
@@ -27,6 +30,8 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+        self.draft_device = torch.device(draft_device or device)
+        self.remote_draft = remote_draft
 
     def inject_target_hidden(
         self,
@@ -39,43 +44,49 @@ class TargetHiddenKvInjector:
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
-        device = self.model_runner.device
-        cache_loc = cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
-        positions = positions.to(device=device, dtype=torch.int64, non_blocking=True)
-        target_hidden = target_hidden.to(device=device, non_blocking=True)
-        n_real = positions.shape[0]
-        if target_hidden.shape[0] > n_real:
-            target_hidden = target_hidden[:n_real]
-        if cache_loc_2d is not None:
-            cache_loc_2d = cache_loc_2d.to(
+        device = self.draft_device
+        context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+        with context:
+            cache_loc = cache_loc.to(
                 device=device, dtype=torch.int64, non_blocking=True
             )
-        if commit_lens is not None:
-            commit_lens = commit_lens.to(
-                device=device, dtype=torch.int32, non_blocking=True
+            positions = positions.to(
+                device=device, dtype=torch.int64, non_blocking=True
             )
+            target_hidden = target_hidden.to(device=device, non_blocking=True)
+            n_real = positions.shape[0]
+            if target_hidden.shape[0] > n_real:
+                target_hidden = target_hidden[:n_real]
+            if cache_loc_2d is not None:
+                cache_loc_2d = cache_loc_2d.to(
+                    device=device, dtype=torch.int64, non_blocking=True
+                )
+            if commit_lens is not None:
+                commit_lens = commit_lens.to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
 
-        pool = self.draft_model_runner.token_to_kv_pool
-        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            self._inject_mla(
-                pool=pool,
-                target_hidden=target_hidden,
-                cache_loc=cache_loc,
-                positions=positions,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-            )
-            return
+            pool = self.draft_model_runner.token_to_kv_pool
+            if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+                self._inject_mla(
+                    pool=pool,
+                    target_hidden=target_hidden,
+                    cache_loc=cache_loc,
+                    positions=positions,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                return
 
-        with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                target_hidden=target_hidden,
-                pool=pool,
-                positions=positions,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc_2d,
-                commit_lens=commit_lens,
-            )
+            with torch.inference_mode():
+                self.draft_model.write_target_hidden_kv(
+                    target_hidden=target_hidden,
+                    pool=pool,
+                    positions=positions,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
 
     def _inject_mla(
         self,
@@ -116,7 +127,9 @@ class TargetHiddenKvInjector:
         hidden = hidden_strided.view(bs, stride, -1)
 
         pool = self.draft_model_runner.token_to_kv_pool
-        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+        if not self.remote_draft and hasattr(
+            pool, "set_swa_key_buffer_radix_fused_norm_rope"
+        ):
             if hidden_strided.numel() == 0:
                 return
             inject_layout = BuildCommitInjectLayout.execute(

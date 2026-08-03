@@ -137,6 +137,21 @@ class TestDSparkKTTuner(unittest.TestCase):
         ratio_index = command.index("--random-range-ratio") + 1
         self.assertEqual(command[ratio_index], "1")
 
+    def test_optional_remote_draft_uses_marlin(self):
+        args = self.make_args(
+            "--cuda-visible-devices",
+            "0,2",
+            "--speculative-draft-device",
+            "GPU-b6bb9e3a-d439-ef36-dcf5-40eeb5870765",
+        )
+        config = self.tuner.build_candidates(args)[0]
+        command = self.tuner.build_server_command(args, config)
+
+        self.assertIn("--speculative-draft-device", command)
+        self.assertIn("GPU-b6bb9e3a-d439-ef36-dcf5-40eeb5870765", command)
+        backend_index = command.index("--speculative-moe-runner-backend") + 1
+        self.assertEqual(command[backend_index], "marlin")
+
     def test_arguments_are_json_serializable(self):
         args = self.make_args()
         json.dumps(self.tuner.json_safe(vars(args)))

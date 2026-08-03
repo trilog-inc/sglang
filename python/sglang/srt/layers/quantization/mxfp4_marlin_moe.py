@@ -9,7 +9,6 @@ from torch.nn import Module
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -115,8 +114,12 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not is_sm90_supported() and not is_sm120_supported():
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        capability = torch.cuda.get_device_capability(layer.w13_weight.device)
+        if capability < (8, 0):
+            raise RuntimeError(
+                "MXFP4 Marlin requires SM80 or newer, "
+                f"got compute capability {capability[0]}.{capability[1]}."
+            )
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(

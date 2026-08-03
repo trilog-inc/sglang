@@ -2011,6 +2011,14 @@ class ServerArgs:
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
         NS("spec"),
     ] = None
+    speculative_draft_device: A[
+        Optional[str],
+        "Optional CUDA device for the DSpark draft model. Accepts a logical CUDA "
+        "index (for example '2'), 'cuda:2', or a CUDA GPU UUID. The target model "
+        "stays on its normal device. This heterogeneous-GPU path currently "
+        "requires tp_size=dp_size=pp_size=1.",
+        NS("spec"),
+    ] = None
     speculative_draft_load_format: A[
         Optional[str],
         Arg(

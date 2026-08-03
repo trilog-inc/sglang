@@ -171,7 +171,7 @@ def resolve_greedy_mask(
 ) -> torch.Tensor:
     if sampling_info is None:
         return torch.ones(bs, dtype=torch.bool, device=device)
-    return (sampling_info.top_ks <= 1).view(-1)
+    return (sampling_info.top_ks.to(device=device, non_blocking=True) <= 1).view(-1)
 
 
 def sample_draft_block(
@@ -192,7 +192,9 @@ def sample_draft_block(
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
     else:
         temperatures = (
-            sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
+            sampling_info.temperatures.view(-1)
+            .to(device=device, dtype=torch.float32, non_blocking=True)
+            .clamp_min(1e-5)
         )
 
     if not any_sampling:
@@ -299,7 +301,7 @@ class DraftBlockProposer:
             else:
                 temperatures = (
                     sampling_info.temperatures.view(-1)
-                    .to(torch.float32)
+                    .to(device=device, dtype=torch.float32, non_blocking=True)
                     .clamp_min(1e-5)
                 )
             draft_block = DraftBlockResult(
@@ -369,14 +371,18 @@ class DraftBlockProposer:
         embed_module,
     ) -> DraftForwardResult:
         gamma = self.gamma
-        prefix_lens = batch.seq_lens
-        positions_2d = verify_window.positions_2d
-        verify_cache_loc_2d = verify_window.verify_cache_loc_2d
+        prefix_lens = batch.seq_lens.to(device=device, non_blocking=True)
+        positions_2d = verify_window.positions_2d.to(device=device, non_blocking=True)
+        verify_cache_loc_2d = verify_window.verify_cache_loc_2d.to(
+            device=device, non_blocking=True
+        )
 
         draft_block_ids = torch.full(
             (bs, gamma), int(self._mask_token_id), dtype=torch.long, device=device
         )
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        draft_block_ids[:, 0].copy_(
+            draft_input.bonus_tokens.view(-1).to(device=device, non_blocking=True)
+        )
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
 
@@ -399,7 +405,9 @@ class DraftBlockProposer:
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
             input_ids=draft_block_ids.flatten(),
-            req_pool_indices=batch.req_pool_indices,
+            req_pool_indices=batch.req_pool_indices.to(
+                device=device, non_blocking=True
+            ),
             seq_lens=prefix_lens,
             out_cache_loc=draft_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,

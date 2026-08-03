@@ -78,6 +78,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        confidence_device=None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -85,6 +86,7 @@ class DSparkVerifyPlanner:
         self.device = device
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self.confidence_device = confidence_device or device
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -95,7 +97,9 @@ class DSparkVerifyPlanner:
         if sts_path and self._confidence_head is not None:
             calibration = load_sts_calibration_from_path(sts_path)
             sts_temperatures = torch.tensor(
-                calibration.temperatures, dtype=torch.float32, device=device
+                calibration.temperatures,
+                dtype=torch.float32,
+                device=self.confidence_device,
             )
             if envs.SGLANG_DSPARK_STS_COLLECT_PATH.get() and not bool(
                 torch.all(sts_temperatures == 1.0)

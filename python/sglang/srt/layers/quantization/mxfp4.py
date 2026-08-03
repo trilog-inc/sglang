@@ -519,8 +519,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if not is_sm90_supported() and not is_sm120_supported():
-                raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+            capability = torch.cuda.get_device_capability(layer.w13_weight.device)
+            if capability < (8, 0):
+                raise RuntimeError(
+                    "MXFP4 Marlin requires SM80 or newer, "
+                    f"got compute capability {capability[0]}.{capability[1]}."
+                )
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."

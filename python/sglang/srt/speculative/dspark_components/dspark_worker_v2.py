@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Optional
 
@@ -8,6 +8,11 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -22,8 +27,10 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
+    draft_cuda_device_context,
     make_draft_block_spec_info,
     make_draft_sampler_capture_hook,
+    resolve_speculative_draft_device,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
@@ -31,7 +38,9 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
     DraftBlockProposer,
+    DraftProposal,
     make_next_draft_input,
     maybe_build_draft_sampler,
 )
@@ -83,6 +92,57 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._target_device = torch.device("cuda", gpu_id)
+        self.draft_gpu_id = (
+            resolve_speculative_draft_device(server_args.speculative_draft_device)
+            if server_args.speculative_draft_device is not None
+            else gpu_id
+        )
+        if (
+            server_args.speculative_draft_device is not None
+            and self.draft_gpu_id == gpu_id
+        ):
+            raise ValueError(
+                "--speculative-draft-device resolves to the target CUDA device "
+                f"{gpu_id}; omit the option for same-GPU drafting or select another GPU."
+            )
+        self._remote_draft = self.draft_gpu_id != gpu_id
+        self.draft_device = torch.device("cuda", self.draft_gpu_id)
+        self._remote_req_generation: dict[int, int] = {}
+        self._remote_req_synced_len: dict[int, int] = {}
+        if self._remote_draft:
+            draft_capability = torch.cuda.get_device_capability(self.draft_gpu_id)
+            if draft_capability < (8, 0):
+                raise ValueError(
+                    "--speculative-draft-device requires an SM80 or newer GPU, "
+                    f"got SM{draft_capability[0]}{draft_capability[1]}."
+                )
+            if (
+                draft_capability[0] == 8
+                and server_args.speculative_moe_runner_backend != "marlin"
+            ):
+                raise ValueError(
+                    "An SM8x DSpark draft requires "
+                    "--speculative-moe-runner-backend marlin so the native MXFP4 "
+                    "weights use the W4A16 Marlin kernels."
+                )
+            peer_access = torch.cuda.can_device_access_peer(gpu_id, self.draft_gpu_id)
+            logger.info(
+                "DSpark heterogeneous draft enabled: target=cuda:%d, draft=cuda:%d "
+                "(%s, SM%d%d), peer_access=%s.",
+                gpu_id,
+                self.draft_gpu_id,
+                torch.cuda.get_device_name(self.draft_gpu_id),
+                draft_capability[0],
+                draft_capability[1],
+                peer_access,
+            )
+            if not peer_access:
+                logger.warning(
+                    "CUDA peer access is unavailable between the target and draft "
+                    "GPUs. DSpark will use CUDA's host-staged copy path; only hidden "
+                    "states, proposal metadata, and incremental KV indices cross it."
+                )
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -99,8 +159,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         with self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
-                gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                gpu_id=self.draft_gpu_id,
+                ps=replace(ps, pp_rank=0, gpu_id=self.draft_gpu_id),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
@@ -129,20 +189,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "markov_head=%s, target_device=%s, draft_device=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
+                self._target_device,
+                self.draft_device,
             )
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.gamma), device=self.draft_device
         )
 
         target_model = self.target_worker.model_runner.model
@@ -151,10 +213,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
-        self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
-            lm_head=lm_head,
-        )
+        target_embed_tokens = self._resolve_target_embed_tokens(target_model)
+        if self._remote_draft:
+            with self._draft_context():
+                draft_embed_tokens = self._replicate_vocab_module(target_embed_tokens)
+                draft_lm_head = (
+                    draft_embed_tokens
+                    if lm_head is target_embed_tokens
+                    else self._replicate_vocab_module(lm_head)
+                )
+                self.draft_model.attach_shared_modules(
+                    embed_tokens=draft_embed_tokens,
+                    lm_head=draft_lm_head,
+                )
+        else:
+            self.draft_model.attach_shared_modules(
+                embed_tokens=target_embed_tokens,
+                lm_head=lm_head,
+            )
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -164,6 +240,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=self.ps.tp_rank,
             server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
+            confidence_device=self.draft_device,
         )
         if (
             server_args.enable_dp_attention
@@ -185,6 +262,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
+            draft_device=self.draft_device,
+            remote_draft=self._remote_draft,
         )
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
@@ -196,7 +275,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         self._verify_epilogue = None
         if (
-            self._verify_planner.is_compact_mode
+            not self._remote_draft
+            and self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
             and is_cuda()
         ):
@@ -263,6 +343,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
 
+    def _replicate_vocab_module(self, source):
+        """Copy an embedding/LM head directly to the draft GPU.
+
+        Constructing the replica on the destination avoids ``deepcopy`` first
+        duplicating the multi-gigabyte vocabulary tensor on the target GPU.
+        Remote drafting is single-rank, so source and replica have identical
+        vocabulary partition geometry.
+        """
+        if not isinstance(source, VocabParallelEmbedding):
+            raise TypeError(
+                "Remote DSpark requires a VocabParallelEmbedding-compatible "
+                f"embedding/LM head, got {type(source).__name__}."
+            )
+        common = dict(
+            params_dtype=source.weight.dtype,
+            org_num_embeddings=int(source.org_vocab_size),
+            padding_size=int(source.padding_size),
+            quant_config=source.quant_config,
+            enable_tp=bool(source.enable_tp),
+            use_attn_tp_group=bool(source.use_attn_tp_group),
+            use_presharded_weights=bool(source.use_presharded_weights),
+        )
+        with torch.device(self.draft_device):
+            if isinstance(source, ParallelLMHead):
+                replica = ParallelLMHead(
+                    int(source.num_embeddings),
+                    int(source.embedding_dim),
+                    bias=getattr(source, "bias", None) is not None,
+                    **common,
+                )
+            else:
+                replica = VocabParallelEmbedding(
+                    int(source.num_embeddings),
+                    int(source.embedding_dim),
+                    **common,
+                )
+        with torch.no_grad():
+            replica.weight.copy_(source.weight)
+            if getattr(source, "bias", None) is not None:
+                replica.bias.copy_(source.bias)
+        return replica
+
     @property
     def carries_confidence(self) -> bool:
         return self._verify_planner.carries_confidence
@@ -279,10 +401,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        dp_context = (
+            draft_tp_context(get_parallel().attn_tp_group)
+            if self._draft_dp_context_enabled
+            else nullcontext()
+        )
+        with (
+            draft_cuda_device_context(self.draft_gpu_id),
+            dp_context,
+            speculative_moe_backend_context(),
+        ):
+            yield
 
     def alloc_memory_pool(
         self,
@@ -290,11 +421,39 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        with self._draft_context():
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=(None if self._remote_draft else memory_pool_config),
+                req_to_token_pool=(None if self._remote_draft else req_to_token_pool),
+                token_to_kv_pool_allocator=(
+                    None if self._remote_draft else token_to_kv_pool_allocator
+                ),
+            )
+        if (
+            self._remote_draft
+            and self.draft_model_runner.max_total_num_tokens
+            < memory_pool_config.max_total_num_tokens
+        ):
+            raise RuntimeError(
+                "The remote DSpark KV pool is smaller than the target pool "
+                f"({self.draft_model_runner.max_total_num_tokens} < "
+                f"{memory_pool_config.max_total_num_tokens} tokens). Reduce "
+                "--max-total-tokens or free memory on the draft GPU."
+            )
+        target_swa_tokens = memory_pool_config.swa_max_total_num_tokens
+        draft_swa_tokens = getattr(
+            self.draft_model_runner, "swa_max_total_num_tokens", None
         )
+        if (
+            self._remote_draft
+            and target_swa_tokens is not None
+            and (draft_swa_tokens is None or draft_swa_tokens < target_swa_tokens)
+        ):
+            raise RuntimeError(
+                "The remote DSpark SWA KV pool is smaller than the target SWA pool "
+                f"({draft_swa_tokens} < {target_swa_tokens} tokens). Reduce "
+                "--max-total-tokens or free memory on the draft GPU."
+            )
 
     def init_attention_backends(self):
         with self._draft_context():
@@ -309,7 +468,8 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            with draft_cuda_device_context(self.draft_gpu_id):
+                available_mem = get_available_gpu_memory(self.device, self.draft_gpu_id)
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -334,7 +494,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
-            device=self.device,
+            device=self.draft_device,
             tp_rank=self.ps.tp_rank,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
@@ -349,7 +509,130 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        if not self._remote_draft:
+            return
+        with self._draft_context():
+            self.draft_model_runner.req_to_token_pool.clear()
+            self.draft_model_runner.token_to_kv_pool_allocator.clear()
+        self._remote_req_generation.clear()
+        self._remote_req_synced_len.clear()
+
+    def _sync_remote_req_to_token(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        positions_2d: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+    ) -> None:
+        if not self._remote_draft or positions_2d.numel() == 0:
+            return
+        target_cache_loc = cache_loc_2d.to(
+            device=self._target_device, dtype=torch.int64, non_blocking=True
+        )
+        target_swa_loc = (
+            self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+                target_cache_loc
+            )
+        )
+        with draft_cuda_device_context(self.draft_gpu_id):
+            req_pool_indices = req_pool_indices.to(
+                device=self.draft_device, dtype=torch.int64, non_blocking=True
+            )
+            positions_2d = positions_2d.to(
+                device=self.draft_device, dtype=torch.int64, non_blocking=True
+            )
+            cache_loc_2d = cache_loc_2d.to(
+                device=self.draft_device, dtype=torch.int32, non_blocking=True
+            )
+            target_swa_loc = target_swa_loc.to(
+                device=self.draft_device, dtype=torch.int64, non_blocking=True
+            )
+            self.draft_model_runner.req_to_token_pool.req_to_token[
+                req_pool_indices[:, None], positions_2d
+            ] = cache_loc_2d
+            draft_mapping = (
+                self.draft_model_runner.token_to_kv_pool.full_to_swa_index_mapping
+            )
+            draft_mapping[cache_loc_2d.to(torch.int64)] = target_swa_loc
+
+    def _sync_remote_prefill_mapping(self, batch: ScheduleBatch) -> None:
+        """Mirror only newly exposed target mappings, including radix prefixes."""
+        if not self._remote_draft:
+            return
+        req_indices_cpu = batch.req_pool_indices_cpu
+        if req_indices_cpu is None:
+            req_indices_cpu = batch.req_pool_indices.to(device="cpu")
+        req_indices = [int(value) for value in req_indices_cpu.tolist()]
+        target_pool = self.model_runner.req_to_token_pool
+
+        row_parts = []
+        position_parts = []
+        cache_loc_parts = []
+        pending_state = []
+        for req_index, prefix_len, extend_len in zip(
+            req_indices, batch.prefix_lens, batch.extend_lens
+        ):
+            generation = int(target_pool.req_generation[req_index])
+            if self._remote_req_generation.get(req_index) != generation:
+                start = 0
+            else:
+                start = self._remote_req_synced_len.get(req_index, 0)
+            end = int(prefix_len) + int(extend_len)
+            start = min(start, end)
+            if start < end:
+                positions = torch.arange(
+                    start,
+                    end,
+                    dtype=torch.int64,
+                    device=self._target_device,
+                )
+                row_parts.append(torch.full_like(positions, req_index))
+                position_parts.append(positions)
+                cache_loc_parts.append(
+                    target_pool.req_to_token[req_index, start:end].to(torch.int32)
+                )
+            pending_state.append((req_index, generation, end))
+
+        if position_parts:
+            self._sync_remote_req_to_token(
+                req_pool_indices=torch.cat(row_parts),
+                positions_2d=torch.cat(position_parts).view(-1, 1),
+                cache_loc_2d=torch.cat(cache_loc_parts).view(-1, 1),
+            )
+        for req_index, generation, end in pending_state:
+            self._remote_req_generation[req_index] = generation
+            self._remote_req_synced_len[req_index] = end
+
+    def _proposal_to_target(
+        self, proposal: DraftProposal, confidence: Optional[torch.Tensor]
+    ) -> tuple[DraftProposal, Optional[torch.Tensor]]:
+        if not self._remote_draft:
+            return proposal, confidence
+
+        def move(x):
+            return (
+                None
+                if x is None
+                else x.to(device=self._target_device, non_blocking=True)
+            )
+
+        block = proposal.draft_block
+        proposal = DraftProposal(
+            draft_block_ids=move(proposal.draft_block_ids),
+            draft_block=DraftBlockResult(
+                draft_tokens=move(block.draft_tokens),
+                corrected_logits=move(block.corrected_logits),
+                greedy_mask=move(block.greedy_mask),
+                temperatures=move(block.temperatures),
+            ),
+            # Confidence is computed on the draft GPU before this boundary;
+            # hidden/tap tensors are several times larger and have no target-side use.
+            draft_hidden=None,
+            confidence=move(proposal.confidence),
+            confidence_tap=None,
+            folded=proposal.folded,
+        )
+        return proposal, move(confidence)
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
@@ -427,6 +710,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             ctx_lens,
             int(sum(batch.extend_lens)),
         )
+        # The remote draft must learn the target's full->SWA slot mapping before
+        # translating and writing the newly materialized KV rows.
+        self._sync_remote_prefill_mapping(batch)
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=batch.out_cache_loc,
@@ -531,27 +817,37 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         sampling_info = batch.sampling_info
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+            self._sync_remote_req_to_token(
+                req_pool_indices=batch.req_pool_indices,
+                positions_2d=verify_window.positions_2d,
+                cache_loc_2d=verify_window.verify_cache_loc_2d,
+            )
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
                 verify_window=verify_window,
                 bs=bs,
-                device=device,
+                device=self.draft_device,
                 target_model=target_model,
                 sampling_info=sampling_info,
             )
+            draft_block_ids = proposal.draft_block_ids
+            draft_block = proposal.draft_block
+            draft_tokens = draft_block.draft_tokens
+
+            confidence = proposal.confidence
+            if confidence is None:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=draft_block_ids[:, 0],
+                    draft_tokens=draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+
+        proposal, confidence = self._proposal_to_target(proposal, confidence)
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
-
-        confidence = proposal.confidence
-        if confidence is None:
-            confidence = self._verify_planner.compute_confidence_tensor(
-                draft_hidden=proposal.draft_hidden,
-                anchor_tokens=draft_block_ids[:, 0],
-                draft_tokens=draft_tokens,
-                confidence_tap=proposal.confidence_tap,
-            )
 
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,

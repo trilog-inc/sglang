@@ -71,7 +71,6 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -80,7 +79,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
-_is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -142,8 +140,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 def _dspark_swa_page_index_alignment(block_size: int) -> int:
     """Choose a DSpark index width accepted by the selected SM120 backend."""
+    is_sm120 = _is_cuda and torch.cuda.get_device_capability()[0] == 12
     if not (
-        _is_sm120 and envs.SGLANG_SM120_FLASHMLA_BACKEND.get().lower() == "flashinfer"
+        is_sm120 and envs.SGLANG_SM120_FLASHMLA_BACKEND.get().lower() == "flashinfer"
     ):
         return PAGE_INDEX_ALIGNED_SIZE
 
@@ -160,7 +159,8 @@ def _dspark_swa_page_index_alignment(block_size: int) -> int:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    capability = torch.cuda.get_device_capability() if _is_cuda else (0, 0)
+    if capability[0] < 9 or capability[0] == 12 or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -526,6 +526,12 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self.cuda_capability = (
+            torch.cuda.get_device_capability(model_runner.gpu_id)
+            if _is_cuda
+            else (0, 0)
+        )
+        self._is_sm120 = self.cuda_capability[0] == 12
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
@@ -680,7 +686,7 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and _is_sm120
+                self.enable_deepseek_v4_fp4_indexer and self._is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
@@ -1657,6 +1663,7 @@ class DeepseekV4AttnBackend(
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            swa_k_cache_raw = swa_k_cache
 
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
@@ -1712,6 +1719,21 @@ class DeepseekV4AttnBackend(
 
             assert attn_sink is not None
 
+            if self.is_dspark_draft and self.cuda_capability[0] == 8:
+                if compress_ratio != 0:
+                    raise RuntimeError(
+                        "The SM8x DSpark attention fallback supports SWA-only "
+                        f"draft layers, got compress_ratio={compress_ratio}."
+                    )
+                return self._forward_dspark_sm8x_swa(
+                    q=q,
+                    quant_k_cache=swa_k_cache_raw,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    page_size=token_to_kv_pool.swa_window_size,
+                    attn_sink=attn_sink,
+                )
+
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
             assert (
@@ -1725,7 +1747,7 @@ class DeepseekV4AttnBackend(
             # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not self._is_sm120
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1741,7 +1763,7 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if self._is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1785,6 +1807,43 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_dspark_sm8x_swa(
+        self,
+        *,
+        q: torch.Tensor,
+        quant_k_cache: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        page_size: int,
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Ada/Ampere DSpark SWA over the native packed DSV4 KV cache.
+
+        FlashMLA's sparse decode kernel is Hopper-only. On SM8x, keep the
+        compact FP8-nope/BF16-rope cache, dequantize only the selected 128-token
+        window, and use BF16 tensor-core batch matmuls for attention.
+        """
+        if q.ndim == 4:
+            q = q.squeeze(1)
+        if indices.ndim == 3:
+            indices = indices.squeeze(1)
+
+        num_q, topk = indices.shape
+        col = torch.arange(topk, device=indices.device, dtype=torch.int32)
+        valid = (indices >= 0) & (col[None, :] < topk_length.view(-1, 1))
+        safe_indices = torch.where(valid, indices, torch.zeros_like(indices))
+        kv = dequantize_k_cache_paged(
+            quant_k_cache,
+            safe_indices.reshape(-1).contiguous(),
+            page_size=page_size,
+        ).view(num_q, topk, self.model_runner.model_config.head_dim)
+
+        scores = torch.matmul(q, kv.transpose(1, 2)).float() * self.softmax_scale
+        scores.masked_fill_(~valid[:, None, :], -torch.inf)
+        sink = attn_sink.view(1, -1, 1).expand(num_q, -1, 1)
+        probs = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)[..., :-1]
+        return torch.matmul(probs.to(kv.dtype), kv)
 
     def _forward_prefill_sparse(
         self,
