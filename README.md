@@ -1,6 +1,11 @@
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
+> [!NOTE]
+> Using this branch for DeepSeek-V4-Flash-0731 with DSpark, native MXFP4
+> KT-Kernel AMX offload, CUDA 13.3, or an optional second-GPU draft? Follow the
+> [complete Conda installation and deployment guide](DSPARK_KT_MXFP4_INSTALL.md).
+
 [![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
 ![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
 [![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
@@ -70,11 +75,6 @@ Its core features include:
 - **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
 
 ## Getting Started
-
-> [!NOTE]
-> Using this branch for DeepSeek-V4-Flash-0731 with DSpark, native MXFP4
-> KT-Kernel AMX offload, CUDA 13.3, or an optional second-GPU draft? Follow the
-> [complete Conda installation and deployment guide](DSPARK_KT_MXFP4_INSTALL.md).
 
 - [Install SGLang](https://docs.sglang.io/get_started/install.html)
 - [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
