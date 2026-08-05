@@ -1,11 +1,6 @@
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
-> [!NOTE]
-> Using this branch for DeepSeek-V4-Flash-0731 with DSpark, native MXFP4
-> KT-Kernel AMX offload, CUDA 13.3, or an optional second-GPU draft? Follow the
-> [complete Conda installation and deployment guide](DSPARK_KT_MXFP4_INSTALL.md).
-
 [![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
 ![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
 [![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
@@ -16,6 +11,12 @@
 </div>
 
 --------------------------------------------------------------------------------
+
+
+> [!NOTE]
+> Using this branch for DeepSeek-V4-Flash-0731 with DSpark, native MXFP4
+> KT-Kernel AMX offload, CUDA 13.3, or an optional second-GPU draft? Follow the
+> [complete Conda installation and deployment guide](DSPARK_KT_MXFP4_INSTALL.md).
 
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
