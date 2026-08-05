@@ -152,6 +152,21 @@ class TestDSparkKTTuner(unittest.TestCase):
         backend_index = command.index("--speculative-moe-runner-backend") + 1
         self.assertEqual(command[backend_index], "marlin")
 
+    def test_frequency_profile_does_not_enable_expert_remapping(self):
+        args = self.make_args(
+            "--placement-strategies",
+            "frequency",
+            "--expert-frequency-path",
+            "/profiles/recording.pt",
+        )
+        config = self.tuner.build_candidates(args)[0]
+        command = self.tuner.build_server_command(args, config)
+
+        profile_index = command.index("--kt-expert-frequency-file") + 1
+        location_index = command.index("--init-expert-location") + 1
+        self.assertEqual(command[profile_index], "/profiles/recording.pt")
+        self.assertEqual(command[location_index], "trivial")
+
     def test_arguments_are_json_serializable(self):
         args = self.make_args()
         json.dumps(self.tuner.json_safe(vars(args)))

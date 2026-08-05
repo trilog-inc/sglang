@@ -171,6 +171,11 @@ tensor:
 --expert-frequency-path /path/to/expert_counts.pt
 ```
 
+The tuner passes this file through `--kt-expert-frequency-file` and keeps
+`--init-expert-location trivial`. Do not pass a recorder output through
+`--init-expert-location`; that option enables SGLang expert remapping and is
+incompatible with KT's compact logical expert maps.
+
 Additional `launch_server` arguments must come last, after `--`:
 
 ```bash

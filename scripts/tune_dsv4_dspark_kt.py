@@ -570,6 +570,8 @@ def build_server_command(args: argparse.Namespace, config: ServerConfig) -> list
         str(config.gpu_experts),
         "--kt-expert-placement-strategy",
         config.placement,
+        "--init-expert-location",
+        "trivial",
         "--kt-cpuinfer",
         str(config.cpu_layout.cpuinfer_threads),
         "--kt-threadpool-count",
@@ -608,7 +610,7 @@ def build_server_command(args: argparse.Namespace, config: ServerConfig) -> list
     if config.ragged_verify_mode == "compact" and args.align_verify_to_graph_tier:
         command.append("--speculative-dspark-align-verify-tokens-to-graph-tier")
     if args.expert_frequency_path and config.placement == "frequency":
-        command.extend(["--init-expert-location", args.expert_frequency_path])
+        command.extend(["--kt-expert-frequency-file", args.expert_frequency_path])
     command.extend(args.extra_server_args)
     return command
 
