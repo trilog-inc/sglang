@@ -141,7 +141,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
+        tool_call: Dict with "name" and "arguments" keys.
 
     Returns:
         DSML-formatted parameter string.
@@ -149,10 +149,14 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    arguments = (
+        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+    )
+    if not isinstance(arguments, dict):
+        raise ValueError(
+            "Assistant tool call function.arguments must be a JSON object."
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -223,6 +227,16 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
             last_user_index = idx
             break
     return last_user_index
+
+
+def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
+    """Set `task` on the most recent user/developer message; raise if none exists."""
+    idx = find_last_user_index(messages)
+    if idx == -1:
+        raise ValueError(
+            "`task` requires at least one message with role='user' or 'developer'."
+        )
+    messages[idx]["task"] = task
 
 
 # ============================================================
@@ -512,7 +526,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def sort_tool_results_by_call_order(
-    messages: List[Dict[str, Any]]
+    messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
     Sort tool_result blocks within user messages by the order of tool_calls
