@@ -3,6 +3,9 @@
 Status: Phase 0/1 implemented; Phase 2+ gated on the target-server audit
 Last updated: 2026-08-13
 
+Server setup and validation runbook:
+[DEEPSEEK_V4_PRO_SERVER_SETUP.md](DEEPSEEK_V4_PRO_SERVER_SETUP.md)
+
 ## Implementation checkpoint
 
 The repository now includes the metadata-only capacity gate and the native

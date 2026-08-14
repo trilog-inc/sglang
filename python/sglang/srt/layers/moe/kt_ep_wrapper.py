@@ -550,6 +550,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         gpu_logical_ids = torch.where(self.gpu_experts_mask)[0]
         cpu_logical_ids = torch.where(~self.gpu_experts_mask)[0]
         self.gpu_index_to_logical = gpu_logical_ids.to(torch.int64)
+        # Some compact GPU quantization methods load global expert metadata
+        # (for example NVFP4 tensor scales) and must slice it in the same order
+        # as the resident weight slots. The all-CPU placement still needs one
+        # internally consistent dummy slot for GPU-method post-processing.
+        self.gpu_method.gpu_index_to_logical = (
+            self.gpu_index_to_logical
+            if self.num_gpu_experts > 0
+            else torch.zeros(1, dtype=torch.int64)
+        )
         self.cpu_index_to_logical = cpu_logical_ids.to(torch.int64)
         self.num_cpu_experts = int(cpu_logical_ids.numel())
         self.logical_to_gpu_index = torch.full(

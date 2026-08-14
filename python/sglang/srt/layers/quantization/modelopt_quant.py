@@ -2059,12 +2059,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         if is_nvfp4_online:
             weight_loader = self.get_online_weight_loader(layer, weight_loader)
+        # Wrappers such as KT expert offload pass the compact number of GPU
+        # weight slots here while layer.num_local_experts still describes the
+        # logical MoE layer.
+        num_weight_experts = num_experts
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_weight_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
@@ -2079,7 +2083,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_weight_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
@@ -2093,7 +2097,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_weight_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2116,7 +2120,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                num_weight_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2140,21 +2144,29 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
+        use_global_aux_scales = hasattr(self, "num_gpu_experts")
+        num_aux_scale_experts = (
+            layer.num_experts if use_global_aux_scales else layer.num_local_experts
+        )
         w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
+            (num_aux_scale_experts, 2)
             if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
+            else (num_aux_scale_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        if use_global_aux_scales:
+            w13_weight_scale_2._sglang_require_global_experts = True
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(num_aux_scale_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        if use_global_aux_scales:
+            w2_weight_scale_2._sglang_require_global_experts = True
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
         if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
@@ -2211,6 +2223,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale.data, up_first=up_first
             )
             layer._w13_deinterleaved = True
+
+        scale_indices = None
+        gpu_index_to_logical = getattr(self, "gpu_index_to_logical", None)
+        if gpu_index_to_logical is not None:
+            # Keep the checkpoint-global payload available to host/offload
+            # consumers, then compact the GPU parameters to resident-slot
+            # order so their first dimension matches the compact weights.
+            if layer.w13_weight_scale_2.shape[0] == layer.num_experts:
+                layer._w13_weight_scale_2_global = (
+                    layer.w13_weight_scale_2.detach()
+                )
+            if layer.w2_weight_scale_2.shape[0] == layer.num_experts:
+                layer._w2_weight_scale_2_global = layer.w2_weight_scale_2.detach()
+
+            scale_indices = gpu_index_to_logical.to(
+                device=layer.w13_weight_scale_2.device, dtype=torch.long
+            )
+            if layer.w13_weight_scale_2.shape[0] != layer.w13_weight.shape[0]:
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight_scale_2",
+                    layer.w13_weight_scale_2[scale_indices].contiguous(),
+                )
+            if layer.w2_weight_scale_2.shape[0] != layer.w2_weight.shape[0]:
+                copy_or_rebind_param(
+                    layer,
+                    "w2_weight_scale_2",
+                    layer.w2_weight_scale_2[
+                        scale_indices.to(layer.w2_weight_scale_2.device)
+                    ].contiguous(),
+                )
 
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
@@ -2283,6 +2326,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # the static checkpoint activation scale is intentionally neutral.
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
+
+        if scale_indices is not None:
+            if (
+                w13_input_scale.ndim > 0
+                and w13_input_scale.shape[0] == layer.num_experts
+            ):
+                w13_input_scale = w13_input_scale[
+                    scale_indices.to(w13_input_scale.device)
+                ]
+            if (
+                w2_input_scale.ndim > 0
+                and w2_input_scale.shape[0] == layer.num_experts
+            ):
+                w2_input_scale = w2_input_scale[scale_indices.to(w2_input_scale.device)]
 
         # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
         # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
