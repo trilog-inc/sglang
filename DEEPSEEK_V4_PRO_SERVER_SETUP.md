@@ -8,7 +8,7 @@ is written for the implementation in these branches:
   `6245b7797805eed54578275c8bb0f47fc940f581`;
 - KTransformers/KT-Kernel: `trilog-inc/ktransformers`, branch
   `codex/nvfp4-kt-support`, minimum merge commit
-  `fe73a2cae671d878a42388a303740571056bd283`.
+  `b2b2708da6b82647bf7c6a7ed11eee7e6286f517`.
 
 ## Read this first: current implementation boundary
 
@@ -279,7 +279,7 @@ git -C "$SGLANG_SRC" merge-base --is-ancestor \
   6245b7797805eed54578275c8bb0f47fc940f581 HEAD
 
 git -C "$KTRANSFORMERS_SRC" merge-base --is-ancestor \
-  fe73a2cae671d878a42388a303740571056bd283 HEAD
+  b2b2708da6b82647bf7c6a7ed11eee7e6286f517 HEAD
 
 git -C "$SGLANG_SRC" status --short --branch
 git -C "$KTRANSFORMERS_SRC" status --short --branch
@@ -717,6 +717,14 @@ imported from a different environment or user site. Do not build KT-Kernel
 until that path belongs to the `dsv4-pro` Conda environment and the assertion
 passes. If KT-Kernel was already built against the CUDA 12.8 wheel, set
 `CPUINFER_FORCE_REBUILD=1` and repeat Section 8 after replacing PyTorch.
+
+### `pip check` says KT-Kernel requires Torch 2.9.1
+
+The KTransformers checkout predates the Torch 2.11 metadata alignment. Pull
+`codex/nvfp4-kt-support`, confirm that it contains the minimum commit from
+Section 6, and repeat the native build in Section 8. The rebuilt wheel must
+declare `torch==2.11.0`; do not downgrade the SGLang environment to Torch
+2.9.1 to satisfy a stale KT-Kernel wheel.
 
 ### `No kernel image is available` or unsupported SM120
 
