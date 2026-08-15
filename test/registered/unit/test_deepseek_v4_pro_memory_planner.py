@@ -223,6 +223,103 @@ def test_target_only_placement_can_exclude_mtp(tmp_path: Path) -> None:
         )
 
 
+def test_mtp_can_be_split_across_gpu_tiers(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1}), encoding="utf-8"
+    )
+    _write_safetensor(
+        tmp_path / "model.safetensors",
+        {
+            "model.embed_tokens.weight": ("U8", [10], 10),
+            "model.layers.0.mlp.experts.0.weight": ("U8", [20], 20),
+            "model.layers.1.mtp.weight": ("U8", [60], 60),
+        },
+    )
+    audit = planner.scan_checkpoint(tmp_path)
+    devices = [
+        planner.DevicePlan("primary", 100, 0, 0, 1, "mxfp4"),
+        planner.DevicePlan("draft-0", 100, 0, 0, 0, "mxfp4", 0.5),
+        planner.DevicePlan("draft-1", 100, 0, 0, 0, "mxfp4", 0.5),
+    ]
+
+    usages, diagnostics = planner.build_placement(
+        audit,
+        host_total_bytes=100,
+        host_reserve_bytes=0,
+        host_runtime_bytes=0,
+        devices=devices,
+        allocator_overhead_fraction=0,
+    )
+
+    assert not diagnostics
+    assert usages[1].weight_bytes == 30
+    assert usages[1].mtp_bytes == 0
+    assert usages[2].weight_bytes == 30
+    assert usages[2].mtp_bytes == 30
+    assert usages[3].weight_bytes == 30
+    assert usages[3].mtp_bytes == 30
+    result = planner._json_result(audit, usages, diagnostics)
+    assert result["checkpoint"]["placement_payload_bytes"] == 90
+    assert result["placement_exclusions"] == {}
+    assert result["go"] is True
+
+    json_output = tmp_path / "two-gpu-mtp-plan.json"
+    status = planner.main(
+        [
+            str(tmp_path),
+            "--host-ram-gib",
+            "1",
+            "--host-reserve-gib",
+            "0",
+            "--gpu-names",
+            "primary,draft-0,draft-1",
+            "--gpu-capacities-gib",
+            "1,1,1",
+            "--gpu-reserves-gib",
+            "0,0,0",
+            "--gpu-runtime-gib",
+            "0,0,0",
+            "--gpu-experts-per-layer",
+            "1,0,0",
+            "--gpu-backends",
+            "mxfp4,mxfp4,mxfp4",
+            "--gpu-mtp-fractions",
+            "0,0.5,0.5",
+            "--allocator-overhead-percent",
+            "0",
+            "--json-output",
+            str(json_output),
+        ]
+    )
+    cli_result = json.loads(json_output.read_text(encoding="utf-8"))
+    assert status == 0
+    assert [tier["mtp_bytes"] for tier in cli_result["placement"]] == [0, 0, 30, 30]
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "must sum to 1"):
+        planner.build_placement(
+            audit,
+            host_total_bytes=100,
+            host_reserve_bytes=0,
+            host_runtime_bytes=0,
+            devices=[
+                planner.DevicePlan("draft-0", 100, 0, 0, 0, "mxfp4", 0.4),
+                planner.DevicePlan("draft-1", 100, 0, 0, 0, "mxfp4", 0.4),
+            ],
+            allocator_overhead_fraction=0,
+        )
+
+    with unittest.TestCase().assertRaisesRegex(ValueError, "both excluded"):
+        planner.build_placement(
+            audit,
+            host_total_bytes=100,
+            host_reserve_bytes=0,
+            host_runtime_bytes=0,
+            devices=devices,
+            allocator_overhead_fraction=0,
+            excluded_categories=frozenset({"mtp"}),
+        )
+
+
 def test_native_pro_expert_bank_size_matches_strategy() -> None:
     hidden_size = 7_168
     intermediate_size = 3_072

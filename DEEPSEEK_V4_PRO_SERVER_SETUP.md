@@ -443,7 +443,7 @@ python -m pytest -q \
 python -m py_compile scripts/deepseek_v4_pro_memory_planner.py
 ```
 
-Expected result: seven planner tests pass and the focused DSpark tests pass.
+Expected result: eight planner tests pass and the focused DSpark tests pass.
 
 ### Optional native parity executables
 
@@ -603,6 +603,63 @@ The measured checkpoint contains 39.10 GiB of MTP tensors, and the initial
 reserves. That `NO-GO` applies to built-in MTP/DSpark enablement, not to the
 target-only placement.
 
+### Experimental two-GPU MTP capacity gate
+
+The measured host and GPU headroom permits a deliberately tighter test plan.
+Dedicate both RTX 3090s to equal halves of the 39.10 GiB MTP payload, keep the
+faster RTX 4090 as a target-expert tier, and move the displaced 3090 experts to
+the RTX PRO 6000 and host. The modeled per-layer expert split becomes
+26/10/0/0. Use 48 GiB of host reserve, 10 GiB on the primary, and 2 GiB on each
+helper only for this experiment:
+
+```bash
+cd "$SGLANG_SRC"
+set -o pipefail
+
+python scripts/deepseek_v4_pro_memory_planner.py "$DSV4_MODEL" \
+  --host-ram-gib "$DSV4_HOST_RAM_GIB" \
+  --host-reserve-gib 48 \
+  --host-runtime-gib 8 \
+  --gpu-names rtx-pro-6000,rtx-4090,rtx-3090-1,rtx-3090-2 \
+  --gpu-capacities-gib 96,24,24,24 \
+  --gpu-reserves-gib 10,2,2,2 \
+  --gpu-runtime-gib 5,1,1,1 \
+  --gpu-experts-per-layer 26,10,0,0 \
+  --gpu-mtp-fractions 0,0,0.5,0.5 \
+  --gpu-backends flashinfer_mxfp4,marlin_mxfp4,marlin_mxfp4,marlin_mxfp4 \
+  --allocator-overhead-percent 0.5 \
+  --json-output "$DSV4_REPORT/deepseek-v4-pro-two-gpu-mtp-plan.json" \
+  2>&1 | tee "$DSV4_REPORT/deepseek-v4-pro-two-gpu-mtp-plan.txt"
+
+DSV4_MTP_PLANNER_STATUS=${PIPESTATUS[0]}
+printf 'two-GPU MTP planner exit status: %s\n' "$DSV4_MTP_PLANNER_STATUS" \
+  | tee "$DSV4_REPORT/two-gpu-mtp-planner-status.txt"
+
+jq '{go, placement_exclusions, warnings, diagnostics, placement}' \
+  "$DSV4_REPORT/deepseek-v4-pro-two-gpu-mtp-plan.json"
+```
+
+Based on the first server audit, the expected rounded result is:
+
+| Tier | Weights | Runtime | Headroom | Test reserve |
+| --- | ---: | ---: | ---: | ---: |
+| Host | ~697.29 GiB | 8 GiB | ~50.12 GiB | 48 GiB |
+| RTX PRO 6000 | ~78.95 GiB | 5 GiB | ~12.05 GiB | 10 GiB |
+| RTX 4090 | ~20.03 GiB | 1 GiB | ~2.97 GiB | 2 GiB |
+| Each RTX 3090 | ~19.65 GiB MTP | 1 GiB | ~3.35 GiB | 2 GiB |
+
+Treat these values as estimates until the command runs against the exact
+checkpoint and capacities in `gpus.csv`. The remaining margins are narrow,
+especially on the RTX 4090. Do not proceed if the planner reports `NO-GO`, if
+the host has less measured headroom, or if runtime profiling shows that the
+1 GiB helper-runtime allowances are insufficient.
+
+This gate proves capacity only. The current DSpark integration accepts one
+remote draft device, and the current target router does not distribute experts
+across all four target tiers. A runnable version still requires a two-device
+MTP/DSpark sharding implementation, its inter-GPU synchronization path, and
+the multi-device target-expert router described below.
+
 Interpretation:
 
 - Exit status `0` and JSON `"go": true`: the metadata is understood and all
@@ -644,6 +701,8 @@ tests all of the following:
 - direct layerwise loading into every final tier;
 - bounded expert staging during long prefill;
 - exact multi-tier output recombination tests; and
+- two-device MTP/DSpark sharding and synchronization for the experimental
+  speculative profile;
 - conservative runtime flags matching the reviewed CLI in that branch.
 
 Do not substitute tensor parallelism across these heterogeneous GPUs. Do not
@@ -797,7 +856,9 @@ reports that it is corrupt.
 Treat the result as final until the cause is explained. Common legitimate
 causes are less usable RAM than assumed, checkpoint layout changes, non-UE8M0
 expert scales, insufficient GPU reserves, or unexpected expert counts. Do not
-reduce the 64 GiB host reserve or helper reserves merely to force `GO`.
+reduce reserves merely to force `GO`. The explicit two-GPU MTP experiment in
+Section 13 is the only documented tighter profile; its smaller reserves must
+still pass with the actual server capacities and runtime measurements.
 
 ### The host begins swapping or approaches OOM
 

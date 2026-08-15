@@ -70,7 +70,11 @@ weights. The normal target loader skips the MTP tensors when speculative
 decoding is disabled, so Phase 0 now records separate target-only and
 speculative-inclusive capacity gates. The initial 18/9/9/9 placement is a
 `NO-GO` when MTP is included under the stated reserves; this does not invalidate
-the target-only placement.
+the target-only placement. A second, experimental capacity model can fit MTP
+50/50 on the two RTX 3090s by changing the target-expert split to 26/10/0/0 and
+tightening reserves to 48 GiB host, 10 GiB primary, and 2 GiB per helper. This
+is not executable until the runtime supports both the multi-device target
+router and a two-device MTP/DSpark draft.
 
 ## Source model facts
 
@@ -371,12 +375,18 @@ capacity and for reducing CPU memory traffic.
 Recommended progression:
 
 1. Run target-only eager decode.
-2. Re-plan the 39.10 GiB MTP footprint after target correctness is proven; do
-   not enable it until the speculative-inclusive capacity gate passes.
-3. Evaluate whether MTP improves end-to-end latency at the low expected batch
+2. Validate the experimental 26/10/0/0 placement with the MTP payload split
+   equally across the two RTX 3090s. The measured audit predicts approximately
+   50.12 GiB host, 12.05 GiB primary, 2.97 GiB RTX 4090, and 3.35 GiB per-3090
+   headroom after the configured runtime allowances.
+3. Implement and validate two-device draft sharding; the merged DSpark path
+   currently accepts only one remote draft device.
+4. Enable the draft only after the speculative-inclusive capacity gate and
+   measured runtime allocations pass.
+5. Evaluate whether MTP improves end-to-end latency at the low expected batch
    sizes.
-4. Consider DSpark only if a smaller compatible draft can be hosted without
-   evicting target experts or reducing KV/workspace headroom.
+6. Consider a separate DSpark model only if a smaller compatible draft can be
+   hosted without evicting target experts or reducing KV/workspace headroom.
 
 The DSpark expert-distribution recorder guard must remain in place so draft
 routing cannot pollute target placement statistics.
@@ -393,8 +403,10 @@ routing cannot pollute target placement statistics.
 - Produce separate target-only and speculative-inclusive placements and fail
   early if the applicable safety reserves cannot be met.
 
-Exit criterion: predicted placement leaves at least 64 GiB host reserve,
-12 GiB primary-GPU reserve, and 3 GiB per helper GPU.
+Exit criterion: the production target-only placement leaves at least 64 GiB
+host reserve, 12 GiB primary-GPU reserve, and 3 GiB per helper GPU. The
+two-GPU MTP experiment has a separate explicit gate of 48/10/2/2/2 GiB and
+must not silently weaken the target-only criterion.
 
 ### Phase 1: packed UE8M0 AMX path
 
@@ -454,7 +466,8 @@ reserves and generates deterministically for a short greedy prompt.
 
 ### Phase 7: MTP and concurrency
 
-- Enable built-in MTP.
+- Implement two-device MTP/DSpark sharding and synchronization.
+- Enable MTP only after the 26/10/0/0 capacity and runtime gates pass.
 - Verify acceptance rate and net latency improvement.
 - Test concurrency levels 1, 2, 4, and 8 only while memory reserves hold.
 - Establish production-safe token and request limits.

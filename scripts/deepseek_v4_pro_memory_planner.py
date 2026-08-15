@@ -51,6 +51,7 @@ class DevicePlan:
     runtime_bytes: int
     experts_per_layer: int
     backend: str
+    mtp_fraction: float = 0.0
 
 
 @dataclass
@@ -63,6 +64,7 @@ class TierUsage:
     weight_bytes: int = 0
     routed_expert_bytes: int = 0
     non_expert_bytes: int = 0
+    mtp_bytes: int = 0
     expert_count: int = 0
     layer_experts: dict[int, list[int]] = field(default_factory=dict)
 
@@ -332,6 +334,16 @@ def build_placement(
     if "routed_experts" in excluded_categories:
         raise ValueError("Routed experts cannot be excluded from placement")
 
+    mtp_fraction_total = sum(device.mtp_fraction for device in devices)
+    if any(device.mtp_fraction < 0 for device in devices):
+        raise ValueError("GPU MTP fractions cannot be negative")
+    if mtp_fraction_total and not math.isclose(
+        mtp_fraction_total, 1.0, rel_tol=0, abs_tol=1e-9
+    ):
+        raise ValueError("Nonzero GPU MTP fractions must sum to 1")
+    if mtp_fraction_total and "mtp" in excluded_categories:
+        raise ValueError("MTP cannot be both excluded and assigned to GPUs")
+
     overhead = 1.0 + allocator_overhead_fraction
     usages = [
         TierUsage(
@@ -355,17 +367,42 @@ def build_placement(
         for index, device in enumerate(devices)
     )
 
-    excluded_non_expert_bytes = sum(
-        audit.category_bytes.get(category, 0) for category in excluded_categories
+    routed_expert_bytes = audit.category_bytes.get("routed_experts", 0)
+    mtp_bytes = audit.category_bytes.get("mtp", 0)
+    other_excluded_bytes = sum(
+        audit.category_bytes.get(category, 0)
+        for category in excluded_categories
+        if category != "mtp"
     )
-    non_expert_bytes = (
-        audit.payload_bytes
-        - audit.category_bytes.get("routed_experts", 0)
-        - excluded_non_expert_bytes
+    primary_non_expert_raw_bytes = (
+        audit.payload_bytes - routed_expert_bytes - mtp_bytes - other_excluded_bytes
     )
-    primary_non_expert = math.ceil(non_expert_bytes * overhead)
+    primary_non_expert = math.ceil(primary_non_expert_raw_bytes * overhead)
     usages[1].non_expert_bytes = primary_non_expert
     usages[1].weight_bytes += primary_non_expert
+
+    if "mtp" not in excluded_categories:
+        placed_mtp_bytes = math.ceil(mtp_bytes * overhead)
+        if mtp_fraction_total:
+            shard_indices = [
+                index for index, device in enumerate(devices) if device.mtp_fraction > 0
+            ]
+            remaining_mtp_bytes = placed_mtp_bytes
+            for position, device_index in enumerate(shard_indices):
+                if position == len(shard_indices) - 1:
+                    shard_bytes = remaining_mtp_bytes
+                else:
+                    shard_bytes = math.floor(
+                        placed_mtp_bytes * devices[device_index].mtp_fraction
+                    )
+                    remaining_mtp_bytes -= shard_bytes
+                usage = usages[device_index + 1]
+                usage.mtp_bytes += shard_bytes
+                usage.weight_bytes += shard_bytes
+                usage.representation += "+mtp_shard"
+        else:
+            usages[1].mtp_bytes = placed_mtp_bytes
+            usages[1].weight_bytes += placed_mtp_bytes
 
     by_layer: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
     for (layer, expert), nbytes in audit.expert_bytes.items():
@@ -535,6 +572,8 @@ def _print_report(
             f"{'PASS' if usage.passes else 'FAIL'}"
         )
         print(f"    representation: {usage.representation}")
+        if usage.mtp_bytes:
+            print(f"    MTP shard: {_human_bytes(usage.mtp_bytes)}")
 
     messages = [*audit.warnings, *diagnostics]
     if messages:
@@ -575,6 +614,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu-backends",
         default="flashinfer_mxfp4,marlin_mxfp4,marlin_mxfp4,marlin_mxfp4",
+    )
+    parser.add_argument(
+        "--gpu-mtp-fractions",
+        help=(
+            "Comma-separated fraction of MTP/NextN bytes assigned to each GPU. "
+            "Use all zeros for primary-GPU placement or fractions summing to 1 "
+            "for an explicit shard plan, for example 0,0,0.5,0.5."
+        ),
     )
     parser.add_argument(
         "--allocator-overhead-percent",
@@ -623,6 +670,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         option="--gpu-experts-per-layer",
     )
     backends = _parse_csv_numbers(args.gpu_backends, cast=str, option="--gpu-backends")
+    mtp_fractions = (
+        _parse_csv_numbers(
+            args.gpu_mtp_fractions,
+            cast=float,
+            option="--gpu-mtp-fractions",
+        )
+        if args.gpu_mtp_fractions is not None
+        else [0.0] * len(names)
+    )
     _same_length(
         parser,
         names=names,
@@ -631,11 +687,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtimes=runtimes,
         expert_counts=expert_counts,
         backends=backends,
+        mtp_fractions=mtp_fractions,
     )
-    if any(value < 0 for value in [*capacities, *reserves, *runtimes, *expert_counts]):
+    if any(
+        value < 0
+        for value in [
+            *capacities,
+            *reserves,
+            *runtimes,
+            *expert_counts,
+            *mtp_fractions,
+        ]
+    ):
         parser.error(
-            "GPU capacities, reserves, runtime use, and expert counts cannot be negative"
+            "GPU capacities, reserves, runtime use, expert counts, and MTP "
+            "fractions cannot be negative"
         )
+    mtp_fraction_total = sum(mtp_fractions)
+    if mtp_fraction_total and not math.isclose(
+        mtp_fraction_total, 1.0, rel_tol=0, abs_tol=1e-9
+    ):
+        parser.error("Nonzero --gpu-mtp-fractions values must sum to 1")
+    if args.exclude_mtp and mtp_fraction_total:
+        parser.error("--exclude-mtp cannot be combined with GPU MTP fractions")
 
     devices = [
         DevicePlan(
@@ -645,9 +719,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_bytes=_gib(runtime),
             experts_per_layer=expert_count,
             backend=backend,
+            mtp_fraction=mtp_fraction,
         )
-        for name, capacity, reserve, runtime, expert_count, backend in zip(
-            names, capacities, reserves, runtimes, expert_counts, backends
+        for name, capacity, reserve, runtime, expert_count, backend, mtp_fraction in zip(
+            names,
+            capacities,
+            reserves,
+            runtimes,
+            expert_counts,
+            backends,
+            mtp_fractions,
         )
     ]
 
