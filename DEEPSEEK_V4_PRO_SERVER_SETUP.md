@@ -715,7 +715,8 @@ python -m pip check
 If the assertion still reports 12.8, the displayed `torch.__file__` is being
 imported from a different environment or user site. Do not build KT-Kernel
 until that path belongs to the `dsv4-pro` Conda environment and the assertion
-passes.
+passes. If KT-Kernel was already built against the CUDA 12.8 wheel, set
+`CPUINFER_FORCE_REBUILD=1` and repeat Section 8 after replacing PyTorch.
 
 ### `No kernel image is available` or unsupported SM120
 
