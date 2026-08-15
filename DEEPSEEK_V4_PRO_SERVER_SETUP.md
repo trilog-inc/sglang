@@ -727,6 +727,10 @@ export DSV4_CPUINFER_THREADS="${DSV4_CPUINFER_THREADS:-$(nproc)}"
 # Correctness-first SM120 decode fallback. Remove only after the standalone
 # FlashInfer sparse-MLA parity test passes on this exact driver/wheel stack.
 export SGLANG_SM120_FLASHMLA_BACKEND=triton
+# The HTTP listener starts before SGLang's prompt-plus-eight-token warmup. This
+# CPU-offloaded 1.6T topology can exceed the generic 600-second watchdog on its
+# first JIT-heavy forward.
+export SGLANG_WARMUP_TIMEOUT=1800
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -864,6 +868,14 @@ Keep the same monitor running. Stop if either RTX 3090 falls below its 2 GiB
 reserve, if the draft loads any `model.layers.N` expert in place of `mtp.N`, or
 if target-only and MTP-enabled greedy output diverge before the speculative
 accept/reject boundary can explain it.
+
+Do not treat a successful `/v1/models` response as readiness. The HTTP listener
+is live while the internal warmup is still running, so an external completion
+can queue behind it. Wait for this log line before sending the first request:
+
+```text
+The server is fired up and ready to roll!
+```
 
 Do not substitute tensor parallelism across these heterogeneous GPUs. Do not
 put target experts on either RTX 3090, and do not let Linux swap the expert bank
@@ -1003,6 +1015,31 @@ the first retry. If SGLang next reports that the draft pool is smaller than the
 target's 4096-token pool, reduce `--max-total-tokens` to `3072` for both workers
 before raising the fraction above `0.912`. Stop if `nvidia-smi` shows less than
 2 GiB free after pool initialization.
+
+### Internal server warmup times out after 600 seconds
+
+`/v1/models` can respond before SGLang finishes its internal `/generate`
+warmup. A traceback from `_execute_server_warmup` with `read timeout=600` means
+the warmup watchdog expired; it is not an OpenAI completions-client timeout.
+Set the runbook's extended watchdog before launching:
+
+```bash
+export SGLANG_WARMUP_TIMEOUT=1800
+```
+
+Do not submit an external completion until the server prints `The server is
+fired up and ready to roll!`. Keep the GPU/host monitor running during the
+warmup. If the internal request still does not finish within 1,800 seconds,
+retry once with `--skip-server-warmup` and issue a single streaming completion
+with `max_tokens=1`; use that only as a diagnostic to distinguish very slow
+first-token execution from a stuck scheduler. Preserve the scheduler output
+from the first `Prefill batch` or `Decode batch` message through the failure.
+
+```bash
+curl -N --max-time 1800 http://127.0.0.1:60000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"dsv4pro","prompt":"Hello","max_tokens":1,"temperature":0,"stream":true}'
+```
 
 ### `CUDA_HOME environment variable is not set`
 
