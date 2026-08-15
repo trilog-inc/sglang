@@ -811,7 +811,7 @@ python -m sglang.launch_server \
   --chunked-prefill-size 4096 \
   --max-total-tokens 4096 \
   --max-running-requests 1 \
-  --mem-fraction-static 0.89 \
+  --mem-fraction-static 0.912 \
   --disable-flashinfer-autotune \
   --disable-overlap-schedule \
   --disable-cuda-graph \
@@ -829,6 +829,15 @@ draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
 two 24 GiB devices do not duplicate the target embedding and LM-head weights.
 This first version uses synchronous cross-device vocabulary transfers and must
 remain eager.
+
+The MTP smoke launch deliberately uses `--mem-fraction-static 0.912`, while the
+target-only launch remains at `0.89`. On the measured first RTX 3090, draft
+loading began with 23.26 GiB available and left 2.26 GiB free after 21.00 GiB
+of weights. A fraction of `0.89` reserves 2.56 GiB, which is already larger
+than the observed free memory and therefore gives the draft KV configurator a
+negative budget. `0.912` reserves about 2.05 GiB and exposes about 0.21 GiB to
+the capped 4K draft cache. Treat this as a machine-specific narrow setting:
+recalculate it from the logged values if either number changes.
 
 Each draft stage should then report both of these bounded preparation paths:
 
@@ -976,6 +985,24 @@ export SGLANG_SM120_FLASHMLA_BACKEND=triton
 This selects SGLang's Triton sparse-MLA decode implementation and disables the
 FlashInfer tuning forward. It is the conservative correctness path for the
 initial load, not a statement about final attention performance.
+
+### Draft weights leave no memory for the KV cache
+
+If all local and remote MTP tiers finish but the draft KV configurator reports
+that `--mem-fraction-static=0.89` is below a minimum near `0.903`, the bounded
+expert loader succeeded. Use the two-device MTP value from Section 14:
+
+```bash
+--mem-fraction-static 0.912
+```
+
+For the measured 23.26/2.26 GiB pre-load/free values, this retains roughly
+2.05 GiB of non-static slack while making roughly 0.21 GiB available for the
+draft cache. Keep `--max-total-tokens 4096` and `--max-running-requests 1` for
+the first retry. If SGLang next reports that the draft pool is smaller than the
+target's 4096-token pool, reduce `--max-total-tokens` to `3072` for both workers
+before raising the fraction above `0.912`. Stop if `nvidia-smi` shows less than
+2 GiB free after pool initialization.
 
 ### `CUDA_HOME environment variable is not set`
 
