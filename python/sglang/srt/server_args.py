@@ -2019,6 +2019,20 @@ class ServerArgs:
         "requires tp_size=dp_size=pp_size=1.",
         NS("spec"),
     ] = None
+    speculative_draft_helper_device: A[
+        Optional[str],
+        "Optional second CUDA device for a DeepSeek-V4 DSpark draft. The draft "
+        "backbone and primary expert bank stay on --speculative-draft-device; "
+        "the second expert bank uses host-staged remote Marlin execution.",
+        NS("spec"),
+    ] = None
+    speculative_draft_num_gpu_experts_per_device: A[
+        Optional[List[int]],
+        "Routed experts per DSpark stage on the primary and helper draft devices. "
+        "Exactly two counts are required with --speculative-draft-helper-device, "
+        "and their sum must equal the draft's routed-expert count.",
+        NS("spec"),
+    ] = None
     speculative_draft_load_format: A[
         Optional[str],
         Arg(
@@ -2896,6 +2910,12 @@ class ServerArgs:
         "[ktransformers parameter] The path of the quantized expert weights for amx kernel. A local folder.",
         NS("exec.moe"),
     ] = None
+    kt_weight_prefix: A[
+        Optional[str],
+        "[ktransformers parameter] Optional checkpoint prefix for routed experts. "
+        "The target uses model layer auto-detection; a bundled DSpark draft uses mtp.",
+        NS("exec.moe"),
+    ] = None
     kt_method: A[
         str,
         "[ktransformers parameter] Native quantization format for CPU execution. DeepSeek-V4-Flash uses MXFP4 (packed E2M1 plus UE8M0 scales).",
@@ -2919,6 +2939,27 @@ class ServerArgs:
     kt_num_gpu_experts: A[
         Optional[int],
         "[ktransformers parameter] Number of routed experts retained on GPU per MoE layer.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_expert_devices: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Logical CUDA devices for static routed-expert "
+        "tiers. The first device must be the target GPU; remaining devices are "
+        "remote helper tiers. Use with --kt-num-gpu-experts-per-device and "
+        "--kt-gpu-expert-backends.",
+        NS("exec.moe"),
+    ] = None
+    kt_num_gpu_experts_per_device: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Routed experts retained per MoE layer on each "
+        "device in --kt-gpu-expert-devices.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_expert_backends: A[
+        Optional[List[str]],
+        "[ktransformers parameter] Expert backend for each device in "
+        "--kt-gpu-expert-devices. The initial remote-helper implementation "
+        "supports marlin_mxfp4.",
         NS("exec.moe"),
     ] = None
     kt_gpu_experts_ratio: A[
@@ -6853,10 +6894,75 @@ class ServerArgs:
             )
         self.kt_expert_placement_strategy = strategy
 
-        if self.kt_weight_path is None:
-            if self.kt_expert_frequency_file is not None:
+        topology = (
+            self.kt_gpu_expert_devices,
+            self.kt_num_gpu_experts_per_device,
+            self.kt_gpu_expert_backends,
+        )
+        topology_is_set = [value is not None for value in topology]
+        if any(topology_is_set) and not all(topology_is_set):
+            raise ValueError(
+                "--kt-gpu-expert-devices, --kt-num-gpu-experts-per-device, and "
+                "--kt-gpu-expert-backends must be provided together."
+            )
+        if all(topology_is_set):
+            lengths = [len(value) for value in topology]
+            if not lengths[0] or len(set(lengths)) != 1:
                 raise ValueError(
-                    "--kt-expert-frequency-file requires --kt-weight-path."
+                    "KT per-device expert topology lists must be non-empty and "
+                    f"have the same length, got {lengths}."
+                )
+            if len(set(self.kt_gpu_expert_devices)) != lengths[0] or any(
+                device < 0 for device in self.kt_gpu_expert_devices
+            ):
+                raise ValueError(
+                    "--kt-gpu-expert-devices must contain unique non-negative "
+                    "logical CUDA indices."
+                )
+            if any(count < 0 for count in self.kt_num_gpu_experts_per_device):
+                raise ValueError(
+                    "--kt-num-gpu-experts-per-device values cannot be negative."
+                )
+            if (
+                self.kt_num_gpu_experts is not None
+                or self.kt_gpu_experts_ratio is not None
+            ):
+                raise ValueError(
+                    "Per-device KT expert topology cannot be combined with "
+                    "--kt-num-gpu-experts or --kt-gpu-experts-ratio."
+                )
+            if self.tp_size != 1 or self.dp_size != 1 or self.pp_size != 1:
+                raise ValueError(
+                    "Remote KT expert tiers currently require "
+                    "--tp-size 1 --dp-size 1 --pp-size 1."
+                )
+            primary_device = int(self.base_gpu_id)
+            if int(self.kt_gpu_expert_devices[0]) != primary_device:
+                raise ValueError(
+                    "The first --kt-gpu-expert-devices entry must be the target "
+                    f"GPU ({primary_device}), got {self.kt_gpu_expert_devices[0]}."
+                )
+            primary_backend = self.kt_gpu_expert_backends[0].lower()
+            if primary_backend not in ("flashinfer_mxfp4", "marlin_mxfp4"):
+                raise ValueError(
+                    "The primary KT expert backend must be flashinfer_mxfp4 or "
+                    f"marlin_mxfp4, got {self.kt_gpu_expert_backends[0]!r}."
+                )
+            unsupported_helpers = [
+                backend
+                for backend in self.kt_gpu_expert_backends[1:]
+                if backend.lower() != "marlin_mxfp4"
+            ]
+            if unsupported_helpers:
+                raise ValueError(
+                    "Remote KT expert tiers currently support only "
+                    "marlin_mxfp4, got " + ", ".join(unsupported_helpers)
+                )
+
+        if self.kt_weight_path is None:
+            if self.kt_expert_frequency_file is not None or any(topology_is_set):
+                raise ValueError(
+                    "KT expert placement options require --kt-weight-path."
                 )
             return
 

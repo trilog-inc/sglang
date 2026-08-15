@@ -29,6 +29,7 @@ from typing import Mapping, Sequence
 GIB = 1 << 30
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _EXPERT_RE = re.compile(r"(?:^|\.)experts\.(\d+)(?:\.|$)")
+_MTP_STAGE_RE = re.compile(r"(?:^|\.)(?:mtp|nextn)\.(\d+)(?:\.|$)")
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,9 @@ class TierUsage:
     routed_expert_bytes: int = 0
     non_expert_bytes: int = 0
     mtp_bytes: int = 0
+    mtp_routed_expert_bytes: int = 0
+    mtp_non_expert_bytes: int = 0
+    mtp_expert_count: int = 0
     expert_count: int = 0
     layer_experts: dict[int, list[int]] = field(default_factory=dict)
 
@@ -87,6 +91,7 @@ class AuditResult:
     category_bytes: Mapping[str, int]
     layer_bytes: Mapping[int, int]
     expert_bytes: Mapping[tuple[int, int], int]
+    mtp_expert_bytes: Mapping[tuple[int, int], int]
     payload_bytes: int
     shard_file_bytes: int
     warnings: tuple[str, ...]
@@ -200,6 +205,7 @@ def scan_checkpoint(model_dir: Path) -> AuditResult:
     category_bytes: defaultdict[str, int] = defaultdict(int)
     layer_bytes: defaultdict[int, int] = defaultdict(int)
     expert_bytes: defaultdict[tuple[int, int], int] = defaultdict(int)
+    mtp_expert_bytes: defaultdict[tuple[int, int], int] = defaultdict(int)
     warnings: list[str] = []
     seen_names: set[str] = set()
     shard_file_bytes = 0
@@ -265,6 +271,10 @@ def scan_checkpoint(model_dir: Path) -> AuditResult:
                     warnings.append(
                         f"Routed-expert scale {name} uses {dtype}, not native one-byte UE8M0"
                     )
+            elif category == "mtp" and expert is not None:
+                stage_match = _MTP_STAGE_RE.search(name.lower())
+                if stage_match is not None:
+                    mtp_expert_bytes[(int(stage_match.group(1)), expert)] += nbytes
 
     if not expert_bytes:
         warnings.append("No routed-expert tensors were recognized")
@@ -278,6 +288,15 @@ def scan_checkpoint(model_dir: Path) -> AuditResult:
                 if len(expert_ids) != expected_experts:
                     warnings.append(
                         f"Layer {layer} contains {len(expert_ids)} routed experts; "
+                        f"config.json declares {expected_experts}"
+                    )
+            mtp_experts_by_stage: defaultdict[int, set[int]] = defaultdict(set)
+            for stage, expert in mtp_expert_bytes:
+                mtp_experts_by_stage[stage].add(expert)
+            for stage, expert_ids in sorted(mtp_experts_by_stage.items()):
+                if len(expert_ids) != expected_experts:
+                    warnings.append(
+                        f"MTP stage {stage} contains {len(expert_ids)} routed experts; "
                         f"config.json declares {expected_experts}"
                     )
 
@@ -311,6 +330,7 @@ def scan_checkpoint(model_dir: Path) -> AuditResult:
         category_bytes=dict(sorted(category_bytes.items())),
         layer_bytes=dict(sorted(layer_bytes.items())),
         expert_bytes=dict(sorted(expert_bytes.items())),
+        mtp_expert_bytes=dict(sorted(mtp_expert_bytes.items())),
         payload_bytes=payload_bytes,
         shard_file_bytes=shard_file_bytes,
         warnings=tuple(dict.fromkeys(warnings)),
@@ -387,21 +407,65 @@ def build_placement(
             shard_indices = [
                 index for index, device in enumerate(devices) if device.mtp_fraction > 0
             ]
-            remaining_mtp_bytes = placed_mtp_bytes
-            for position, device_index in enumerate(shard_indices):
-                if position == len(shard_indices) - 1:
-                    shard_bytes = remaining_mtp_bytes
-                else:
-                    shard_bytes = math.floor(
-                        placed_mtp_bytes * devices[device_index].mtp_fraction
-                    )
-                    remaining_mtp_bytes -= shard_bytes
-                usage = usages[device_index + 1]
-                usage.mtp_bytes += shard_bytes
-                usage.weight_bytes += shard_bytes
-                usage.representation += "+mtp_shard"
+            mtp_routed_raw_bytes = sum(audit.mtp_expert_bytes.values())
+            if mtp_routed_raw_bytes:
+                placed_mtp_non_expert_bytes = math.ceil(
+                    (mtp_bytes - mtp_routed_raw_bytes) * overhead
+                )
+                backbone_usage = usages[shard_indices[0] + 1]
+                backbone_usage.mtp_bytes += placed_mtp_non_expert_bytes
+                backbone_usage.mtp_non_expert_bytes += placed_mtp_non_expert_bytes
+                backbone_usage.weight_bytes += placed_mtp_non_expert_bytes
+                backbone_usage.representation += "+mtp_backbone"
+
+                mtp_by_stage: defaultdict[int, list[tuple[int, int]]] = defaultdict(
+                    list
+                )
+                for (stage, expert), nbytes in audit.mtp_expert_bytes.items():
+                    mtp_by_stage[stage].append((expert, nbytes))
+                shard_raw_bytes = {device_index: 0 for device_index in shard_indices}
+                shard_expert_counts = {
+                    device_index: 0 for device_index in shard_indices
+                }
+                for experts in mtp_by_stage.values():
+                    experts.sort()
+                    offset = 0
+                    for position, device_index in enumerate(shard_indices):
+                        if position == len(shard_indices) - 1:
+                            end = len(experts)
+                        else:
+                            count = math.floor(
+                                len(experts) * devices[device_index].mtp_fraction
+                            )
+                            end = offset + count
+                        selected = experts[offset:end]
+                        shard_raw_bytes[device_index] += sum(
+                            nbytes for _, nbytes in selected
+                        )
+                        shard_expert_counts[device_index] += len(selected)
+                        offset = end
+
+                for device_index in shard_indices:
+                    shard_bytes = math.ceil(shard_raw_bytes[device_index] * overhead)
+                    usage = usages[device_index + 1]
+                    usage.mtp_bytes += shard_bytes
+                    usage.mtp_routed_expert_bytes += shard_bytes
+                    usage.mtp_expert_count += shard_expert_counts[device_index]
+                    usage.weight_bytes += shard_bytes
+                    usage.representation += "+mtp_expert_shard"
+            elif mtp_bytes:
+                raise ValueError(
+                    "MTP sharding requires recognizable per-expert tensor names"
+                )
         else:
             usages[1].mtp_bytes = placed_mtp_bytes
+            usages[1].mtp_routed_expert_bytes = math.ceil(
+                sum(audit.mtp_expert_bytes.values()) * overhead
+            )
+            usages[1].mtp_expert_count = len(audit.mtp_expert_bytes)
+            usages[1].mtp_non_expert_bytes = (
+                placed_mtp_bytes - usages[1].mtp_routed_expert_bytes
+            )
             usages[1].weight_bytes += placed_mtp_bytes
 
     by_layer: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
@@ -494,6 +558,8 @@ def _json_result(
             "routed_expert_instances": len(audit.expert_bytes),
             "routed_expert_bytes_min": min(audit.expert_bytes.values(), default=0),
             "routed_expert_bytes_max": max(audit.expert_bytes.values(), default=0),
+            "mtp_routed_expert_instances": len(audit.mtp_expert_bytes),
+            "mtp_routed_expert_bytes": sum(audit.mtp_expert_bytes.values()),
         },
         "placement_exclusions": dict(excluded_category_bytes),
         "placement": [
@@ -574,6 +640,16 @@ def _print_report(
         print(f"    representation: {usage.representation}")
         if usage.mtp_bytes:
             print(f"    MTP shard: {_human_bytes(usage.mtp_bytes)}")
+            if usage.mtp_routed_expert_bytes:
+                print(
+                    f"      routed experts: {usage.mtp_expert_count:,} instances, "
+                    f"{_human_bytes(usage.mtp_routed_expert_bytes)}"
+                )
+            if usage.mtp_non_expert_bytes:
+                print(
+                    "      backbone/heads: "
+                    f"{_human_bytes(usage.mtp_non_expert_bytes)}"
+                )
 
     messages = [*audit.warnings, *diagnostics]
     if messages:
@@ -618,9 +694,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gpu-mtp-fractions",
         help=(
-            "Comma-separated fraction of MTP/NextN bytes assigned to each GPU. "
-            "Use all zeros for primary-GPU placement or fractions summing to 1 "
-            "for an explicit shard plan, for example 0,0,0.5,0.5."
+            "Comma-separated fraction of MTP/NextN routed-expert bytes assigned "
+            "to each GPU. Recognized MTP backbone tensors stay on the first GPU "
+            "with a nonzero fraction, matching the two-device DSpark runtime. "
+            "Use all zeros for primary-GPU placement or fractions summing to 1, "
+            "for example 0,0,0.5,0.5."
         ),
     )
     parser.add_argument(

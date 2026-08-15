@@ -1,6 +1,6 @@
 # DeepSeek-V4-Pro Single-Server Inference Strategy
 
-Status: Phase 0/1 implemented; Phase 2+ gated on the target-server audit
+Status: target and two-device MTP topology implemented; hardware validation pending
 Last updated: 2026-08-15
 
 Server setup and validation runbook:
@@ -8,8 +8,9 @@ Server setup and validation runbook:
 
 ## Implementation checkpoint
 
-The repository now includes the metadata-only capacity gate and the native
-UE8M0 CPU path required before attempting a Pro load:
+The repository now includes the metadata-only capacity gate, native UE8M0 CPU
+path, multi-device target router, and experimental two-device DSpark expert
+split required for a Pro load:
 
 ```bash
 python scripts/deepseek_v4_pro_memory_planner.py \
@@ -20,9 +21,9 @@ python scripts/deepseek_v4_pro_memory_planner.py \
 
 The command exits with status 0 only when every configured memory reserve is
 met and the checkpoint metadata has no unexplained routed-expert warnings. It
-does not read tensor payloads. Phase 2 and the helper-GPU phases must be run on
-the target inference server only after this command returns `GO`; this follows
-the go/no-go requirement at the end of this document.
+does not read tensor payloads. Hardware validation must run on the target
+inference server only after this command returns `GO`; this follows the
+go/no-go requirement at the end of this document.
 
 ## Objective
 
@@ -48,18 +49,11 @@ throughput and maximum context support are later optimization stages.
 
 ## Feasibility conclusion
 
-The model cannot run with the current two-tier target-GPU/CPU implementation.
-The existing CPU MXFP4 representation expands every one-byte UE8M0 scale to a
-four-byte FP32 value, making the host expert allocation alone larger than the
-available 768 GiB RAM.
-
-A native-precision deployment is likely feasible after two fundamental
-changes:
-
-1. Retain UE8M0 scales in their native one-byte representation throughout the
-   CPU loader and AMX kernels.
-2. Use the RTX 4090 and both RTX 3090s as additional target-model expert
-   compute tiers rather than reserving a GPU for a speculative draft.
+The audited 26/10/0/0 target placement passes after retaining UE8M0 scales in
+their native one-byte representation and assigning 10 routed experts per layer
+to the RTX 4090. The remaining target experts stay packed in host memory. The
+two RTX 3090s are reserved for the bundled MTP draft, whose routed experts are
+split across both devices.
 
 This is a narrow capacity envelope. Every large allocation must be intentional,
 and model loading must never materialize a full duplicate of the checkpoint.
@@ -70,11 +64,11 @@ weights. The normal target loader skips the MTP tensors when speculative
 decoding is disabled, so Phase 0 now records separate target-only and
 speculative-inclusive capacity gates. The initial 18/9/9/9 placement is a
 `NO-GO` when MTP is included under the stated reserves; this does not invalidate
-the target-only placement. A second, experimental capacity model can fit MTP
-50/50 on the two RTX 3090s by changing the target-expert split to 26/10/0/0 and
-tightening reserves to 48 GiB host, 10 GiB primary, and 2 GiB per helper. This
-is not executable until the runtime supports both the multi-device target
-router and a two-device MTP/DSpark draft.
+the target-only placement. A second, experimental capacity model can fit MTP by
+splitting its routed experts 50/50 across the two RTX 3090s, keeping its
+backbone on the first, changing the target-expert split to 26/10/0/0, and
+tightening reserves to 48 GiB host, 10 GiB primary, and 2 GiB per helper. The
+runtime topology is implemented, with hardware validation still pending.
 
 ## Source model facts
 
@@ -235,22 +229,23 @@ Extend the current KT routing split from two destinations:
 primary GPU | CPU
 ```
 
-to five destinations:
+to an explicit ordered set of GPU tiers plus CPU:
 
 ```text
-RTX PRO 6000 | RTX 4090 | RTX 3090 #1 | RTX 3090 #2 | CPU
+configured primary GPU | configured helper GPU(s) | CPU
 ```
 
 Each layer needs a logical-expert-to-tier map and a compact index within that
-tier. A possible CLI shape is:
+tier. The implemented CLI for the 26/10/0/0 profile is:
 
 ```text
---kt-gpu-expert-devices 0,1,2,3
---kt-num-gpu-experts-per-device 18,9,9,9
---kt-gpu-expert-backends flashinfer_mxfp4,marlin,marlin,marlin
+--kt-gpu-expert-devices 0 1
+--kt-num-gpu-experts-per-device 26 10
+--kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4
 ```
 
-The actual option names should follow existing SGLang argument conventions.
+The two RTX 3090s are intentionally absent because the MTP capacity profile
+reserves them for the draft.
 
 Placement strategies should include:
 
@@ -258,10 +253,9 @@ Placement strategies should include:
 - `frequency` using recorded target-model expert distributions; and
 - an explicit placement file for reproducible deployments.
 
-The frequency policy should place the hottest experts on the RTX PRO 6000,
-the next group on the RTX 4090, then distribute the remaining GPU-resident
-experts across the RTX 3090s while accounting for their equal memory but lower
-compute throughput.
+The frequency policy should place the hottest experts on the RTX PRO 6000 and
+the next group on the RTX 4090 for the 26/10/0/0 profile. The RTX 3090s remain
+absent from the target tier list because they are dedicated to MTP.
 
 ### 3. Explicit host-staged transport
 
@@ -375,12 +369,11 @@ capacity and for reducing CPU memory traffic.
 Recommended progression:
 
 1. Run target-only eager decode.
-2. Validate the experimental 26/10/0/0 placement with the MTP payload split
-   equally across the two RTX 3090s. The measured audit predicts approximately
-   50.12 GiB host, 12.05 GiB primary, 2.97 GiB RTX 4090, and 3.35 GiB per-3090
-   headroom after the configured runtime allowances.
-3. Implement and validate two-device draft sharding; the merged DSpark path
-   currently accepts only one remote draft device.
+2. Validate the experimental 26/10/0/0 placement with MTP routed experts split
+   equally across the two RTX 3090s and the MTP backbone on the first. The
+   updated planner reports the resulting asymmetric per-3090 headroom.
+3. Validate the implemented two-device draft topology in eager mode, first at
+   one request and 4K total tokens.
 4. Enable the draft only after the speculative-inclusive capacity gate and
    measured runtime allocations pass.
 5. Evaluate whether MTP improves end-to-end latency at the low expected batch
@@ -430,19 +423,25 @@ and large-model-loading changes before multi-GPU routing is introduced.
 
 ### Phase 3: one helper GPU
 
-- Add one remote target expert tier on the RTX 4090.
+- Add one remote target expert tier on the RTX 4090. Implemented; hardware
+  validation pending.
 - Implement pinned host staging and asynchronous event coordination.
+  Implemented with reusable per-device buffers and cross-device CUDA events;
+  hardware validation pending.
+- Stream selected helper weights through one temporary native-MXFP4 expert
+  slot into permanent compact Marlin storage. Implemented.
 - Verify exact output combination for arbitrary routing patterns.
 - Benchmark the latency crossover between CPU AMX and remote Marlin.
 
 Exit criterion: helper execution reduces or matches layer latency without
 increasing peak host memory.
 
-### Phase 4: four-device expert routing
+### Phase 4: complete target placement
 
-- Add both RTX 3090 tiers.
+- Validate the 26/10/0/0 target split on the complete checkpoint while keeping
+  both RTX 3090s free for MTP.
 - Implement weighted static placement and per-device capacity planning.
-- Run all four expert compute paths concurrently.
+- Run the primary, RTX 4090, and CPU expert paths concurrently.
 - Add failure diagnostics that identify the tier, layer, expert, device, and
   bucket involved.
 
@@ -466,7 +465,13 @@ reserves and generates deterministically for a short greedy prompt.
 
 ### Phase 7: MTP and concurrency
 
-- Implement two-device MTP/DSpark sharding and synchronization.
+- Split every bundled DSpark stage's routed experts across two draft devices,
+  using a compact Marlin bank and host-staged asynchronous helper execution.
+  Implemented for a configurable two-count partition; hardware validation
+  pending.
+- Keep the already-loaded target embedding and LM head on the primary target
+  GPU so the 24 GiB draft devices do not duplicate the vocabulary weights.
+  Implemented in eager mode; cross-device transfer cost remains to be measured.
 - Enable MTP only after the 26/10/0/0 capacity and runtime gates pass.
 - Verify acceptance rate and net latency improvement.
 - Test concurrency levels 1, 2, 4, and 8 only while memory reserves hold.
@@ -566,7 +571,7 @@ deployment, not data-center-class throughput.
 | Primary GPU OOM during autotune or graph capture | Reserve at least 12-20 GiB, cap graph shapes, disable prefill graph |
 | Helper GPUs slower than CPU for tiny assignments | Measure crossover and route small buckets to CPU |
 | Host-staged transfers serialize every layer | Persistent pinned buffers, separate streams, concurrent CPU/helper execution |
-| Marlin representation exceeds helper capacity | Use 8-9 experts/layer, account for repack and scale bytes before allocation |
+| Marlin representation exceeds helper capacity | Use planner-gated per-device counts and account for repack and scale bytes before allocation |
 | Long prefill needs a full layer staging buffer | Demand-driven expert minibatches across all helpers |
 | File cache displaces anonymous expert memory | Release mappings and use advisory cache eviction after each layer |
 | Frequency placement overfits one workload | Preserve a uniform baseline and validate on multiple prompt classes |

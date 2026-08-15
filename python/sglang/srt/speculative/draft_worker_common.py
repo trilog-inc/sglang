@@ -202,6 +202,8 @@ def build_draft_tp_worker(
     algo_label: str,
     attention_backend_override: Optional[str] = None,
     fp8_gemm_backend_override: Optional[str] = None,
+    expert_helper_gpu_id: Optional[int] = None,
+    expert_counts_per_device: Optional[tuple[int, int]] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -234,6 +236,26 @@ def build_draft_tp_worker(
     # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
     # would silently skip those paths. context_length keeps the draft aligned
     # with the target.
+    if (expert_helper_gpu_id is None) != (expert_counts_per_device is None):
+        raise ValueError(
+            "Draft expert helper device and per-device counts must be set together."
+        )
+    kt_overrides = (
+        {
+            "kt_weight_path": draft_server_args.speculative_draft_model_path,
+            "kt_weight_prefix": "mtp",
+            "kt_method": "MXFP4",
+            "kt_gpu_expert_devices": [int(gpu_id), int(expert_helper_gpu_id)],
+            "kt_num_gpu_experts_per_device": list(expert_counts_per_device),
+            "kt_gpu_expert_backends": ["marlin_mxfp4", "marlin_mxfp4"],
+            "kt_num_gpu_experts": None,
+            "kt_gpu_experts_ratio": None,
+            "kt_gpu_prefill_token_threshold": 0,
+            "kt_max_deferred_experts_per_token": None,
+        }
+        if expert_helper_gpu_id is not None
+        else {"kt_weight_path": None, "kt_weight_prefix": None}
+    )
     draft_server_args.override(
         "draft_worker.build",
         skip_tokenizer_init=True,
@@ -248,16 +270,21 @@ def build_draft_tp_worker(
             if fp8_gemm_backend_override is not None
             else draft_server_args.fp8_gemm_runner_backend
         ),
-        # KT CPU/GPU expert offload belongs to the target only. In particular,
-        # DSpark's bundled DeepSeek-V4 draft must remain GPU-resident: applying
-        # target placement masks to it would load a second CPU model and put
-        # blocking CPU work on every proposal step.
-        kt_weight_path=None,
+        # Target placement is never inherited by the draft. A two-device
+        # bundled DSV4 draft installs its own all-GPU compact topology; other
+        # drafts keep KT disabled.
+        **kt_overrides,
     )
 
     # The draft's layers must resolve config from the draft's own bags.
     with get_context().preserve_config():
         get_context().set_server_args(draft_server_args)
+        if expert_helper_gpu_id is not None:
+            from sglang.srt.layers.moe.kt_ep_wrapper import (
+                reset_kt_expert_placement_cache,
+            )
+
+            reset_kt_expert_placement_cache()
         draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,

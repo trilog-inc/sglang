@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """KTransformers CPU/GPU expert parallelism for routed MoE layers.
 
-The target keeps a configurable hot subset of native MXFP4 experts on the GPU
-and executes the remaining experts with KT-Kernel.  The DSpark draft is kept
+The target keeps a configurable hot subset of native MXFP4 experts on its
+primary GPU, may place additional compact Marlin tiers on helper GPUs, and
+executes the remaining experts with KT-Kernel.  The DSpark draft is kept
 GPU-only by ``draft_worker_common.build_draft_tp_worker``.
 
 The CPU implementation consumes the checkpoint's packed E2M1 values and UE8M0
@@ -46,10 +47,25 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
+_KT_GPU_EXPERT_TIER_MAP: Optional[torch.Tensor] = None
 _SHARED_STAGING_BUFFER: Optional["SharedStagingBuffer"] = None
 _MXFP4_PREFILL_LAYER_REGISTRY: dict[tuple, dict[int, tuple]] = {}
 _MXFP4_LAYERWISE_MANAGERS: dict[tuple, "_Mxfp4LayerwisePrefillManager"] = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS: dict[tuple, str] = {}
+
+
+def reset_kt_expert_placement_cache() -> None:
+    """Reset model-construction placement state before building another model."""
+    global _KT_GPU_EXPERTS_MASKS, _KT_GPU_EXPERT_TIER_MAP
+    _KT_GPU_EXPERTS_MASKS = None
+    _KT_GPU_EXPERT_TIER_MAP = None
+
+
+@dataclass
+class KTRemoteExpertTierConfig:
+    device_id: int
+    backend: str
+    experts_mask: torch.Tensor
 
 
 @dataclass
@@ -59,6 +75,7 @@ class KTConfig:
     cpuinfer_threads: int
     threadpool_count: int
     weight_path: str
+    weight_base_key: Optional[str]
     chunked_prefill_size: int
     max_deferred_experts_per_token: Optional[int]
     method: str
@@ -67,6 +84,10 @@ class KTConfig:
     mxfp4_prefill_host_staging_experts: int = 8
     numa_nodes: Optional[list[int]] = None
     num_layers: Optional[int] = None
+    gpu_expert_devices: tuple[int, ...] = ()
+    gpu_expert_backends: tuple[str, ...] = ()
+    expert_tier_map: Optional[torch.Tensor] = None
+    remote_expert_tiers: tuple[KTRemoteExpertTierConfig, ...] = ()
 
 
 class SharedStagingBuffer:
@@ -239,7 +260,7 @@ def _load_activation_frequency(
 
 
 def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]:
-    global _KT_GPU_EXPERTS_MASKS
+    global _KT_GPU_EXPERTS_MASKS, _KT_GPU_EXPERT_TIER_MAP
     if _KT_GPU_EXPERTS_MASKS is not None:
         return _KT_GPU_EXPERTS_MASKS
 
@@ -259,6 +280,104 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
     moe_layers = _moe_layer_indices(hf_config)
     if not moe_layers:
         return None
+
+    explicit_devices = getattr(server_args, "kt_gpu_expert_devices", None)
+    explicit_counts = getattr(server_args, "kt_num_gpu_experts_per_device", None)
+    explicit_backends = getattr(server_args, "kt_gpu_expert_backends", None)
+    explicit_values = (explicit_devices, explicit_counts, explicit_backends)
+    explicit_is_set = [value is not None for value in explicit_values]
+    if any(explicit_is_set) and not all(explicit_is_set):
+        raise ValueError(
+            "KT per-device expert topology requires devices, counts, and backends."
+        )
+    if all(explicit_is_set):
+        devices = tuple(int(value) for value in explicit_devices)
+        counts = tuple(int(value) for value in explicit_counts)
+        backends = tuple(str(value).lower() for value in explicit_backends)
+        if not devices or len({len(devices), len(counts), len(backends)}) != 1:
+            raise ValueError(
+                "KT per-device expert topology lists must be non-empty and have "
+                "the same length."
+            )
+        if len(set(devices)) != len(devices) or any(device < 0 for device in devices):
+            raise ValueError("KT expert devices must be unique and non-negative")
+        if any(count < 0 for count in counts) or sum(counts) > num_experts:
+            raise ValueError(
+                "KT per-device expert counts must be non-negative and total no "
+                f"more than {num_experts} per layer."
+            )
+        if (
+            getattr(server_args, "kt_num_gpu_experts", None) is not None
+            or getattr(server_args, "kt_gpu_experts_ratio", None) is not None
+        ):
+            raise ValueError(
+                "KT per-device topology cannot be combined with legacy GPU "
+                "expert count or ratio options."
+            )
+
+        strategy = server_args.kt_expert_placement_strategy.lower()
+        scores = None
+        if strategy == "frequency":
+            freq_path = server_args.kt_expert_frequency_file
+            if not freq_path:
+                raise ValueError(
+                    "--kt-expert-placement-strategy frequency requires "
+                    "--kt-expert-frequency-file."
+                )
+            scores = _load_activation_frequency(
+                str(freq_path), num_layers=num_layers, num_experts=num_experts
+            )
+            empty_layers = [
+                layer_idx
+                for layer_idx in moe_layers
+                if float(scores[layer_idx].sum()) <= 0
+            ]
+            if empty_layers:
+                raise ValueError(
+                    "KT frequency profile has no recorded routes for MoE layers "
+                    f"{empty_layers}. Recapture a complete target-model profile."
+                )
+        elif strategy not in ("uniform", "front-loading", "random"):
+            raise ValueError(
+                "--kt-expert-placement-strategy must be one of: "
+                "uniform, front-loading, random, frequency"
+            )
+
+        tier_map = torch.full(
+            (num_layers, num_experts), -1, dtype=torch.int16, device="cpu"
+        )
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(42)
+        if get_parallel().tp_rank == 0:
+            for layer_idx in moe_layers:
+                if scores is not None:
+                    ordered = torch.argsort(
+                        scores[layer_idx], descending=True, stable=True
+                    )
+                elif strategy == "random":
+                    ordered = torch.randperm(num_experts, generator=generator)
+                else:
+                    ordered = torch.arange(num_experts)
+                offset = 0
+                for tier_index, count in enumerate(counts):
+                    selected = ordered[offset : offset + count]
+                    tier_map[layer_idx, selected] = tier_index
+                    offset += count
+        if dist.is_initialized():
+            dist.broadcast(tier_map, src=0, group=get_tp_group().cpu_group)
+
+        _KT_GPU_EXPERT_TIER_MAP = tier_map
+        _KT_GPU_EXPERTS_MASKS = tier_map.eq(0)
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "KT multi-device placement: strategy=%s devices=%s "
+                "experts_per_layer=%s backends=%s",
+                strategy,
+                devices,
+                counts,
+                backends,
+            )
+        return _KT_GPU_EXPERTS_MASKS
 
     ratio = server_args.kt_gpu_experts_ratio
     per_layer = server_args.kt_num_gpu_experts
@@ -354,6 +473,11 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
         dist.broadcast(masks, src=0, group=get_tp_group().cpu_group)
 
     _KT_GPU_EXPERTS_MASKS = masks
+    _KT_GPU_EXPERT_TIER_MAP = torch.where(
+        masks,
+        torch.zeros_like(masks, dtype=torch.int16),
+        torch.full_like(masks, -1, dtype=torch.int16),
+    )
     if get_parallel().tp_rank == 0:
         counts = {layer_idx: int(masks[layer_idx].sum()) for layer_idx in moe_layers}
         logger.info(
@@ -427,6 +551,15 @@ def create_kt_config_from_server_args(
         raise ValueError("--kt-gpu-prefill-token-threshold must be non-negative")
     if gpu_prefill_threshold > 0 and get_parallel().tp_size != 1:
         raise ValueError("KT native-MXFP4 layerwise prefill currently requires --tp 1")
+    if (
+        gpu_prefill_threshold > 0
+        and len(getattr(server_args, "kt_gpu_expert_devices", None) or []) > 1
+    ):
+        raise ValueError(
+            "Remote KT expert tiers currently require "
+            "--kt-gpu-prefill-token-threshold 0; helper-resident experts cannot "
+            "participate in the target-only layerwise prefill cache."
+        )
     prefill_slots = str(getattr(server_args, "kt_mxfp4_prefill_slots", "auto")).lower()
     if prefill_slots not in ("auto", "1", "2"):
         raise ValueError("--kt-mxfp4-prefill-slots must be auto, 1, or 2")
@@ -459,6 +592,27 @@ def create_kt_config_from_server_args(
     if numa_nodes is not None and len(numa_nodes) != threadpool_count:
         raise ValueError("--kt-numa-nodes length must equal --kt-threadpool-count")
 
+    explicit_devices = tuple(
+        int(value)
+        for value in (getattr(server_args, "kt_gpu_expert_devices", None) or [])
+    )
+    explicit_backends = tuple(
+        str(value).lower()
+        for value in (getattr(server_args, "kt_gpu_expert_backends", None) or [])
+    )
+    layer_tier_map = (
+        _KT_GPU_EXPERT_TIER_MAP[layer_idx].clone()
+        if _KT_GPU_EXPERT_TIER_MAP is not None
+        else None
+    )
+    remote_tiers = tuple(
+        KTRemoteExpertTierConfig(
+            device_id=device_id,
+            backend=explicit_backends[tier_index],
+            experts_mask=layer_tier_map.eq(tier_index),
+        )
+        for tier_index, device_id in enumerate(explicit_devices[1:], start=1)
+    )
     return KTConfig(
         layer_idx=layer_idx,
         gpu_experts_mask=masks[layer_idx].clone(),
@@ -466,6 +620,11 @@ def create_kt_config_from_server_args(
         threadpool_count=threadpool_count,
         numa_nodes=numa_nodes,
         weight_path=server_args.kt_weight_path,
+        weight_base_key=(
+            f"{server_args.kt_weight_prefix}.{layer_idx}"
+            if getattr(server_args, "kt_weight_prefix", None)
+            else None
+        ),
         chunked_prefill_size=int(server_args.chunked_prefill_size or 8192),
         method=method,
         gpu_prefill_token_threshold=gpu_prefill_threshold,
@@ -473,6 +632,10 @@ def create_kt_config_from_server_args(
         mxfp4_prefill_host_staging_experts=host_staging_experts,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=int(getattr(hf_config, "num_hidden_layers")),
+        gpu_expert_devices=explicit_devices,
+        gpu_expert_backends=explicit_backends,
+        expert_tier_map=layer_tier_map,
+        remote_expert_tiers=remote_tiers,
     )
 
 
@@ -519,8 +682,402 @@ def partition_and_remap_expert_ids(
     return cpu_ids, gpu_ids
 
 
+class _RemoteExpertStaging:
+    """Reusable pinned transport buffers for one helper CUDA device."""
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int,
+        hidden_size: int,
+        top_k: int,
+        dtype: torch.dtype,
+        target_device: torch.device,
+        helper_device: torch.device,
+    ) -> None:
+        self.max_tokens = int(max_tokens)
+        self.hidden_size = int(hidden_size)
+        self.top_k = int(top_k)
+        self.dtype = dtype
+        self.target_device = target_device
+        self.helper_device = helper_device
+        try:
+            self.host_hidden = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device="cpu", pin_memory=True
+            )
+            self.host_ids = torch.empty(
+                (max_tokens, top_k),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.host_weights = torch.empty(
+                (max_tokens, top_k),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            self.host_output = torch.empty(
+                (max_tokens, hidden_size),
+                dtype=dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Remote KT expert tiers require reusable pinned host transport "
+                "buffers; reduce --chunked-prefill-size or free locked memory."
+            ) from exc
+
+        with torch.cuda.device(helper_device):
+            self.helper_hidden = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device=helper_device
+            )
+            self.helper_ids = torch.empty(
+                (max_tokens, top_k), dtype=torch.int64, device=helper_device
+            )
+            self.helper_weights = torch.empty(
+                (max_tokens, top_k), dtype=torch.float32, device=helper_device
+            )
+            self.helper_output = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device=helper_device
+            )
+            self.helper_stream = torch.cuda.Stream(device=helper_device)
+            self.helper_done = torch.cuda.Event()
+
+        with torch.cuda.device(target_device):
+            self.target_output = torch.empty(
+                (max_tokens, hidden_size), dtype=dtype, device=target_device
+            )
+            self.target_ready = torch.cuda.Event()
+
+        self._in_flight_tokens = 0
+
+    def submit(
+        self,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        prepared,
+        *,
+        swiglu_limit: Optional[float],
+    ) -> None:
+        from sglang.srt.layers.quantization.v4_marlin_moe import apply_v4_marlin_moe
+
+        if self._in_flight_tokens:
+            raise RuntimeError("Remote KT staging buffer was reused before collection")
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        num_tokens = int(flat_hidden.shape[0])
+        if num_tokens > self.max_tokens:
+            raise RuntimeError(
+                f"Remote KT helper received {num_tokens} tokens but its reusable "
+                f"buffers hold {self.max_tokens}; increase --chunked-prefill-size."
+            )
+        if topk_ids.shape != (num_tokens, self.top_k):
+            raise RuntimeError(
+                "Remote KT routing shape changed after initialization: "
+                f"expected {(num_tokens, self.top_k)}, got {tuple(topk_ids.shape)}."
+            )
+
+        target_stream = torch.cuda.current_stream(self.target_device)
+        self.host_hidden[:num_tokens].copy_(flat_hidden, non_blocking=True)
+        self.host_ids[:num_tokens].copy_(topk_ids, non_blocking=True)
+        self.host_weights[:num_tokens].copy_(topk_weights, non_blocking=True)
+        self.target_ready.record(target_stream)
+
+        with torch.cuda.device(self.helper_device), torch.cuda.stream(
+            self.helper_stream
+        ):
+            self.helper_stream.wait_event(self.target_ready)
+            helper_hidden = self.helper_hidden[:num_tokens]
+            helper_ids = self.helper_ids[:num_tokens]
+            helper_weights = self.helper_weights[:num_tokens]
+            helper_hidden.copy_(self.host_hidden[:num_tokens], non_blocking=True)
+            helper_ids.copy_(self.host_ids[:num_tokens], non_blocking=True)
+            helper_weights.copy_(self.host_weights[:num_tokens], non_blocking=True)
+            result = apply_v4_marlin_moe(
+                hidden_states=helper_hidden,
+                prepared=prepared,
+                topk_weights=helper_weights,
+                topk_ids=helper_ids,
+                routed_scaling_factor=1.0,
+                swiglu_limit=swiglu_limit,
+            )
+            self.helper_output[:num_tokens].copy_(result)
+            self.host_output[:num_tokens].copy_(
+                self.helper_output[:num_tokens], non_blocking=True
+            )
+            self.helper_done.record(self.helper_stream)
+        self._in_flight_tokens = num_tokens
+
+    def collect(self, output_shape: torch.Size) -> torch.Tensor:
+        num_tokens = self._in_flight_tokens
+        if not num_tokens:
+            raise RuntimeError(
+                "Remote KT helper result was collected before submission"
+            )
+        target_stream = torch.cuda.current_stream(self.target_device)
+        target_stream.wait_event(self.helper_done)
+        result = self.target_output[:num_tokens]
+        result.copy_(self.host_output[:num_tokens], non_blocking=True)
+        self._in_flight_tokens = 0
+        return result.view(output_shape)
+
+
+_REMOTE_EXPERT_STAGING: dict[tuple, _RemoteExpertStaging] = {}
+
+
+def _get_or_create_remote_staging(
+    *,
+    max_tokens: int,
+    hidden_size: int,
+    top_k: int,
+    dtype: torch.dtype,
+    target_device: torch.device,
+    helper_device: torch.device,
+) -> _RemoteExpertStaging:
+    key = (
+        target_device.index,
+        helper_device.index,
+        dtype,
+        hidden_size,
+        top_k,
+    )
+    staging = _REMOTE_EXPERT_STAGING.get(key)
+    if staging is None:
+        staging = _RemoteExpertStaging(
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+            top_k=top_k,
+            dtype=dtype,
+            target_device=target_device,
+            helper_device=helper_device,
+        )
+        _REMOTE_EXPERT_STAGING[key] = staging
+    elif staging.max_tokens < max_tokens:
+        raise RuntimeError(
+            "Remote KT staging configuration grew after model loading: "
+            f"existing={staging.max_tokens}, requested={max_tokens}."
+        )
+    return staging
+
+
+class _RemoteExpertTier:
+    """Permanent compact Marlin expert bank on one helper CUDA device."""
+
+    def __init__(self, config: KTRemoteExpertTierConfig) -> None:
+        self.config = config
+        self.device = torch.device("cuda", int(config.device_id))
+        self.experts_mask = config.experts_mask.to(device="cpu", dtype=torch.bool)
+        self.logical_ids = torch.where(self.experts_mask)[0].to(torch.int64)
+        self.logical_to_compact = torch.full(
+            (self.experts_mask.numel(),), -1, dtype=torch.int64
+        )
+        self.logical_to_compact[self.logical_ids] = torch.arange(
+            self.logical_ids.numel(), dtype=torch.int64
+        )
+        self.experts_mask_cuda: Optional[torch.Tensor] = None
+        self.logical_to_compact_cuda: Optional[torch.Tensor] = None
+        self.prepared = None
+        self.staging: Optional[_RemoteExpertStaging] = None
+        self.swiglu_limit: Optional[float] = None
+
+    def initialize(self, owner: "KTEPWrapperMethod", layer: torch.nn.Module) -> None:
+        if self.config.backend != "marlin_mxfp4":
+            raise ValueError(
+                "Remote KT expert tier supports only marlin_mxfp4, got "
+                f"{self.config.backend!r}."
+            )
+        if self.logical_ids.numel() == 0:
+            return
+        target_device = next(layer.parameters()).device
+        if self.device == target_device:
+            raise ValueError(
+                f"Remote KT helper device {self.device} is the target device."
+            )
+        capability = torch.cuda.get_device_capability(self.device)
+        if capability < (8, 0):
+            raise RuntimeError(
+                "Remote MXFP4 Marlin experts require SM80 or newer, got "
+                f"SM{capability[0]}{capability[1]} on {self.device}."
+            )
+
+        from sglang.srt.layers.quantization.v4_marlin_moe import (
+            V4MarlinPreparedWeights,
+            allocate_v4_mxfp4_marlin,
+            prepare_v4_mxfp4_marlin,
+        )
+
+        hidden_size = int(layer.hidden_size)
+        intermediate_size = int(layer.intermediate_size_per_partition) * int(
+            layer.moe_tp_size
+        )
+        configured_limit = (
+            layer.moe_runner_config.gemm1_clamp_limit
+            or layer.moe_runner_config.swiglu_limit
+        )
+        configured_alpha = float(layer.moe_runner_config.gemm1_alpha or 0.0)
+        if configured_alpha:
+            raise ValueError(
+                "Remote KT Marlin experts do not implement gemm1_alpha; "
+                f"layer {owner.kt_config.layer_idx} requested {configured_alpha}."
+            )
+        self.swiglu_limit = (
+            float(configured_limit) if configured_limit is not None else None
+        )
+        num_experts = int(self.logical_ids.numel())
+        with torch.cuda.device(self.device):
+            self.prepared = allocate_v4_mxfp4_marlin(
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=self.device,
+            )
+            load_stream = torch.cuda.Stream(device=self.device)
+
+        try:
+            host_raw = {
+                "w13_weight": torch.empty(
+                    (1, 2 * intermediate_size, hidden_size // 2),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "w13_scale": torch.empty(
+                    (1, 2 * intermediate_size, hidden_size // 32),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "w2_weight": torch.empty(
+                    (1, hidden_size, intermediate_size // 2),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                "w2_scale": torch.empty(
+                    (1, hidden_size, intermediate_size // 32),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+            }
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Remote KT helper weight loading requires one pinned native-MXFP4 "
+                "expert staging slot."
+            ) from exc
+
+        with torch.cuda.device(self.device):
+            device_raw = {
+                name: torch.empty_like(value, device=self.device)
+                for name, value in host_raw.items()
+            }
+
+        release_native_loader = None
+        try:
+            for compact_id, logical_id in enumerate(self.logical_ids.tolist()):
+                logical_id_tensor = torch.tensor([logical_id], dtype=torch.int64)
+                loader = owner._create_compact_kt_wrapper(
+                    layer=layer,
+                    logical_ids=logical_id_tensor,
+                    max_deferred_experts_per_token=0,
+                    release_loader_after_load=False,
+                )
+                release_native_loader = loader.force_release_loader
+                loader.load_weights(logical_id_tensor)
+                loader.submit_write_weight_scale_to_buffer(
+                    1,
+                    0,
+                    [int(host_raw["w13_weight"][0].data_ptr())],
+                    [int(host_raw["w13_scale"][0].data_ptr())],
+                    [int(host_raw["w2_weight"][0].data_ptr())],
+                    [int(host_raw["w2_scale"][0].data_ptr())],
+                )
+                loader.sync_write_weight_scale_to_buffer()
+                del loader
+                gc.collect()
+                with torch.cuda.device(self.device), torch.cuda.stream(load_stream):
+                    for name in device_raw:
+                        device_raw[name].copy_(host_raw[name], non_blocking=True)
+                    prepared_slice = V4MarlinPreparedWeights(
+                        w13=self.prepared.w13[compact_id : compact_id + 1],
+                        w13_scale=self.prepared.w13_scale[compact_id : compact_id + 1],
+                        w2=self.prepared.w2[compact_id : compact_id + 1],
+                        w2_scale=self.prepared.w2_scale[compact_id : compact_id + 1],
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        num_experts=1,
+                    )
+                    prepare_v4_mxfp4_marlin(
+                        device_raw["w13_weight"],
+                        device_raw["w13_scale"],
+                        device_raw["w2_weight"],
+                        device_raw["w2_scale"],
+                        out=prepared_slice,
+                    )
+                # Do not overwrite the pinned slot until its H2D copies finish.
+                load_stream.synchronize()
+        finally:
+            if release_native_loader is not None:
+                release_native_loader()
+
+        del host_raw, device_raw
+        gc.collect()
+        self.experts_mask_cuda = self.experts_mask.to(target_device)
+        self.logical_to_compact_cuda = self.logical_to_compact.to(target_device)
+        if owner.params_dtype is None:
+            raise RuntimeError("KT remote tier lost the model activation dtype")
+        self.staging = _get_or_create_remote_staging(
+            max_tokens=owner.kt_config.chunked_prefill_size,
+            hidden_size=hidden_size,
+            top_k=int(layer.top_k),
+            dtype=owner.params_dtype,
+            target_device=target_device,
+            helper_device=self.device,
+        )
+        logger.info(
+            "KT remote expert tier ready: layer=%d helper=%s experts=%d "
+            "backend=%s peer_access=%s",
+            owner.kt_config.layer_idx,
+            self.device,
+            num_experts,
+            self.config.backend,
+            torch.cuda.can_device_access_peer(target_device.index, self.device.index),
+        )
+
+    def submit(
+        self,
+        hidden_states: torch.Tensor,
+        logical_topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> bool:
+        if self.prepared is None or hidden_states.numel() == 0:
+            return False
+        assert self.experts_mask_cuda is not None
+        assert self.logical_to_compact_cuda is not None
+        assert self.staging is not None
+        helper_ids = mask_and_remap_expert_ids(
+            logical_topk_ids,
+            self.experts_mask_cuda,
+            self.logical_to_compact_cuda,
+        )
+        self.staging.submit(
+            hidden_states,
+            helper_ids,
+            topk_weights,
+            self.prepared,
+            swiglu_limit=self.swiglu_limit,
+        )
+        return True
+
+    def collect(self, output_shape: torch.Size) -> torch.Tensor:
+        assert self.staging is not None
+        return self.staging.collect(output_shape)
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
-    """Run a routed-expert subset on SM120 and the complement in KT-Kernel."""
+    """Run routed experts on the primary GPU, helpers, and KT-Kernel."""
 
     def __init__(self, gpu_method: FusedMoEMethodBase, kt_config: KTConfig) -> None:
         if not KTRANSFORMERS_AVAILABLE:
@@ -559,6 +1116,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if self.num_gpu_experts > 0
             else torch.zeros(1, dtype=torch.int64)
         )
+        tier_map = kt_config.expert_tier_map
+        if tier_map is None:
+            cpu_logical_ids = torch.where(~self.gpu_experts_mask)[0]
+        else:
+            tier_map = tier_map.to(device="cpu", dtype=torch.int16)
+            if tier_map.shape != self.gpu_experts_mask.shape:
+                raise ValueError(
+                    "KT expert tier map shape does not match the primary mask: "
+                    f"{tuple(tier_map.shape)} vs {tuple(self.gpu_experts_mask.shape)}."
+                )
+            if not torch.equal(tier_map.eq(0), self.gpu_experts_mask):
+                raise ValueError("KT primary expert mask disagrees with tier map")
+            cpu_logical_ids = torch.where(tier_map.lt(0))[0]
         self.cpu_index_to_logical = cpu_logical_ids.to(torch.int64)
         self.num_cpu_experts = int(cpu_logical_ids.numel())
         self.logical_to_gpu_index = torch.full(
@@ -573,6 +1143,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.logical_to_cpu_index[cpu_logical_ids] = torch.arange(
             cpu_logical_ids.numel(), dtype=torch.int64
         )
+        self.remote_tiers = [
+            _RemoteExpertTier(config) for config in kt_config.remote_expert_tiers
+        ]
 
         self.gpu_experts_mask_cuda: Optional[torch.Tensor] = None
         self.logical_to_gpu_index_cuda: Optional[torch.Tensor] = None
@@ -584,6 +1157,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self._staging: Optional[SharedStagingBuffer] = None
         self.graph_state_bridge = KTGraphStateBridge()
         self._mxfp4_pipeline_signature: Optional[tuple] = None
+        self.params_dtype: Optional[torch.dtype] = None
 
     def bridge_cuda_graph_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         return self.graph_state_bridge.copy(name, tensor)
@@ -607,6 +1181,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ) -> None:
         self.global_num_experts = num_experts
+        self.params_dtype = params_dtype
         if num_experts != self.gpu_experts_mask.numel():
             raise ValueError(
                 "KT offload currently supports routed experts only; the MoE layer "
@@ -625,55 +1200,69 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(target_device)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(target_device)
-        self.cpu_experts_mask_cuda = (~self.gpu_experts_mask).to(target_device)
+        self.cpu_experts_mask_cuda = self.logical_to_cpu_index.ge(0).to(target_device)
         self.logical_to_cpu_index_cuda = self.logical_to_cpu_index.to(target_device)
         if self.tp_rank == 0:
             self._cpu_stream = torch.cuda.Stream(device=target_device)
             self._cpu_done_event = torch.cuda.Event()
-            self._staging = _get_or_create_staging_buffer(
-                max_tokens=self.kt_config.chunked_prefill_size,
-                hidden_size=hidden_size,
-                dtype=params_dtype,
-                device=target_device,
-            )
+            if self.num_cpu_experts > 0:
+                self._staging = _get_or_create_staging_buffer(
+                    max_tokens=self.kt_config.chunked_prefill_size,
+                    hidden_size=hidden_size,
+                    dtype=params_dtype,
+                    device=target_device,
+                )
 
-            runner_config = layer.moe_runner_config
-            swiglu_limit = float(runner_config.swiglu_limit or 0.0)
-            gemm1_limit = float(runner_config.gemm1_clamp_limit or 0.0)
-            if gemm1_limit:
-                swiglu_limit = gemm1_limit
-            swiglu_alpha = float(runner_config.gemm1_alpha or 0.0)
-            layer_max_deferred = self.kt_config.max_deferred_experts_per_token or 0
-            if (
-                self.kt_config.num_layers is not None
-                and self.kt_config.layer_idx == self.kt_config.num_layers - 1
-            ):
-                layer_max_deferred = 0
+                layer_max_deferred = self.kt_config.max_deferred_experts_per_token or 0
+                if (
+                    self.kt_config.num_layers is not None
+                    and self.kt_config.layer_idx == self.kt_config.num_layers - 1
+                ):
+                    layer_max_deferred = 0
+                self.wrapper = self._create_compact_kt_wrapper(
+                    layer=layer,
+                    logical_ids=self.cpu_index_to_logical,
+                    max_deferred_experts_per_token=layer_max_deferred,
+                )
 
-            self.wrapper = KTMoEWrapper(
-                layer_idx=self.kt_config.layer_idx,
-                # KT uses a compact CPU-only expert space. This avoids
-                # allocating or copying native MXFP4 buffers for experts that
-                # are already resident on the GPU.
-                num_experts=self.num_cpu_experts,
-                num_experts_per_tok=layer.top_k,
-                hidden_size=hidden_size,
-                moe_intermediate_size=(
-                    layer.intermediate_size_per_partition * layer.moe_tp_size
-                ),
-                gpu_experts_mask=torch.zeros(
-                    self.num_cpu_experts, dtype=torch.bool, device="cpu"
-                ),
-                cpuinfer_threads=self.kt_config.cpuinfer_threads,
-                threadpool_count=self.kt_config.threadpool_count,
-                numa_nodes=self.kt_config.numa_nodes,
-                weight_path=self.kt_config.weight_path,
-                chunked_prefill_size=self.kt_config.chunked_prefill_size,
-                method=self.kt_config.method,
-                swiglu_limit=swiglu_limit,
-                swiglu_alpha=swiglu_alpha,
-                max_deferred_experts_per_token=layer_max_deferred,
-            )
+    def _create_compact_kt_wrapper(
+        self,
+        *,
+        layer: torch.nn.Module,
+        logical_ids: torch.Tensor,
+        max_deferred_experts_per_token: int,
+        release_loader_after_load: bool = True,
+    ):
+        runner_config = layer.moe_runner_config
+        swiglu_limit = float(runner_config.swiglu_limit or 0.0)
+        gemm1_limit = float(runner_config.gemm1_clamp_limit or 0.0)
+        if gemm1_limit:
+            swiglu_limit = gemm1_limit
+        swiglu_alpha = float(runner_config.gemm1_alpha or 0.0)
+        num_experts = int(logical_ids.numel())
+        if num_experts <= 0:
+            raise ValueError("A compact KT wrapper requires at least one expert")
+        return KTMoEWrapper(
+            layer_idx=self.kt_config.layer_idx,
+            num_experts=num_experts,
+            num_experts_per_tok=min(int(layer.top_k), num_experts),
+            hidden_size=layer.hidden_size,
+            moe_intermediate_size=(
+                layer.intermediate_size_per_partition * layer.moe_tp_size
+            ),
+            gpu_experts_mask=torch.zeros(num_experts, dtype=torch.bool, device="cpu"),
+            cpuinfer_threads=self.kt_config.cpuinfer_threads,
+            threadpool_count=self.kt_config.threadpool_count,
+            numa_nodes=self.kt_config.numa_nodes,
+            weight_path=self.kt_config.weight_path,
+            weight_base_key=self.kt_config.weight_base_key,
+            chunked_prefill_size=self.kt_config.chunked_prefill_size,
+            method=self.kt_config.method,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            max_deferred_experts_per_token=max_deferred_experts_per_token,
+            release_loader_after_load=release_loader_after_load,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.kt_config.gpu_prefill_token_threshold > 0:
@@ -692,12 +1281,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if hasattr(self.gpu_method, "process_weights_after_loading"):
             self.gpu_method.process_weights_after_loading(layer)
 
-        if self.tp_rank == 0 and self.wrapper is not None:
+        if self.tp_rank == 0:
             torch.cuda.synchronize()
-            # Compact KT expert index -> checkpoint logical expert index.
-            # EPLB is rejected during config creation, so this mapping remains
-            # static for the lifetime of the server.
-            self.wrapper.load_weights(self.cpu_index_to_logical.contiguous())
+            if self.wrapper is not None:
+                # Compact KT expert index -> checkpoint logical expert index.
+                # EPLB is rejected during config creation, so this mapping remains
+                # static for the lifetime of the server.
+                self.wrapper.load_weights(self.cpu_index_to_logical.contiguous())
+
+            for remote_tier in self.remote_tiers:
+                remote_tier.initialize(self, layer)
 
         _register_mxfp4_prefill_layer(self, layer)
 
@@ -739,8 +1332,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.logical_to_cpu_index_cuda,
         )
 
-        if self.tp_rank == 0:
-            assert self.wrapper is not None
+        if self.tp_rank == 0 and self.wrapper is not None:
             assert self._cpu_stream is not None
             assert self._staging is not None
             staged = self._staging.get_slice(x.reshape(-1, x.shape[-1]).shape[0])
@@ -754,6 +1346,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     self._cpu_stream.cuda_stream,
                 )
 
+        submitted_remote_tiers = [
+            tier for tier in self.remote_tiers if tier.submit(x, topk_ids, topk_weights)
+        ]
+
         if self.num_gpu_experts > 0:
             gpu_topk_output = topk_output._replace(topk_ids=gpu_topk_ids)
             gpu_dispatch_output = dispatch_output._replace(topk_output=gpu_topk_output)
@@ -762,7 +1358,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         else:
             output = torch.zeros_like(x)
 
-        if self.tp_rank == 0:
+        for remote_tier in submitted_remote_tiers:
+            output = output + remote_tier.collect(output.shape)
+
+        if self.tp_rank == 0 and self.wrapper is not None:
             assert staged is not None
             assert self._cpu_stream is not None
             assert self._cpu_done_event is not None
@@ -860,9 +1459,9 @@ class _Mxfp4LayerwisePrefillManager:
         }
         raw_dtypes = {
             "w13_weight": first_layer.w13_weight.dtype,
-            "w13_weight_scale_inv": torch.float8_e8m0fnu,
+            "w13_weight_scale_inv": torch.uint8,
             "w2_weight": first_layer.w2_weight.dtype,
-            "w2_weight_scale_inv": torch.float8_e8m0fnu,
+            "w2_weight_scale_inv": torch.uint8,
         }
         host_slots = first_method.kt_config.mxfp4_prefill_host_staging_experts
         # One stream owns this reusable raw window. Batching preparation cuts
@@ -878,14 +1477,11 @@ class _Mxfp4LayerwisePrefillManager:
             for name, shape in expert_shapes.items()
         }
 
-        host_dtypes = dict(raw_dtypes)
-        host_dtypes["w13_weight_scale_inv"] = torch.bfloat16
-        host_dtypes["w2_weight_scale_inv"] = torch.bfloat16
         try:
             self.host_staging = {
                 name: torch.empty(
                     (host_slots, *shape),
-                    dtype=host_dtypes[name],
+                    dtype=raw_dtypes[name],
                     device="cpu",
                     pin_memory=True,
                 )
@@ -910,7 +1506,7 @@ class _Mxfp4LayerwisePrefillManager:
             gc.collect()
             self.host_staging = {
                 name: torch.empty(
-                    (host_slots, *shape), dtype=host_dtypes[name], device="cpu"
+                    (host_slots, *shape), dtype=raw_dtypes[name], device="cpu"
                 )
                 for name, shape in expert_shapes.items()
             }
@@ -992,16 +1588,18 @@ class _Mxfp4LayerwisePrefillManager:
         dst_s13 = self.raw_staging["w13_weight_scale_inv"][raw_row]
         src_s13 = self.gpu_scale_staging["w13_weight_scale_inv"][raw_row]
         dst_s13[:intermediate].copy_(
-            src_s13[intermediate:], non_blocking=self.host_is_pinned
+            src_s13[intermediate:].view(torch.uint8),
+            non_blocking=self.host_is_pinned,
         )
         dst_s13[intermediate:].copy_(
-            src_s13[:intermediate], non_blocking=self.host_is_pinned
+            src_s13[:intermediate].view(torch.uint8),
+            non_blocking=self.host_is_pinned,
         )
         self.raw_staging["w2_weight"][raw_row].copy_(
             layer.w2_weight[gpu_id], non_blocking=True
         )
         self.raw_staging["w2_weight_scale_inv"][raw_row].copy_(
-            self.gpu_scale_staging["w2_weight_scale_inv"][raw_row],
+            self.gpu_scale_staging["w2_weight_scale_inv"][raw_row].view(torch.uint8),
             non_blocking=self.host_is_pinned,
         )
         self.gpu_scale_free_events[raw_row].record(self.transfer_stream)

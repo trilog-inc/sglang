@@ -232,7 +232,8 @@ def test_mtp_can_be_split_across_gpu_tiers(tmp_path: Path) -> None:
         {
             "model.embed_tokens.weight": ("U8", [10], 10),
             "model.layers.0.mlp.experts.0.weight": ("U8", [20], 20),
-            "model.layers.1.mtp.weight": ("U8", [60], 60),
+            "mtp.0.ffn.experts.0.weight": ("U8", [30], 30),
+            "mtp.0.ffn.experts.1.weight": ("U8", [30], 30),
         },
     )
     audit = planner.scan_checkpoint(tmp_path)
@@ -256,8 +257,10 @@ def test_mtp_can_be_split_across_gpu_tiers(tmp_path: Path) -> None:
     assert usages[1].mtp_bytes == 0
     assert usages[2].weight_bytes == 30
     assert usages[2].mtp_bytes == 30
+    assert usages[2].mtp_expert_count == 1
     assert usages[3].weight_bytes == 30
     assert usages[3].mtp_bytes == 30
+    assert usages[3].mtp_expert_count == 1
     result = planner._json_result(audit, usages, diagnostics)
     assert result["checkpoint"]["placement_payload_bytes"] == 90
     assert result["placement_exclusions"] == {}
@@ -318,6 +321,50 @@ def test_mtp_can_be_split_across_gpu_tiers(tmp_path: Path) -> None:
             allocator_overhead_fraction=0,
             excluded_categories=frozenset({"mtp"}),
         )
+
+
+def test_mtp_expert_split_keeps_backbone_on_first_draft_device(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1}), encoding="utf-8"
+    )
+    _write_safetensor(
+        tmp_path / "model.safetensors",
+        {
+            "model.embed_tokens.weight": ("U8", [10], 10),
+            "model.layers.0.mlp.experts.0.weight": ("U8", [20], 20),
+            "mtp.0.ffn.experts.0.w1.weight": ("U8", [40], 40),
+            "mtp.0.ffn.experts.1.w1.weight": ("U8", [40], 40),
+            "mtp.0.attn.wq.weight": ("U8", [20], 20),
+        },
+    )
+    audit = planner.scan_checkpoint(tmp_path)
+    devices = [
+        planner.DevicePlan("primary", 200, 0, 0, 1, "mxfp4"),
+        planner.DevicePlan("draft-0", 200, 0, 0, 0, "mxfp4", 0.5),
+        planner.DevicePlan("draft-1", 200, 0, 0, 0, "mxfp4", 0.5),
+    ]
+
+    usages, diagnostics = planner.build_placement(
+        audit,
+        host_total_bytes=200,
+        host_reserve_bytes=0,
+        host_runtime_bytes=0,
+        devices=devices,
+        allocator_overhead_fraction=0,
+    )
+
+    assert not diagnostics
+    assert audit.mtp_expert_bytes == {(0, 0): 40, (0, 1): 40}
+    assert usages[2].mtp_routed_expert_bytes == 40
+    assert usages[2].mtp_non_expert_bytes == 20
+    assert usages[2].mtp_expert_count == 1
+    assert usages[2].mtp_bytes == 60
+    assert usages[3].mtp_routed_expert_bytes == 40
+    assert usages[3].mtp_non_expert_bytes == 0
+    assert usages[3].mtp_expert_count == 1
+    assert usages[3].mtp_bytes == 40
 
 
 def test_native_pro_expert_bank_size_matches_strategy() -> None:

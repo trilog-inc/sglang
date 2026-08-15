@@ -4,11 +4,11 @@ This runbook prepares the target server for the DeepSeek-V4-Pro capacity audit
 and native MXFP4/UE8M0 CPU-kernel validation in a fresh Conda environment. It
 is written for the implementation in these branches:
 
-- SGLang: `trilog-inc/sglang`, branch `codex/dsv4`, minimum merge commit
-  `6245b7797805eed54578275c8bb0f47fc940f581`;
+- SGLang: `trilog-inc/sglang`, branch `codex/dsv4`, at a revision containing
+  the per-device KT topology flags verified in Section 6;
 - KTransformers/KT-Kernel: `trilog-inc/ktransformers`, branch
   `codex/nvfp4-kt-support`, minimum merge commit
-  `b2b2708da6b82647bf7c6a7ed11eee7e6286f517`.
+  `26f008fbca8ba0f092f668554f40e4b091a054b7`.
 
 ## Read this first: current implementation boundary
 
@@ -17,27 +17,22 @@ The current update implements:
 - a metadata-only checkpoint and placement planner;
 - native packed E2M1 weights plus one-byte UE8M0 scales on CPU;
 - adaptive AMX-BF16/AVX-512 and AVX2 UE8M0 decoding paths;
-- direct loading into the final CPU expert buffers; and
-- DSpark speculative-decoding integration, tuning, and policy tests; and
-- planner and native-kernel parity tests.
+- direct loading into the final CPU expert buffers;
+- one remote target-expert tier with compact Marlin weights, pinned host
+  transport, and asynchronous CUDA event coordination;
+- DSpark speculative-decoding integration, tuning, and policy tests;
+- planner and native-kernel parity tests; and
+- one-expert-at-a-time remote weight preparation to bound startup memory.
 
-DSpark support is present, but the initial full-model audit should still run
-without a draft model. Enable speculative decoding only after the multi-tier
-router exists and the measured capacity report shows that a compatible draft
-fits without displacing the primary model's expert or KV-cache reserves.
+The 26/10/0/0 target placement is now implemented: 26 experts per layer remain
+on the RTX PRO 6000, 10 run on the RTX 4090, and the complement stays in native
+packed host memory. The two RTX 3090s remain unused by the target.
 
-It does **not** yet implement the multi-GPU expert router needed to split the
-target model across the RTX PRO 6000, RTX 4090, two RTX 3090s, and CPU. A `GO`
-from the planner proves only that the proposed steady-state placement fits the
-configured capacity envelope. It does not make the four-device placement
-executable.
-
-Do not launch the complete Pro checkpoint from this branch. With only the
-current primary-GPU/CPU router, the remaining CPU expert bank is expected to
-exhaust the 768 GiB host once runtime allocations are included. This guide
-therefore stops after environment, build, parity, checkpoint, and capacity
-validation. The safe runtime gate is documented in
-[Current stopping point](#current-stopping-point).
+The bundled DSpark MTP draft can now split every stage's 384 routed experts
+192/192 across the two RTX 3090s. Its non-expert backbone and KV cache stay on
+the first RTX 3090, while embeddings and the LM head reuse the copies already
+resident on the RTX PRO 6000. This is an experimental eager-only path until it
+passes the hardware gates below. Always validate the target-only launch first.
 
 ## Target configuration
 
@@ -275,17 +270,18 @@ git -C "$KTRANSFORMERS_SRC" submodule update --init --recursive \
 Verify that both branches contain the implementation baselines:
 
 ```bash
-git -C "$SGLANG_SRC" merge-base --is-ancestor \
-  6245b7797805eed54578275c8bb0f47fc940f581 HEAD
+test "$(git -C "$SGLANG_SRC" branch --show-current)" = codex/dsv4
+rg -q 'kt_gpu_expert_devices' \
+  "$SGLANG_SRC/python/sglang/srt/server_args.py"
 
 git -C "$KTRANSFORMERS_SRC" merge-base --is-ancestor \
-  b2b2708da6b82647bf7c6a7ed11eee7e6286f517 HEAD
+  26f008fbca8ba0f092f668554f40e4b091a054b7 HEAD
 
 git -C "$SGLANG_SRC" status --short --branch
 git -C "$KTRANSFORMERS_SRC" status --short --branch
 ```
 
-Each `merge-base` command must exit with status 0. Fresh clones should have no
+Each validation command must exit with status 0. Fresh clones should have no
 modified or untracked files.
 
 ## 7. Install the pinned Python and CUDA stack
@@ -443,7 +439,7 @@ python -m pytest -q \
 python -m py_compile scripts/deepseek_v4_pro_memory_planner.py
 ```
 
-Expected result: eight planner tests pass and the focused DSpark tests pass.
+Expected result: nine planner tests pass and the focused DSpark tests pass.
 
 ### Optional native parity executables
 
@@ -606,11 +602,12 @@ target-only placement.
 ### Experimental two-GPU MTP capacity gate
 
 The measured host and GPU headroom permits a deliberately tighter test plan.
-Dedicate both RTX 3090s to equal halves of the 39.10 GiB MTP payload, keep the
-faster RTX 4090 as a target-expert tier, and move the displaced 3090 experts to
-the RTX PRO 6000 and host. The modeled per-layer expert split becomes
-26/10/0/0. Use 48 GiB of host reserve, 10 GiB on the primary, and 2 GiB on each
-helper only for this experiment:
+Dedicate both RTX 3090s to equal halves of the MTP routed experts, keep the MTP
+backbone on the first RTX 3090, retain the faster RTX 4090 as a target-expert
+tier, and move the displaced 3090 target experts to the RTX PRO 6000 and host.
+The modeled target per-layer expert split becomes 26/10/0/0. Use 48 GiB of host
+reserve, 10 GiB on the primary, and 2 GiB on each helper only for this
+experiment:
 
 ```bash
 cd "$SGLANG_SRC"
@@ -646,19 +643,24 @@ Based on the first server audit, the expected rounded result is:
 | Host | ~697.29 GiB | 8 GiB | ~50.12 GiB | 48 GiB |
 | RTX PRO 6000 | ~78.95 GiB | 5 GiB | ~12.05 GiB | 10 GiB |
 | RTX 4090 | ~20.03 GiB | 1 GiB | ~2.97 GiB | 2 GiB |
-| Each RTX 3090 | ~19.65 GiB MTP | 1 GiB | ~3.35 GiB | 2 GiB |
+| RTX 3090 #1 | MTP expert half + MTP backbone (planner-derived) | 1 GiB | planner-derived | 2 GiB |
+| RTX 3090 #2 | MTP expert half only (planner-derived) | 1 GiB | planner-derived | 2 GiB |
 
 Treat these values as estimates until the command runs against the exact
-checkpoint and capacities in `gpus.csv`. The remaining margins are narrow,
-especially on the RTX 4090. Do not proceed if the planner reports `NO-GO`, if
-the host has less measured headroom, or if runtime profiling shows that the
-1 GiB helper-runtime allowances are insufficient.
+checkpoint and capacities in `gpus.csv`. The updated planner assigns recognized
+MTP expert tensors 50/50 but keeps MTP attention, norms, shared experts, and
+other backbone tensors on RTX 3090 #1, matching the runtime. The first 3090 will
+therefore report more weight than the second; an equal 19.65/19.65 report means
+the checkout predates this executable-placement correction. The remaining
+margins are narrow, especially on the RTX 4090 and first RTX 3090. Do not
+proceed if the planner reports `NO-GO`, if the host has less measured headroom,
+or if runtime profiling shows that the 1 GiB helper-runtime allowances are
+insufficient.
 
-This gate proves capacity only. The current DSpark integration accepts one
-remote draft device, and the current target router does not distribute experts
-across all four target tiers. A runnable version still requires a two-device
-MTP/DSpark sharding implementation, its inter-GPU synchronization path, and
-the multi-device target-expert router described below.
+This gate proves capacity only. The target router and two-device DSpark expert
+split now implement the planned topology, but neither result substitutes for a
+successful full-checkpoint load, deterministic greedy comparison, or sustained
+memory observation on the actual server.
 
 Interpretation:
 
@@ -678,36 +680,158 @@ The GPU capacities above are the nominal target values. If `gpus.csv` reports
 meaningfully less usable memory, round each capacity down and rerun the
 planner. Never round up to the marketing capacity.
 
-## 14. Current stopping point
+## 14. Target-helper and two-device MTP implementation gates
 
-Even if the planner prints `GO`, the current branch must stop here for the full
-Pro checkpoint. Confirm that the planned multi-device options are still absent:
+Confirm that the new per-device KT options are present:
 
 ```bash
-if python -m sglang.launch_server --help \
-  | rg -q -- '--kt-gpu-expert-devices'; then
-  echo 'Multi-device KT CLI detected; review the newer implementation guide.'
-else
-  echo 'STOP: this build has only the primary-GPU/CPU KT router.'
-fi
+python -m sglang.launch_server --help | rg -- \
+  '--kt-gpu-expert-devices|--kt-num-gpu-experts-per-device|--kt-gpu-expert-backends|--speculative-draft-helper-device|--speculative-draft-num-gpu-experts-per-device'
 ```
 
-The complete model may be launched only after a later branch implements and
-tests all of the following:
+Run the focused CPU-side topology and routing tests before loading the model:
 
-- per-layer logical-expert maps for four GPU tiers plus CPU;
-- persistent pinned host staging for each helper GPU;
-- asynchronous copy, compute, and return events without peer access;
-- direct layerwise loading into every final tier;
-- bounded expert staging during long prefill;
-- exact multi-tier output recombination tests; and
-- two-device MTP/DSpark sharding and synchronization for the experimental
-  speculative profile;
-- conservative runtime flags matching the reviewed CLI in that branch.
+```bash
+cd "$SGLANG_SRC"
+python -m pytest -q test/registered/unit/layers/test_kt_ep_wrapper.py \
+  -k 'explicit_gpu_tier or remote_tier or remote_expert_topology'
+
+python -m pytest -q \
+  test/registered/spec/dspark/test_dspark_draft_path_default.py \
+  test/registered/spec/dspark/test_dspark_draft_device.py
+```
+
+For the first hardware smoke test, expose the GPUs in this exact logical order:
+
+```text
+cuda:0 = RTX PRO 6000
+cuda:1 = RTX 4090
+cuda:2 = RTX 3090 #1
+cuda:3 = RTX 3090 #2
+```
+
+Adjust `CUDA_VISIBLE_DEVICES` if the physical indices in `gpus.csv` differ.
+Keep the first launch eager, target-only, single-request, and limited to 4K
+total tokens:
+
+```bash
+conda activate dsv4-pro
+cd "$SGLANG_SRC"
+
+export CUDA_HOME=/usr/local/cuda-13.3
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TORCH_CUDA_ARCH_LIST='8.6;8.9;12.0+PTX'
+export DSV4_CPUINFER_THREADS="${DSV4_CPUINFER_THREADS:-$(nproc)}"
+
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+python -m sglang.launch_server \
+  --trust-remote-code \
+  --model-path "$DSV4_MODEL" \
+  --tp 1 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --kt-weight-path "$DSV4_MODEL" \
+  --kt-method MXFP4 \
+  --kt-mxfp4-backend amx \
+  --kt-mxfp4-amx-min-tokens-per-expert 4 \
+  --kt-gpu-expert-devices 0 1 \
+  --kt-num-gpu-experts-per-device 26 10 \
+  --kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4 \
+  --kt-expert-placement-strategy uniform \
+  --init-expert-location trivial \
+  --kt-cpuinfer "$DSV4_CPUINFER_THREADS" \
+  --kt-threadpool-count 2 \
+  --kt-numa-nodes 0 1 \
+  --kt-gpu-prefill-token-threshold 0 \
+  --disable-shared-experts-fusion \
+  --chunked-prefill-size 4096 \
+  --max-total-tokens 4096 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.89 \
+  --disable-overlap-schedule \
+  --disable-cuda-graph \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4 \
+  --served-model-name dsv4pro \
+  --host 0.0.0.0 \
+  --port 60000 \
+  2>&1 | tee "$DSV4_REPORT/target-helper-smoke-server.txt"
+```
+
+The startup log must report devices `(0, 1)`, counts `(26, 10)`, and a remote
+Marlin tier with 10 experts for every routed layer. In a second shell, monitor
+host RSS and all GPU allocations while weights load:
+
+```bash
+watch -n 2 'free -h; nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader'
+```
+
+Stop immediately if the RTX 4090 approaches its final 2 GiB reserve, host
+available memory falls below 48 GiB, swap grows, or any layer reports a compact
+mapping or Marlin preparation error. Do not increase context or concurrency
+until a short greedy request completes deterministically.
+
+After the target-only smoke test passes, stop that server and repeat the same
+launch with the two-device DSpark options included:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+python -m sglang.launch_server \
+  --trust-remote-code \
+  --model-path "$DSV4_MODEL" \
+  --tp 1 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --kt-weight-path "$DSV4_MODEL" \
+  --kt-method MXFP4 \
+  --kt-mxfp4-backend amx \
+  --kt-mxfp4-amx-min-tokens-per-expert 4 \
+  --kt-gpu-expert-devices 0 1 \
+  --kt-num-gpu-experts-per-device 26 10 \
+  --kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4 \
+  --kt-expert-placement-strategy uniform \
+  --init-expert-location trivial \
+  --kt-cpuinfer "$DSV4_CPUINFER_THREADS" \
+  --kt-threadpool-count 2 \
+  --kt-numa-nodes 0 1 \
+  --kt-gpu-prefill-token-threshold 0 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "$DSV4_MODEL" \
+  --speculative-draft-device 2 \
+  --speculative-draft-helper-device 3 \
+  --speculative-draft-num-gpu-experts-per-device 192 192 \
+  --speculative-moe-runner-backend marlin \
+  --disable-shared-experts-fusion \
+  --chunked-prefill-size 4096 \
+  --max-total-tokens 4096 \
+  --max-running-requests 1 \
+  --mem-fraction-static 0.89 \
+  --disable-overlap-schedule \
+  --disable-cuda-graph \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4 \
+  --served-model-name dsv4pro \
+  --host 0.0.0.0 \
+  --port 60000 \
+  2>&1 | tee "$DSV4_REPORT/two-device-mtp-smoke-server.txt"
+```
+
+The MTP startup log must report primary draft `cuda:2`, helper `cuda:3`, counts
+`(192, 192)`, an `mtp.N` weight prefix for every draft stage, and no CPU-resident
+draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
+two 24 GiB devices do not duplicate the target embedding and LM-head weights.
+This first version uses synchronous cross-device vocabulary transfers and must
+remain eager.
+
+Keep the same monitor running. Stop if either RTX 3090 falls below its 2 GiB
+reserve, if the draft loads any `model.layers.N` expert in place of `mtp.N`, or
+if target-only and MTP-enabled greedy output diverge before the speculative
+accept/reject boundary can explain it.
 
 Do not substitute tensor parallelism across these heterogeneous GPUs. Do not
-reserve the RTX 4090 for a separate draft model. Do not let Linux swap the
-expert bank from disk during decode.
+put target experts on either RTX 3090, and do not let Linux swap the expert bank
+from disk during decode.
 
 ## 15. Preserve the audit bundle
 
