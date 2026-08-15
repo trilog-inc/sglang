@@ -344,7 +344,7 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
             )
 
         tier_map = torch.full(
-            (num_layers, num_experts), -1, dtype=torch.int16, device="cpu"
+            (num_layers, num_experts), -1, dtype=torch.int32, device="cpu"
         )
         generator = torch.Generator(device="cpu")
         generator.manual_seed(42)
@@ -363,7 +363,10 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
                     selected = ordered[offset : offset + count]
                     tier_map[layer_idx, selected] = tier_index
                     offset += count
-        if dist.is_initialized():
+        # Remote KT tiers require TP=1, where broadcasting through the CPU
+        # process group is both redundant and unsupported for some scalar
+        # types/backends. Keep the collective only for a real multi-rank group.
+        if dist.is_initialized() and get_parallel().tp_size > 1:
             dist.broadcast(tier_map, src=0, group=get_tp_group().cpu_group)
 
         _KT_GPU_EXPERT_TIER_MAP = tier_map
@@ -475,8 +478,8 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
     _KT_GPU_EXPERTS_MASKS = masks
     _KT_GPU_EXPERT_TIER_MAP = torch.where(
         masks,
-        torch.zeros_like(masks, dtype=torch.int16),
-        torch.full_like(masks, -1, dtype=torch.int16),
+        torch.zeros_like(masks, dtype=torch.int32),
+        torch.full_like(masks, -1, dtype=torch.int32),
     )
     if get_parallel().tp_rank == 0:
         counts = {layer_idx: int(masks[layer_idx].sum()) for layer_idx in moe_layers}
@@ -1120,7 +1123,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if tier_map is None:
             cpu_logical_ids = torch.where(~self.gpu_experts_mask)[0]
         else:
-            tier_map = tier_map.to(device="cpu", dtype=torch.int16)
+            tier_map = tier_map.to(device="cpu", dtype=torch.int32)
             if tier_map.shape != self.gpu_experts_mask.shape:
                 raise ValueError(
                     "KT expert tier map shape does not match the primary mask: "

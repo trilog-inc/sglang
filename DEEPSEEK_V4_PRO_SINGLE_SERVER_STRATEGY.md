@@ -239,7 +239,7 @@ Each layer needs a logical-expert-to-tier map and a compact index within that
 tier. The implemented CLI for the 26/10/0/0 profile is:
 
 ```text
---kt-gpu-expert-devices 0 1
+--kt-gpu-expert-devices 0 2
 --kt-num-gpu-experts-per-device 26 10
 --kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4
 ```

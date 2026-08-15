@@ -705,8 +705,8 @@ For the first hardware smoke test, expose the GPUs in this exact logical order:
 
 ```text
 cuda:0 = RTX PRO 6000
-cuda:1 = RTX 4090
-cuda:2 = RTX 3090 #1
+cuda:1 = RTX 3090 #1
+cuda:2 = RTX 4090
 cuda:3 = RTX 3090 #2
 ```
 
@@ -735,7 +735,7 @@ python -m sglang.launch_server \
   --kt-method MXFP4 \
   --kt-mxfp4-backend amx \
   --kt-mxfp4-amx-min-tokens-per-expert 4 \
-  --kt-gpu-expert-devices 0 1 \
+  --kt-gpu-expert-devices 0 2 \
   --kt-num-gpu-experts-per-device 26 10 \
   --kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4 \
   --kt-expert-placement-strategy uniform \
@@ -787,7 +787,7 @@ python -m sglang.launch_server \
   --kt-method MXFP4 \
   --kt-mxfp4-backend amx \
   --kt-mxfp4-amx-min-tokens-per-expert 4 \
-  --kt-gpu-expert-devices 0 1 \
+  --kt-gpu-expert-devices 0 2 \
   --kt-num-gpu-experts-per-device 26 10 \
   --kt-gpu-expert-backends flashinfer_mxfp4 marlin_mxfp4 \
   --kt-expert-placement-strategy uniform \
@@ -798,7 +798,7 @@ python -m sglang.launch_server \
   --kt-gpu-prefill-token-threshold 0 \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path "$DSV4_MODEL" \
-  --speculative-draft-device 2 \
+  --speculative-draft-device 1 \
   --speculative-draft-helper-device 3 \
   --speculative-draft-num-gpu-experts-per-device 192 192 \
   --speculative-moe-runner-backend marlin \
@@ -817,7 +817,7 @@ python -m sglang.launch_server \
   2>&1 | tee "$DSV4_REPORT/two-device-mtp-smoke-server.txt"
 ```
 
-The MTP startup log must report primary draft `cuda:2`, helper `cuda:3`, counts
+The MTP startup log must report primary draft `cuda:1`, helper `cuda:3`, counts
 `(192, 192)`, an `mtp.N` weight prefix for every draft stage, and no CPU-resident
 draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
 two 24 GiB devices do not duplicate the target embedding and LM-head weights.

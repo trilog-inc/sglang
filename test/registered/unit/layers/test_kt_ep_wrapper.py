@@ -306,9 +306,14 @@ def test_explicit_gpu_tiers_assign_compact_disjoint_expert_sets(monkeypatch):
     monkeypatch.setattr(
         kt_ep_wrapper,
         "get_parallel",
-        lambda: SimpleNamespace(tp_rank=0),
+        lambda: SimpleNamespace(tp_rank=0, tp_size=1),
     )
-    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        kt_ep_wrapper.dist,
+        "broadcast",
+        lambda *args, **kwargs: pytest.fail("TP=1 must not broadcast the tier map"),
+    )
 
     primary_masks = kt_ep_wrapper._build_gpu_expert_masks(server_args)
     tier_map = kt_ep_wrapper._KT_GPU_EXPERT_TIER_MAP
