@@ -295,10 +295,16 @@ variant. PyTorch officially publishes 2.11 wheels for CUDA 13.0. Use that wheel
 runtime with the CUDA 13.3 host compiler toolkit:
 
 ```bash
-python -m pip install \
+python -m pip install --force-reinstall --no-cache-dir \
   torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu130
+
+python -c 'import torch; assert torch.version.cuda == "13.0", torch.version.cuda; print("torch", torch.__version__, "cuda", torch.version.cuda, "from", torch.__file__)'
 ```
+
+Do not continue until that check reports CUDA 13.0. `torch.version.cuda` is
+compiled into the PyTorch wheel; it does not report the version selected by
+`CUDA_HOME` or the host's `nvcc`.
 
 Install the SGLang fork from the checked-out source:
 
@@ -683,6 +689,33 @@ Verify `sglang-kernel==0.4.5` and all three FlashInfer distributions at
 13.0 wheel installs in Section 7. Then rerun Sections 9, 10, 13, and 14.
 
 ## Troubleshooting
+
+### `torch.version.cuda` reports `12.8`
+
+The environment contains a CUDA 12.8 PyTorch wheel. CUDA 13.3 in
+`CUDA_HOME` cannot change a wheel that was compiled for CUDA 12.8. Confirm the
+active interpreter, then replace the complete PyTorch package trio from the
+CUDA 13.0 index:
+
+```bash
+conda activate dsv4-pro
+
+which python
+python -m pip --version
+python -c 'import sys, torch; print(sys.executable); print(torch.__version__, torch.version.cuda, torch.__file__)'
+
+python -m pip install --force-reinstall --no-cache-dir \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu130
+
+python -c 'import torch; assert torch.version.cuda == "13.0", torch.version.cuda; print("torch", torch.__version__, "cuda", torch.version.cuda, "from", torch.__file__)'
+python -m pip check
+```
+
+If the assertion still reports 12.8, the displayed `torch.__file__` is being
+imported from a different environment or user site. Do not build KT-Kernel
+until that path belongs to the `dsv4-pro` Conda environment and the assertion
+passes.
 
 ### `No kernel image is available` or unsupported SM120
 
