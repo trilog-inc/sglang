@@ -466,9 +466,9 @@ reserves and generates deterministically for a short greedy prompt.
 ### Phase 7: MTP and concurrency
 
 - Split every bundled DSpark stage's routed experts across two draft devices,
-  using a compact Marlin bank and host-staged asynchronous helper execution.
-  Implemented for a configurable two-count partition; hardware validation
-  pending.
+  using compact Marlin banks, one-expert-at-a-time preparation on both devices,
+  and host-staged asynchronous helper execution. Implemented for a configurable
+  two-count partition; hardware validation pending.
 - Keep the already-loaded target embedding and LM head on the primary target
   GPU so the 24 GiB draft devices do not duplicate the vocabulary weights.
   Implemented in eager mode; cross-device transfer cost remains to be measured.
@@ -575,6 +575,7 @@ deployment, not data-center-class throughput.
 | Helper GPUs slower than CPU for tiny assignments | Measure crossover and route small buckets to CPU |
 | Host-staged transfers serialize every layer | Persistent pinned buffers, separate streams, concurrent CPU/helper execution |
 | Marlin representation exceeds helper capacity | Use planner-gated per-device counts and account for repack and scale bytes before allocation |
+| Draft-primary Marlin repack duplicates a full raw expert bank | Allocate final Marlin storage first and stream one native-MXFP4 expert at a time into both draft tiers |
 | Long prefill needs a full layer staging buffer | Demand-driven expert minibatches across all helpers |
 | File cache displaces anonymous expert memory | Release mappings and use advisory cache eviction after each layer |
 | Frequency placement overfits one workload | Preserve a uniform baseline and validate on multiple prompt classes |

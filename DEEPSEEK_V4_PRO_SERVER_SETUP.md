@@ -22,7 +22,8 @@ The current update implements:
   transport, and asynchronous CUDA event coordination;
 - DSpark speculative-decoding integration, tuning, and policy tests;
 - planner and native-kernel parity tests; and
-- one-expert-at-a-time remote weight preparation to bound startup memory.
+- one-expert-at-a-time helper and draft-primary weight preparation to bound
+  startup memory.
 
 The 26/10/0/0 target placement is now implemented: 26 experts per layer remain
 on the RTX PRO 6000, 10 run on the RTX 4090, and the complement stays in native
@@ -694,7 +695,7 @@ Run the focused CPU-side topology and routing tests before loading the model:
 ```bash
 cd "$SGLANG_SRC"
 python -m pytest -q test/registered/unit/layers/test_kt_ep_wrapper.py \
-  -k 'explicit_gpu_tier or remote_tier or remote_expert_topology'
+  -k 'explicit_gpu_tier or remote_tier or remote_expert_topology or mtp_marlin_primary'
 
 python -m pytest -q \
   test/registered/spec/dspark/test_dspark_draft_path_default.py \
@@ -763,7 +764,7 @@ python -m sglang.launch_server \
   2>&1 | tee "$DSV4_REPORT/target-helper-smoke-server.txt"
 ```
 
-The startup log must report devices `(0, 1)`, counts `(26, 10)`, and a remote
+The startup log must report devices `(0, 2)`, counts `(26, 10)`, and a remote
 Marlin tier with 10 experts for every routed layer. In a second shell, monitor
 host RSS and all GPU allocations while weights load:
 
@@ -828,6 +829,23 @@ draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
 two 24 GiB devices do not duplicate the target embedding and LM-head weights.
 This first version uses synchronous cross-device vocabulary transfers and must
 remain eager.
+
+Each draft stage should then report both of these bounded preparation paths:
+
+```text
+Preparing KT remote expert tier one expert at a time: ... device=cuda:3 experts=192 ...
+KT remote prepared expert tier ready: ... device=cuda:3 experts=192 ...
+Preparing KT local expert tier one expert at a time: ... device=cuda:1 experts=192 ...
+KT local prepared expert tier ready: ... device=cuda:1 experts=192 ...
+```
+
+The ordinary `Preparing MXFP4 experts for Marlin backend` message can still
+appear once per stage for the internal one-slot dummy needed to initialize the
+standard quantization method. It must not consume a 192-expert raw bank. If an
+OOM traceback reaches `_repack_weight` with roughly 23 GiB already allocated,
+the server is still running the older draft-primary loader; update the
+`codex/dsv4` checkout before retrying. `PYTORCH_CUDA_ALLOC_CONF` and smaller
+prefill/token limits do not fix that startup-weight duplication.
 
 The smoke-test environment forces the Triton SM120 sparse-MLA decode fallback.
 The native FlashInfer SM120 kernel can be evaluated separately after the server

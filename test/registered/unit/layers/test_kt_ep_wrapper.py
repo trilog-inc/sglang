@@ -407,6 +407,60 @@ def test_create_config_exposes_remote_tier_without_counting_it_as_cpu(monkeypatc
     assert remote.experts_mask.tolist() == [False, False, True, False, False, False]
 
 
+def test_mtp_marlin_primary_uses_local_streamed_preparation(monkeypatch):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        n_routed_experts=6,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_weight_path="/weights",
+        kt_weight_prefix="mtp",
+        enable_eplb=False,
+        kt_method="MXFP4",
+        kt_mxfp4_backend="amx",
+        kt_mxfp4_amx_min_tokens_per_expert=4,
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[3, 3],
+        kt_gpu_expert_backends=["marlin_mxfp4", "marlin_mxfp4"],
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=None,
+        kt_expert_placement_strategy="uniform",
+        kt_expert_frequency_file=None,
+        init_expert_location="trivial",
+        kt_threadpool_count=1,
+        kt_cpuinfer=8,
+        kt_numa_nodes=[0],
+        chunked_prefill_size=64,
+        kt_gpu_prefill_token_threshold=0,
+        kt_mxfp4_prefill_slots="auto",
+        kt_mxfp4_prefill_host_staging_experts=8,
+        kt_max_deferred_experts_per_token=None,
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERT_TIER_MAP", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_size=1),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+
+    config = create_kt_config_from_server_args(server_args, layer_idx=1)
+
+    assert not bool(config.gpu_experts_mask.any())
+    assert config.expert_tier_map.tolist() == [0, 0, 0, 1, 1, 1]
+    assert len(config.remote_expert_tiers) == 2
+    helper, local = config.remote_expert_tiers
+    assert (helper.device_id, helper.host_staged) == (1, True)
+    assert helper.experts_mask.tolist() == [False, False, False, True, True, True]
+    assert (local.device_id, local.host_staged) == (0, False)
+    assert local.experts_mask.tolist() == [True, True, True, False, False, False]
+
+
 def test_remote_tier_builds_compact_logical_mapping_without_cuda():
     tier = _RemoteExpertTier(
         KTRemoteExpertTierConfig(
