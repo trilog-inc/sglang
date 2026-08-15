@@ -8,17 +8,19 @@ import unittest
 from pathlib import Path
 
 
-_SCRIPT = (
-    Path(__file__).parents[3] / "scripts" / "deepseek_v4_pro_memory_planner.py"
+_SCRIPT = Path(__file__).parents[3] / "scripts" / "deepseek_v4_pro_memory_planner.py"
+_SPEC = importlib.util.spec_from_file_location(
+    "deepseek_v4_pro_memory_planner", _SCRIPT
 )
-_SPEC = importlib.util.spec_from_file_location("deepseek_v4_pro_memory_planner", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 planner = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = planner
 _SPEC.loader.exec_module(planner)
 
 
-def _write_safetensor(path: Path, tensors: dict[str, tuple[str, list[int], int]]) -> None:
+def _write_safetensor(
+    path: Path, tensors: dict[str, tuple[str, list[int], int]]
+) -> None:
     offset = 0
     header = {}
     for name, (dtype, shape, nbytes) in tensors.items():
@@ -125,6 +127,99 @@ def test_placement_rejects_more_gpu_experts_than_checkpoint(tmp_path: Path) -> N
             host_runtime_bytes=0,
             devices=[planner.DevicePlan("primary", 100, 1, 0, 2, "mxfp4")],
             allocator_overhead_fraction=0,
+        )
+
+
+def test_target_only_placement_can_exclude_mtp(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1}), encoding="utf-8"
+    )
+    _write_safetensor(
+        tmp_path / "model.safetensors",
+        {
+            "model.embed_tokens.weight": ("U8", [10], 10),
+            "model.layers.1.mlp.experts.0.weight": ("U8", [60], 60),
+            "model.layers.0.mlp.experts.0.weight": ("U8", [20], 20),
+        },
+    )
+    audit = planner.scan_checkpoint(tmp_path)
+    devices = [planner.DevicePlan("primary", 60, 10, 0, 0, "mxfp4")]
+
+    full_usages, _ = planner.build_placement(
+        audit,
+        host_total_bytes=100,
+        host_reserve_bytes=10,
+        host_runtime_bytes=0,
+        devices=devices,
+        allocator_overhead_fraction=0,
+    )
+    target_usages, diagnostics = planner.build_placement(
+        audit,
+        host_total_bytes=100,
+        host_reserve_bytes=10,
+        host_runtime_bytes=0,
+        devices=devices,
+        allocator_overhead_fraction=0,
+        excluded_categories=frozenset({"mtp"}),
+    )
+
+    assert not full_usages[1].passes
+    assert target_usages[1].passes
+    assert target_usages[1].non_expert_bytes == 10
+    assert not diagnostics
+
+    result = planner._json_result(
+        audit,
+        target_usages,
+        diagnostics,
+        excluded_category_bytes={"mtp": 60},
+    )
+    assert result["checkpoint"]["tensor_payload_bytes"] == 90
+    assert result["checkpoint"]["placement_payload_bytes"] == 30
+    assert result["placement_exclusions"] == {"mtp": 60}
+    assert result["go"] is True
+
+    json_output = tmp_path / "target-only-plan.json"
+    status = planner.main(
+        [
+            str(tmp_path),
+            "--exclude-mtp",
+            "--host-ram-gib",
+            "1",
+            "--host-reserve-gib",
+            "0",
+            "--gpu-names",
+            "primary",
+            "--gpu-capacities-gib",
+            "1",
+            "--gpu-reserves-gib",
+            "0",
+            "--gpu-runtime-gib",
+            "0",
+            "--gpu-experts-per-layer",
+            "0",
+            "--gpu-backends",
+            "mxfp4",
+            "--json-output",
+            str(json_output),
+        ]
+    )
+    cli_result = json.loads(json_output.read_text(encoding="utf-8"))
+    assert status == 0
+    assert cli_result["checkpoint"]["placement_payload_bytes"] == 30
+    assert cli_result["placement_exclusions"] == {"mtp": 60}
+
+    with unittest.TestCase().assertRaisesRegex(
+        ValueError, "Routed experts cannot be excluded"
+    ):
+        planner.build_placement(
+            audit,
+            host_total_bytes=100,
+            host_reserve_bytes=10,
+            host_runtime_bytes=0,
+            devices=devices,
+            allocator_overhead_fraction=0,
+            excluded_categories=frozenset({"routed_experts"}),
         )
 
 

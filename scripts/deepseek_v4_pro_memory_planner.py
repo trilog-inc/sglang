@@ -114,10 +114,14 @@ def categorize_tensor(
 
     lower = name.lower()
     layer, expert = _layer_and_expert(lower)
-    if "mtp" in lower or "nextn" in lower or (
-        layer is not None
-        and num_hidden_layers is not None
-        and layer >= num_hidden_layers
+    if (
+        "mtp" in lower
+        or "nextn" in lower
+        or (
+            layer is not None
+            and num_hidden_layers is not None
+            and layer >= num_hidden_layers
+        )
     ):
         return "mtp", layer, expert
     if "shared_expert" in lower or "shared_experts" in lower:
@@ -128,7 +132,10 @@ def categorize_tensor(
         return "indexer", layer, None
     if any(token in lower for token in ("self_attn", ".attention.", ".attn.", ".mla.")):
         return "attention", layer, None
-    if any(token in lower for token in ("embed_tokens", "word_embeddings", "tok_embeddings")):
+    if any(
+        token in lower
+        for token in ("embed_tokens", "word_embeddings", "tok_embeddings")
+    ):
         return "embeddings", layer, None
     if any(token in lower for token in ("lm_head", "output_layer", "output.weight")):
         return "heads", layer, None
@@ -164,7 +171,9 @@ def _read_safetensor_header(path: Path) -> tuple[dict, int]:
     try:
         value = json.loads(header)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"{path} has an invalid safetensor JSON header: {exc}") from exc
+        raise ValueError(
+            f"{path} has an invalid safetensor JSON header: {exc}"
+        ) from exc
     if not isinstance(value, dict):
         raise ValueError(f"{path} safetensor header must be a JSON object")
     return value, file_size - 8 - header_size
@@ -203,7 +212,9 @@ def scan_checkpoint(model_dir: Path) -> AuditResult:
                 raise ValueError(f"Tensor {name!r} occurs in more than one shard")
             seen_names.add(name)
             if not isinstance(raw_info, dict):
-                raise ValueError(f"Tensor metadata for {name!r} in {shard} is not an object")
+                raise ValueError(
+                    f"Tensor metadata for {name!r} in {shard} is not an object"
+                )
             offsets = raw_info.get("data_offsets")
             shape = raw_info.get("shape")
             dtype = raw_info.get("dtype")
@@ -312,11 +323,14 @@ def build_placement(
     host_runtime_bytes: int,
     devices: Sequence[DevicePlan],
     allocator_overhead_fraction: float,
+    excluded_categories: frozenset[str] = frozenset(),
 ) -> tuple[list[TierUsage], list[str]]:
     if not devices:
         raise ValueError("At least one GPU device must be configured")
     if allocator_overhead_fraction < 0:
         raise ValueError("Allocator overhead cannot be negative")
+    if "routed_experts" in excluded_categories:
+        raise ValueError("Routed experts cannot be excluded from placement")
 
     overhead = 1.0 + allocator_overhead_fraction
     usages = [
@@ -332,9 +346,7 @@ def build_placement(
         TierUsage(
             name=device.name,
             representation=(
-                "primary_dense_plus_" + device.backend
-                if index == 0
-                else device.backend
+                "primary_dense_plus_" + device.backend if index == 0 else device.backend
             ),
             capacity_bytes=device.total_bytes,
             reserve_bytes=device.reserve_bytes,
@@ -343,8 +355,13 @@ def build_placement(
         for index, device in enumerate(devices)
     )
 
-    non_expert_bytes = audit.payload_bytes - audit.category_bytes.get(
-        "routed_experts", 0
+    excluded_non_expert_bytes = sum(
+        audit.category_bytes.get(category, 0) for category in excluded_categories
+    )
+    non_expert_bytes = (
+        audit.payload_bytes
+        - audit.category_bytes.get("routed_experts", 0)
+        - excluded_non_expert_bytes
     )
     primary_non_expert = math.ceil(non_expert_bytes * overhead)
     usages[1].non_expert_bytes = primary_non_expert
@@ -423,18 +440,25 @@ def _json_result(
     audit: AuditResult,
     usages: Sequence[TierUsage],
     diagnostics: Sequence[str],
+    excluded_category_bytes: Mapping[str, int] | None = None,
 ) -> dict:
+    excluded_category_bytes = excluded_category_bytes or {}
     return {
         "checkpoint": {
             "tensor_payload_bytes": audit.payload_bytes,
+            "placement_payload_bytes": audit.payload_bytes
+            - sum(excluded_category_bytes.values()),
             "safetensor_file_bytes": audit.shard_file_bytes,
             "tensor_count": len(audit.tensors),
             "category_bytes": dict(audit.category_bytes),
-            "layer_bytes": {str(key): value for key, value in audit.layer_bytes.items()},
+            "layer_bytes": {
+                str(key): value for key, value in audit.layer_bytes.items()
+            },
             "routed_expert_instances": len(audit.expert_bytes),
             "routed_expert_bytes_min": min(audit.expert_bytes.values(), default=0),
             "routed_expert_bytes_max": max(audit.expert_bytes.values(), default=0),
         },
+        "placement_exclusions": dict(excluded_category_bytes),
         "placement": [
             {
                 **asdict(usage),
@@ -461,7 +485,9 @@ def _print_report(
     diagnostics: Sequence[str],
     *,
     verbose_layers: bool,
+    excluded_category_bytes: Mapping[str, int] | None = None,
 ) -> None:
+    excluded_category_bytes = excluded_category_bytes or {}
     print("DeepSeek-V4-Pro metadata audit")
     print(f"  tensor payload:   {_human_bytes(audit.payload_bytes)}")
     print(f"  shard file bytes: {_human_bytes(audit.shard_file_bytes)}")
@@ -470,6 +496,13 @@ def _print_report(
     print("\nTensor categories")
     for category, nbytes in audit.category_bytes.items():
         print(f"  {category:20s} {_human_bytes(nbytes):>14s}")
+
+    if excluded_category_bytes:
+        print("\nExcluded from placement")
+        for category, nbytes in excluded_category_bytes.items():
+            print(f"  {category:20s} {_human_bytes(nbytes):>14s}")
+        placement_payload = audit.payload_bytes - sum(excluded_category_bytes.values())
+        print(f"  {'placement payload':20s} {_human_bytes(placement_payload):>14s}")
 
     if verbose_layers:
         print("\nPer-layer native payload")
@@ -519,7 +552,11 @@ def _print_report(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("model", type=Path, help="Directory containing config.json and safetensor shards")
+    parser.add_argument(
+        "model",
+        type=Path,
+        help="Directory containing config.json and safetensor shards",
+    )
     parser.add_argument("--host-ram-gib", type=float, default=768.0)
     parser.add_argument("--host-reserve-gib", type=float, default=64.0)
     parser.add_argument("--host-runtime-gib", type=float, default=0.0)
@@ -545,8 +582,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Representation/alignment overhead applied to all weight placements",
     )
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    parser.add_argument("--json-output", type=Path, help="Also write the JSON report to this path")
+    parser.add_argument(
+        "--exclude-mtp",
+        action="store_true",
+        help=(
+            "Exclude MTP/NextN tensors from placement while retaining them in "
+            "the checkpoint audit. Use only for target-only inference, whose "
+            "model loader skips those draft weights."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    parser.add_argument(
+        "--json-output", type=Path, help="Also write the JSON report to this path"
+    )
     parser.add_argument("--verbose-layers", action="store_true")
     return parser
 
@@ -572,9 +622,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cast=int,
         option="--gpu-experts-per-layer",
     )
-    backends = _parse_csv_numbers(
-        args.gpu_backends, cast=str, option="--gpu-backends"
-    )
+    backends = _parse_csv_numbers(args.gpu_backends, cast=str, option="--gpu-backends")
     _same_length(
         parser,
         names=names,
@@ -585,7 +633,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         backends=backends,
     )
     if any(value < 0 for value in [*capacities, *reserves, *runtimes, *expert_counts]):
-        parser.error("GPU capacities, reserves, runtime use, and expert counts cannot be negative")
+        parser.error(
+            "GPU capacities, reserves, runtime use, and expert counts cannot be negative"
+        )
 
     devices = [
         DevicePlan(
@@ -603,6 +653,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         audit = scan_checkpoint(args.model)
+        excluded_categories = frozenset({"mtp"}) if args.exclude_mtp else frozenset()
+        excluded_category_bytes = {
+            category: audit.category_bytes.get(category, 0)
+            for category in sorted(excluded_categories)
+        }
         usages, diagnostics = build_placement(
             audit,
             host_total_bytes=_gib(args.host_ram_gib),
@@ -610,16 +665,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             host_runtime_bytes=_gib(args.host_runtime_gib),
             devices=devices,
             allocator_overhead_fraction=args.allocator_overhead_percent / 100.0,
+            excluded_categories=excluded_categories,
         )
     except (OSError, ValueError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
-    result = _json_result(audit, usages, diagnostics)
+    result = _json_result(
+        audit,
+        usages,
+        diagnostics,
+        excluded_category_bytes=excluded_category_bytes,
+    )
     if args.json:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         _print_report(
-            audit, usages, diagnostics, verbose_layers=args.verbose_layers
+            audit,
+            usages,
+            diagnostics,
+            verbose_layers=args.verbose_layers,
+            excluded_category_bytes=excluded_category_bytes,
         )
     if args.json_output:
         args.json_output.parent.mkdir(parents=True, exist_ok=True)

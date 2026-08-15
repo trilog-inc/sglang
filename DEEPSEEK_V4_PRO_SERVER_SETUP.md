@@ -443,7 +443,7 @@ python -m pytest -q \
 python -m py_compile scripts/deepseek_v4_pro_memory_planner.py
 ```
 
-Expected result: six planner tests pass and the focused DSpark tests pass.
+Expected result: seven planner tests pass and the focused DSpark tests pass.
 
 ### Optional native parity executables
 
@@ -566,6 +566,7 @@ cd "$SGLANG_SRC"
 set -o pipefail
 
 python scripts/deepseek_v4_pro_memory_planner.py "$DSV4_MODEL" \
+  --exclude-mtp \
   --host-ram-gib "$DSV4_HOST_RAM_GIB" \
   --host-reserve-gib 64 \
   --host-runtime-gib 8 \
@@ -584,14 +585,29 @@ DSV4_PLANNER_STATUS=${PIPESTATUS[0]}
 printf 'planner exit status: %s\n' "$DSV4_PLANNER_STATUS" \
   | tee "$DSV4_REPORT/planner-status.txt"
 
-jq '{go, warnings, diagnostics, placement}' \
+jq '{go, placement_exclusions, warnings, diagnostics, placement}' \
   "$DSV4_REPORT/deepseek-v4-pro-memory-plan.json"
 ```
+
+`--exclude-mtp` is required for this target-only gate. The normal DeepSeek-V4
+target loader skips the checkpoint's MTP/NextN tensors when speculative
+decoding is disabled. The planner still audits and reports those tensors, but
+does not place them on the primary GPU in this mode. The resulting JSON records
+both the complete `tensor_payload_bytes` and the smaller
+`placement_payload_bytes`, plus the exact `placement_exclusions` map.
+
+Also preserve a speculative-inclusive report by rerunning the same command
+without `--exclude-mtp` and writing it to distinct `*-with-mtp` report files.
+The measured checkpoint contains 39.10 GiB of MTP tensors, and the initial
+18/9/9/9 placement does not fit those tensors while retaining the configured
+reserves. That `NO-GO` applies to built-in MTP/DSpark enablement, not to the
+target-only placement.
 
 Interpretation:
 
 - Exit status `0` and JSON `"go": true`: the metadata is understood and all
-  configured steady-state reserves pass.
+  configured steady-state reserves pass for the explicitly reported placement
+  exclusions.
 - Exit status `1`: valid checkpoint, but at least one capacity reserve,
   metadata warning, or placement diagnostic failed.
 - Exit status `2`: invalid arguments, unreadable files, or malformed

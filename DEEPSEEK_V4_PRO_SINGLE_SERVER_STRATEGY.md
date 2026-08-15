@@ -1,7 +1,7 @@
 # DeepSeek-V4-Pro Single-Server Inference Strategy
 
 Status: Phase 0/1 implemented; Phase 2+ gated on the target-server audit
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
 Server setup and validation runbook:
 [DEEPSEEK_V4_PRO_SERVER_SETUP.md](DEEPSEEK_V4_PRO_SERVER_SETUP.md)
@@ -63,6 +63,14 @@ changes:
 
 This is a narrow capacity envelope. Every large allocation must be intentional,
 and model loading must never materialize a full duplicate of the checkpoint.
+
+The target-server metadata audit measured 831.42 GiB of tensor payload,
+including 765.60 GiB of routed experts and 39.10 GiB of MTP/NextN draft
+weights. The normal target loader skips the MTP tensors when speculative
+decoding is disabled, so Phase 0 now records separate target-only and
+speculative-inclusive capacity gates. The initial 18/9/9/9 placement is a
+`NO-GO` when MTP is included under the stated reserves; this does not invalidate
+the target-only placement.
 
 ## Source model facts
 
@@ -363,7 +371,8 @@ capacity and for reducing CPU memory traffic.
 Recommended progression:
 
 1. Run target-only eager decode.
-2. Enable the checkpoint's built-in MTP after target correctness is proven.
+2. Re-plan the 39.10 GiB MTP footprint after target correctness is proven; do
+   not enable it until the speculative-inclusive capacity gate passes.
 3. Evaluate whether MTP improves end-to-end latency at the low expected batch
    sizes.
 4. Consider DSpark only if a smaller compatible draft can be hosted without
@@ -381,7 +390,8 @@ routing cannot pollute target placement statistics.
   indexer, embeddings, heads, MTP, and miscellaneous tensors.
 - Compare filesystem payload with the official configuration-derived estimate.
 - Measure available host RAM after boot and CUDA context overhead on all GPUs.
-- Produce a proposed placement and fail early if safety reserves cannot be met.
+- Produce separate target-only and speculative-inclusive placements and fail
+  early if the applicable safety reserves cannot be met.
 
 Exit criterion: predicted placement leaves at least 64 GiB host reserve,
 12 GiB primary-GPU reserve, and 3 GiB per helper GPU.
