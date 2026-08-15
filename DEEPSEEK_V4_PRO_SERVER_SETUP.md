@@ -50,14 +50,17 @@ The procedure assumes:
 | Primary GPU | RTX PRO 6000 Blackwell Workstation Edition, 96 GiB |
 | Helper GPUs | RTX 4090 24 GiB and 2 x RTX 3090 24 GiB |
 | CPU | Intel AMX, AVX-512, and BF16 capable |
-| CUDA toolkit | 12.9.x under `/usr/local/cuda-12.9` |
+| CUDA toolkit | 13.3.x under `/usr/local/cuda-13.3` |
 | Python | 3.11 in a dedicated Conda environment |
 | Model storage | At least 1.1 TB free on a local high-throughput filesystem |
 
-CUDA 12.8 is the minimum for the MXFP4 path. CUDA 12.9 is recommended here
-because the repository's container defaults to CUDA 12.9.1 and it supports the
-SM120 primary GPU. PyTorch uses its official CUDA 12.8 wheel; the installed
-CUDA 12.9 driver/toolkit is backward-compatible with that wheel.
+CUDA 13.3 is the target compiler toolkit for this server. The Python stack uses
+the official PyTorch CUDA 13.0 wheel because that is the current CUDA 13 wheel
+line published for PyTorch 2.11. CUDA 13.0 wheel binaries run on the newer
+CUDA 13.3 driver through backward compatibility, while source and JIT
+extensions compile with the local CUDA 13.3 toolkit. Consequently,
+`torch.version.cuda` should report `13.0` and `nvcc --version` should report
+`13.3`; that difference is intentional.
 
 If the machine differs from this table, do not copy the placement numbers
 blindly. Record its actual capacities and pass them to the planner.
@@ -114,8 +117,9 @@ Confirm all of the following before continuing:
 1. All four GPUs appear and have their expected memory capacities.
 2. The RTX PRO 6000's compute capability is 12.0, the RTX 4090 is 8.9, and
    the RTX 3090s are 8.6.
-3. The NVIDIA driver reports CUDA 12.9 or newer capability.
-4. `nvcc --version` reports a local CUDA toolkit new enough to compile SM120.
+3. The NVIDIA Linux driver is version 610.43.02 or newer and reports CUDA 13.3
+   or newer capability.
+4. `nvcc --version` reports release 13.3.
 5. `/proc/cpuinfo` contains `amx_tile`, `amx_bf16`, `amx_int8`, `avx512f`,
    `avx512bw`, and `avx512_bf16`.
 6. The model filesystem has at least 1.1 TB available before download.
@@ -137,8 +141,11 @@ does not satisfy the intended Pro performance posture.
 ## 3. Install system build tools
 
 Do not install or replace the NVIDIA driver from inside the Conda environment.
-Have the administrator install a driver and CUDA 12.9 toolkit using the
-server's normal NVIDIA package-management policy first.
+Have the administrator install NVIDIA Linux driver 610.43.02 or newer and the
+CUDA 13.3 toolkit using the server's normal package-management policy first.
+For an NVIDIA APT repository configured for Ubuntu 24.04, the versioned toolkit
+metapackage is `cuda-toolkit-13-3`; using the versioned name prevents an
+unplanned upgrade to a later toolkit family.
 
 Install the CPU build and diagnostic dependencies:
 
@@ -159,6 +166,10 @@ sudo apt-get install -y \
   ripgrep \
   tmux
 
+# Run only when the NVIDIA CUDA repository is already configured and the
+# toolkit is not already installed by the administrator.
+sudo apt-get install -y cuda-toolkit-13-3
+
 git lfs install
 numactl --hardware | tee "$DSV4_REPORT/numa.txt"
 ```
@@ -167,12 +178,13 @@ Verify the CUDA compiler explicitly. Adjust `CUDA_HOME` if the toolkit is in a
 different versioned directory:
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.9
+export CUDA_HOME=/usr/local/cuda-13.3
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 nvcc --version
 test -x "$CUDA_HOME/bin/nvcc"
+nvcc --version | rg -q 'release 13\.3'
 ```
 
 Do not continue with an older toolkit merely because `nvidia-smi` displays a
@@ -279,13 +291,13 @@ modified or untracked files.
 ## 7. Install the pinned Python and CUDA stack
 
 Install PyTorch first so downstream packages cannot select a different CUDA
-variant. PyTorch officially publishes 2.9.1 wheels for CUDA 12.8 and 13.0; this
-guide uses CUDA 12.8 wheels with the CUDA 12.9 host toolkit:
+variant. PyTorch officially publishes 2.11 wheels for CUDA 13.0. Use that wheel
+runtime with the CUDA 13.3 host compiler toolkit:
 
 ```bash
 python -m pip install \
-  torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-  --index-url https://download.pytorch.org/whl/cu128
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu130
 ```
 
 Install the SGLang fork from the checked-out source:
@@ -294,35 +306,44 @@ Install the SGLang fork from the checked-out source:
 python -m pip install -e "$SGLANG_SRC/python"
 ```
 
-For CUDA 12.8/12.9, the repository uses `sgl-kernel==0.3.21` from PyPI. Force
-the exact version after the editable install:
+The merged SGLang baseline pins `sglang-kernel==0.4.5`. Force the CUDA 13.0
+wheel from SGLang's wheel index after the editable install:
 
 ```bash
-python -m pip install --force-reinstall --no-deps sgl-kernel==0.3.21
+python -m pip install --force-reinstall --no-deps \
+  sglang-kernel==0.4.5 \
+  --index-url https://docs.sglang.ai/whl/cu130/
 ```
 
-The DeepSeek-V4 MXFP4 implementation imports APIs added in FlashInfer 0.6.9.
-The SGLang package metadata still pins 0.6.3, so apply this deliberate override
-and keep the Python and cubin distributions at the same version:
+Keep the FlashInfer Python, cubin, and JIT-cache distributions aligned with the
+`0.6.15.post1` version pinned by this branch. The Python package is available
+from PyPI, the cubins use FlashInfer's common index, and the CUDA-specific JIT
+cache uses its CUDA 13.0 index:
 
 ```bash
-python -m pip install --upgrade \
-  flashinfer-python==0.6.9 \
-  flashinfer-cubin==0.6.9
+python -m pip install --force-reinstall --no-deps \
+  flashinfer-python==0.6.15.post1
+
+python -m pip install --force-reinstall --no-deps \
+  flashinfer-cubin==0.6.15.post1 \
+  --index-url https://flashinfer.ai/whl
+
+python -m pip install --force-reinstall --no-deps \
+  flashinfer-jit-cache==0.6.15.post1 \
+  --index-url https://flashinfer.ai/whl/cu130
 ```
 
-The non-Hopper sparse-MLA path also needs TileLang. Pin TVM FFI below 0.1.12 to
-avoid the duplicate type-registration failure documented by the repository:
+The non-Hopper sparse-MLA path also needs TileLang. Use the exact TileLang and
+TVM FFI versions pinned by this branch:
 
 ```bash
 python -m pip install \
-  tilelang==0.1.8 \
-  'apache-tvm-ffi>=0.1.5,<0.1.12' \
+  tilelang==0.1.11 \
+  apache-tvm-ffi==0.1.11 \
   pytest
 ```
 
-Do not install upstream `transformers` over this environment. The source
-package intentionally depends on `transformers-kt==5.6.0.post1`.
+Do not override the source package's `transformers==5.12.1` pin.
 
 ## 8. Build KT-Kernel natively for this server
 
@@ -355,7 +376,13 @@ The build must report AMX enabled, CUDA enabled, and architectures 86, 89, and
 Run all of these checks from the `dsv4-pro` environment:
 
 ```bash
-python -c 'import torch; print("torch", torch.__version__, "cuda", torch.version.cuda); print([(i, torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i)) for i in range(torch.cuda.device_count())])'
+python -c 'import torch; assert torch.version.cuda == "13.0", torch.version.cuda; print("torch", torch.__version__, "cuda", torch.version.cuda); print([(i, torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i)) for i in range(torch.cuda.device_count())])'
+
+python -m pip show \
+  sglang-kernel \
+  flashinfer-python \
+  flashinfer-cubin \
+  flashinfer-jit-cache
 
 python -c 'import sglang; print("sglang import OK", sglang.__file__)'
 
@@ -379,9 +406,8 @@ Check dependency consistency:
 python -m pip check
 ```
 
-The FlashInfer 0.6.9 override may produce one expected complaint saying that
-the editable SGLang package declares `flashinfer-python==0.6.3`. Record that
-line. Any other dependency error must be resolved before continuing.
+`pip check` must exit cleanly. This branch directly pins the versions installed
+in Section 7, so do not accept a dependency-conflict warning as expected.
 
 Save the resolved environment:
 
@@ -652,14 +678,16 @@ export CPUINFER_CUDA_ARCHS='86;89;120'
 bash ./install.sh build --manual
 ```
 
-Reapply and verify the deliberate FlashInfer 0.6.9 override if the editable
-SGLang install restores 0.6.3. Then rerun Sections 9, 10, 13, and 14.
+Verify `sglang-kernel==0.4.5` and all three FlashInfer distributions at
+`0.6.15.post1`. If dependency resolution changed them, rerun the forced CUDA
+13.0 wheel installs in Section 7. Then rerun Sections 9, 10, 13, and 14.
 
 ## Troubleshooting
 
 ### `No kernel image is available` or unsupported SM120
 
-- Confirm `nvcc --version` uses CUDA 12.8 or newer; CUDA 12.9 is recommended.
+- Confirm `CUDA_HOME=/usr/local/cuda-13.3` and `nvcc --version` reports release
+  13.3.
 - Confirm `CPUINFER_CUDA_ARCHS='86;89;120'` was present during the KT build.
 - Set `CPUINFER_FORCE_REBUILD=1` and rebuild from a clean CMake cache.
 - Confirm PyTorch sees capability `(12, 0)` for the RTX PRO 6000.
@@ -671,10 +699,11 @@ Set it to the versioned toolkit containing `bin/nvcc`, then update `PATH` and
 
 ### FlashInfer import errors for MXFP4 symbols
 
-Check that both packages are exactly 0.6.9:
+Check that all three packages have base version `0.6.15.post1`. The JIT-cache
+wheel may include a local `+cu130` suffix:
 
 ```bash
-python -m pip show flashinfer-python flashinfer-cubin
+python -m pip show flashinfer-python flashinfer-cubin flashinfer-jit-cache
 python -c 'from flashinfer import mxfp8_quantize; from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe; print("FlashInfer MXFP4 imports OK")'
 ```
 
@@ -683,7 +712,7 @@ python -c 'from flashinfer import mxfp8_quantize; from flashinfer.fused_moe impo
 Reinstall the constrained TVM FFI version:
 
 ```bash
-python -m pip install --force-reinstall 'apache-tvm-ffi>=0.1.5,<0.1.12'
+python -m pip install --force-reinstall apache-tvm-ffi==0.1.11
 ```
 
 ### KT-Kernel cannot find HWLOC or NUMA
@@ -722,7 +751,8 @@ recovery plan.
 ## Reference links
 
 - [Implementation strategy](DEEPSEEK_V4_PRO_SINGLE_SERVER_STRATEGY.md)
-- [Official PyTorch 2.9.1 wheel commands](https://pytorch.org/get-started/previous-versions/)
+- [Official PyTorch 2.11 wheel commands](https://pytorch.org/get-started/previous-versions/)
 - [Hugging Face download guide](https://huggingface.co/docs/huggingface_hub/guides/download)
+- [NVIDIA CUDA 13.3 release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)
 - [NVIDIA CUDA installation guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 - [DeepSeek-V4-Pro model page](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)

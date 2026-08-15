@@ -1,7 +1,7 @@
 # DeepSeek-V4-Pro Single-Server Inference Strategy
 
 Status: Phase 0/1 implemented; Phase 2+ gated on the target-server audit
-Last updated: 2026-08-13
+Last updated: 2026-08-14
 
 Server setup and validation runbook:
 [DEEPSEEK_V4_PRO_SERVER_SETUP.md](DEEPSEEK_V4_PRO_SERVER_SETUP.md)
@@ -33,7 +33,8 @@ server with:
 - one NVIDIA RTX PRO 6000 Blackwell Workstation Edition with 96 GiB VRAM;
 - one NVIDIA GeForce RTX 4090 with 24 GiB VRAM;
 - two NVIDIA GeForce RTX 3090 GPUs with 24 GiB VRAM each;
-- an AMX-capable processor; and
+- an AMX-capable processor;
+- the NVIDIA CUDA 13.3 compiler toolkit; and
 - the SGLang, KTransformers, and `kt-kernel` integration maintained in this
   project.
 
