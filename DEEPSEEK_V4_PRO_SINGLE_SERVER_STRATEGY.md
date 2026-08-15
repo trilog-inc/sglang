@@ -533,6 +533,9 @@ The first successful launch should use conservative limits:
 - no separate draft model;
 - prefill CUDA graph disabled;
 - decode graph disabled or breakable with small batch capture sizes;
+- FlashInfer autotuning disabled for the first complete load;
+- SM120 sparse-MLA decode forced to the Triton fallback until the native
+  FlashInfer kernel passes a standalone parity test on the deployment stack;
 - explicit maximum total tokens;
 - chunked prefill of 1,024-4,096 tokens;
 - FP8 KV cache;

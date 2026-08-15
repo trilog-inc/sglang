@@ -723,6 +723,9 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TORCH_CUDA_ARCH_LIST='8.6;8.9;12.0+PTX'
 export DSV4_CPUINFER_THREADS="${DSV4_CPUINFER_THREADS:-$(nproc)}"
+# Correctness-first SM120 decode fallback. Remove only after the standalone
+# FlashInfer sparse-MLA parity test passes on this exact driver/wheel stack.
+export SGLANG_SM120_FLASHMLA_BACKEND=triton
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -749,6 +752,7 @@ python -m sglang.launch_server \
   --max-total-tokens 4096 \
   --max-running-requests 1 \
   --mem-fraction-static 0.89 \
+  --disable-flashinfer-autotune \
   --disable-overlap-schedule \
   --disable-cuda-graph \
   --reasoning-parser deepseek-v4 \
@@ -807,6 +811,7 @@ python -m sglang.launch_server \
   --max-total-tokens 4096 \
   --max-running-requests 1 \
   --mem-fraction-static 0.89 \
+  --disable-flashinfer-autotune \
   --disable-overlap-schedule \
   --disable-cuda-graph \
   --reasoning-parser deepseek-v4 \
@@ -823,6 +828,10 @@ draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
 two 24 GiB devices do not duplicate the target embedding and LM-head weights.
 This first version uses synchronous cross-device vocabulary transfers and must
 remain eager.
+
+The smoke-test environment forces the Triton SM120 sparse-MLA decode fallback.
+The native FlashInfer SM120 kernel can be evaluated separately after the server
+is stable; do not combine that experiment with the first 800+ GiB model load.
 
 Keep the same monitor running. Stop if either RTX 3090 falls below its 2 GiB
 reserve, if the draft loads any `model.layers.N` expert in place of `mtp.N`, or
@@ -932,6 +941,23 @@ declare `torch==2.11.0`; do not downgrade the SGLang environment to Torch
 - Confirm `CPUINFER_CUDA_ARCHS='86;89;120'` was present during the KT build.
 - Set `CPUINFER_FORCE_REBUILD=1` and rebuild from a clean CMake cache.
 - Confirm PyTorch sees capability `(12, 0)` for the RTX PRO 6000.
+
+### `sparse_mla_sm120_decode_dsv4` reports an unsupported shape or illegal memory access
+
+The FlashInfer SM120 sparse-MLA kernel failed during eager-runner warmup. CUDA
+graph disabling does not disable this autotuning pass. Terminate the failed
+process because an illegal memory access leaves its CUDA context unusable, then
+launch with both of these safeguards:
+
+```bash
+export SGLANG_SM120_FLASHMLA_BACKEND=triton
+# Add to the launch arguments:
+--disable-flashinfer-autotune
+```
+
+This selects SGLang's Triton sparse-MLA decode implementation and disables the
+FlashInfer tuning forward. It is the conservative correctness path for the
+initial load, not a statement about final attention performance.
 
 ### `CUDA_HOME environment variable is not set`
 
