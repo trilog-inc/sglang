@@ -22,6 +22,13 @@ Diagnostic environment variables (disabled by default):
     Select instrumented layers.  Use ``all`` for every routed layer.
 ``SGLANG_KT_HYBRID_TIMING_INTERVAL=16``
     Log the first eight calls, then every Nth call for each selected layer.
+``SGLANG_KT_SKIP_EMPTY_GPU_TIERS=1``
+    For small decode/verify batches, copy one tier-presence vector to the host
+    and skip primary/helper GPU launches that have no routed assignments.  This
+    is opt-in because the synchronization/launch tradeoff is topology-specific.
+``SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS=8``
+    Maximum routed rows for the empty-tier gate.  Larger prefills retain the
+    fully asynchronous path.
 """
 
 from __future__ import annotations
@@ -133,6 +140,16 @@ def _kt_diagnostic_layer_selected(layer_idx: int, raw: str) -> bool:
             "SGLANG_KT_HYBRID_TIMING_LAYERS must be 'all' or a comma-separated "
             f"list of layer indices, got {raw!r}."
         ) from exc
+
+
+def _resolve_gpu_tier_presence(
+    compact_topk_ids: list[torch.Tensor],
+) -> tuple[bool, ...]:
+    """Resolve all small-batch GPU-tier hit flags with one device-to-host copy."""
+    if not compact_topk_ids:
+        return ()
+    presence = torch.stack([topk_ids.ge(0).any() for topk_ids in compact_topk_ids])
+    return tuple(bool(value) for value in presence.to(device="cpu").tolist())
 
 
 def reset_kt_expert_placement_cache() -> None:
@@ -462,6 +479,32 @@ def _build_gpu_expert_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]
                 counts,
                 backends,
             )
+            if scores is not None:
+                routed = float(scores[moe_layers].sum())
+                tier_routes = [
+                    float(scores[tier_map.eq(tier_index)].sum())
+                    for tier_index in range(len(devices))
+                ]
+                selected_routes = sum(tier_routes)
+                logger.info(
+                    "KT frequency profile: file=%s selected_routes=%.0f/%.0f "
+                    "coverage=%.2f%%",
+                    server_args.kt_expert_frequency_file,
+                    selected_routes,
+                    routed,
+                    100.0 * selected_routes / routed,
+                )
+                for tier_index, tier_selected_routes in enumerate(tier_routes):
+                    logger.info(
+                        "KT frequency tier coverage: tier=%d device=%d "
+                        "backend=%s routes=%.0f/%.0f coverage=%.2f%%",
+                        tier_index,
+                        devices[tier_index],
+                        backends[tier_index],
+                        tier_selected_routes,
+                        routed,
+                        100.0 * tier_selected_routes / routed,
+                    )
         return _KT_GPU_EXPERTS_MASKS
 
     ratio = server_args.kt_gpu_experts_ratio
@@ -1241,20 +1284,31 @@ class _RemoteExpertTier:
             self.staging.peer_access if self.staging is not None else True,
         )
 
+    def remap_routes(self, logical_topk_ids: torch.Tensor) -> torch.Tensor:
+        if self.prepared is None:
+            raise RuntimeError("Cannot remap routes for an uninitialized KT tier")
+        assert self.experts_mask_cuda is not None
+        assert self.logical_to_compact_cuda is not None
+        return mask_and_remap_expert_ids(
+            logical_topk_ids,
+            self.experts_mask_cuda,
+            self.logical_to_compact_cuda,
+        )
+
     def submit(
         self,
         hidden_states: torch.Tensor,
         logical_topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        *,
+        compact_topk_ids: Optional[torch.Tensor] = None,
     ) -> bool:
         if self.prepared is None or hidden_states.numel() == 0:
             return False
-        assert self.experts_mask_cuda is not None
-        assert self.logical_to_compact_cuda is not None
-        helper_ids = mask_and_remap_expert_ids(
-            logical_topk_ids,
-            self.experts_mask_cuda,
-            self.logical_to_compact_cuda,
+        helper_ids = (
+            compact_topk_ids
+            if compact_topk_ids is not None
+            else self.remap_routes(logical_topk_ids)
         )
         if self.host_staged:
             assert self.staging is not None
@@ -1413,6 +1467,22 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "SGLANG_KT_HYBRID_TIMING_INTERVAL must be a positive integer."
             ) from exc
         self._diag_step = 0
+        self._skip_empty_gpu_tiers = (
+            os.getenv("SGLANG_KT_SKIP_EMPTY_GPU_TIERS", "0") == "1"
+        )
+        try:
+            self._skip_empty_gpu_tiers_max_tokens = int(
+                os.getenv("SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS", "8")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS must be a positive "
+                "integer."
+            ) from exc
+        if self._skip_empty_gpu_tiers_max_tokens <= 0:
+            raise ValueError(
+                "SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS must be positive."
+            )
 
     def bridge_cuda_graph_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         return self.graph_state_bridge.copy(name, tensor)
@@ -1656,16 +1726,61 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             mark_stage() if log_diagnostics and self._diag_timing else 0.0
         )
 
-        submitted_remote_tiers = [
-            tier for tier in self.remote_tiers if tier.submit(x, topk_ids, topk_weights)
+        # Start CPU work before resolving the optional GPU-tier gate so the
+        # tiny presence D2H can overlap the host expert computation.
+        remote_topk_ids = [
+            tier.remap_routes(topk_ids) if tier.prepared is not None else None
+            for tier in self.remote_tiers
         ]
+        num_routed_rows = int(x.reshape(-1, x.shape[-1]).shape[0])
+        gate_empty_tiers = (
+            self._skip_empty_gpu_tiers
+            and num_routed_rows <= self._skip_empty_gpu_tiers_max_tokens
+        )
+        primary_enabled = self.num_gpu_experts > 0
+        remote_enabled = [route_ids is not None for route_ids in remote_topk_ids]
+        if gate_empty_tiers:
+            presence_inputs = []
+            primary_presence_index = None
+            remote_presence_indices: list[Optional[int]] = []
+            if primary_enabled:
+                primary_presence_index = len(presence_inputs)
+                presence_inputs.append(gpu_topk_ids)
+            for route_ids in remote_topk_ids:
+                if route_ids is None:
+                    remote_presence_indices.append(None)
+                else:
+                    remote_presence_indices.append(len(presence_inputs))
+                    presence_inputs.append(route_ids)
+            tier_presence = _resolve_gpu_tier_presence(presence_inputs)
+            if primary_presence_index is not None:
+                primary_enabled = tier_presence[primary_presence_index]
+            remote_enabled = [
+                False if index is None else tier_presence[index]
+                for index in remote_presence_indices
+            ]
+        after_route_gate = (
+            mark_stage() if log_diagnostics and self._diag_timing else 0.0
+        )
+
+        submitted_remote_tiers = []
+        for tier, compact_topk_ids, enabled in zip(
+            self.remote_tiers, remote_topk_ids, remote_enabled
+        ):
+            if enabled and tier.submit(
+                x,
+                topk_ids,
+                topk_weights,
+                compact_topk_ids=compact_topk_ids,
+            ):
+                submitted_remote_tiers.append(tier)
         after_remote_submit = (
             mark_stage(helper_devices=True)
             if log_diagnostics and self._diag_timing
             else 0.0
         )
 
-        if self.num_gpu_experts > 0:
+        if primary_enabled:
             gpu_topk_output = topk_output._replace(topk_ids=gpu_topk_ids)
             gpu_dispatch_output = dispatch_output._replace(topk_output=gpu_topk_output)
             gpu_result = self.gpu_method.apply(layer, gpu_dispatch_output)
@@ -1706,8 +1821,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 logger.info(
                     "[kt-hybrid-time] layer=%d step=%d mode=%s tokens=%d "
                     "total=%.2fms partition=%.2fms cpu_submit=%.2fms "
+                    "route_gate=%.2fms "
                     "remote_submit=%.2fms primary_gpu=%.2fms "
-                    "remote_collect=%.2fms cpu_wait=%.2fms finalize=%.2fms",
+                    "remote_collect=%.2fms cpu_wait=%.2fms finalize=%.2fms "
+                    "skipped_primary=%d skipped_remote=%d",
                     self.kt_config.layer_idx,
                     self._diag_step,
                     "deep-serialized" if self._diag_deep else "launch",
@@ -1715,11 +1832,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     (timing_end - timing_start) * 1000.0,
                     (after_partition - timing_start) * 1000.0,
                     (after_cpu_submit - after_partition) * 1000.0,
-                    (after_remote_submit - after_cpu_submit) * 1000.0,
+                    (after_route_gate - after_cpu_submit) * 1000.0,
+                    (after_remote_submit - after_route_gate) * 1000.0,
                     (after_primary_gpu - after_remote_submit) * 1000.0,
                     (after_remote_collect - after_primary_gpu) * 1000.0,
                     (after_cpu_wait - cpu_wait_start) * 1000.0,
                     (timing_end - after_cpu_wait) * 1000.0,
+                    int(self.num_gpu_experts > 0 and not primary_enabled),
+                    sum(
+                        route_ids is not None and not enabled
+                        for route_ids, enabled in zip(remote_topk_ids, remote_enabled)
+                    ),
                 )
             if route_summaries is not None:
                 logger.info(

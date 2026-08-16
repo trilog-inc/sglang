@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     _kt_diagnostic_layer_selected,
     _moe_layer_indices,
     _resolve_remote_expert_transport,
+    _resolve_gpu_tier_presence,
     _summarize_route_counts,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
@@ -39,6 +40,17 @@ def test_diagnostic_layer_selector_accepts_list_and_all():
     assert _kt_diagnostic_layer_selected(21, "all")
     with pytest.raises(ValueError, match="comma-separated"):
         _kt_diagnostic_layer_selected(2, "2,nope")
+
+
+def test_gpu_tier_presence_resolves_all_tiers_with_one_result_vector():
+    primary_ids = torch.tensor([[-1, 0, -1]])
+    empty_helper_ids = torch.full((1, 3), -1)
+    active_helper_ids = torch.tensor([[2, -1, -1]])
+
+    assert _resolve_gpu_tier_presence(
+        [primary_ids, empty_helper_ids, active_helper_ids]
+    ) == (True, False, True)
+    assert _resolve_gpu_tier_presence([]) == ()
 
 
 def test_remote_expert_transport_prefers_bidirectional_p2p(monkeypatch):

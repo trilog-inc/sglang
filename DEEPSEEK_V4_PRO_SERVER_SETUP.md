@@ -1365,6 +1365,28 @@ Save both the server log and this JSON. Compare the target verification width
 (`tokens` in the KT log) with `correct_len`/`commit_lens` in the DSpark records.
 Unset all four diagnostic variables before the final throughput benchmark.
 
+For an exact A/B of the empty-tier launch optimization found during the
+target-only profile, enable the gate before startup:
+
+```bash
+export SGLANG_KT_SKIP_EMPTY_GPU_TIERS=1
+export SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS=8
+```
+
+The gate resolves primary/helper route presence with one tiny device-to-host
+copy and skips GPU tiers with no assignments. It covers batch-one target decode
+and a six-row DSpark verification window while leaving larger prefills fully
+asynchronous. It is opt-in because the synchronization cost depends on the
+PCIe topology and route coverage. Compare a warmed 256-token decode with the
+gate set to `0` and `1`; `[kt-hybrid-time]` reports `route_gate`,
+`skipped_primary`, and `skipped_remote`. Keep it only when end-to-end throughput
+improves.
+
+Frequency placement now reports total and per-tier predicted route coverage at
+startup. Preserve those lines with the resulting throughput report; a higher
+total coverage can still perform poorly if the host-transport helper receives
+too few routes to repay its fixed invocation cost.
+
 ## Reference links
 
 - [Implementation strategy](DEEPSEEK_V4_PRO_SINGLE_SERVER_STRATEGY.md)
