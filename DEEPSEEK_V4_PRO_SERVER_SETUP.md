@@ -995,6 +995,25 @@ declare `torch==2.11.0`; do not downgrade the SGLang environment to Torch
 - Set `CPUINFER_FORCE_REBUILD=1` and rebuild from a clean CMake cache.
 - Confirm PyTorch sees capability `(12, 0)` for the RTX PRO 6000.
 
+### `fp8e4nv not supported in this architecture` on the DSpark draft
+
+The MTP checkpoint contains block-FP8 dense projection weights in addition to
+its MXFP4 expert banks. RTX 3090 GPUs (SM86) can store those FP8 weights but
+cannot execute native FP8 tensor-core GEMMs. The supported path is SGLang's
+weight-only FP8 Marlin fallback; startup should print:
+
+```text
+Your GPU does not have native support for FP8 computation ... Marlin kernel
+```
+
+If the first request instead fails in `main_proj` /
+`triton_w8a8_block_fp8_linear` with `fp8e4nv not supported`, the checkout is
+older than the heterogeneous-device capability fix: its Marlin probe inspected
+the SM120 target (`cuda:0`) while constructing the SM86 draft (`cuda:1`). Pull
+the current `codex/dsv4` branch and restart. Do not use
+`SGLANG_FORCE_FP8_MARLIN=1` as a blanket workaround: that process-wide setting
+also repacks target linears on the Blackwell GPU.
+
 ### `sparse_mla_sm120_decode_dsv4` reports an unsupported shape or illegal memory access
 
 The FlashInfer SM120 sparse-MLA kernel failed during eager-runner warmup. CUDA
