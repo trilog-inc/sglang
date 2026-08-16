@@ -731,6 +731,9 @@ export SGLANG_SM120_FLASHMLA_BACKEND=triton
 # CPU-offloaded 1.6T topology can exceed the generic 600-second watchdog on its
 # first JIT-heavy forward.
 export SGLANG_WARMUP_TIMEOUT=1800
+# Two tokens cover prompt processing and one decode transition. The upstream
+# default of eight is too costly for the initial CPU-offloaded smoke test.
+export SGLANG_WARMUP_MAX_NEW_TOKENS=2
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -1025,15 +1028,18 @@ Set the runbook's extended watchdog before launching:
 
 ```bash
 export SGLANG_WARMUP_TIMEOUT=1800
+export SGLANG_WARMUP_MAX_NEW_TOKENS=2
 ```
 
-Do not submit an external completion until the server prints `The server is
-fired up and ready to roll!`. Keep the GPU/host monitor running during the
-warmup. If the internal request still does not finish within 1,800 seconds,
-retry once with `--skip-server-warmup` and issue a single streaming completion
-with `max_tokens=1`; use that only as a diagnostic to distinguish very slow
-first-token execution from a stuck scheduler. Preserve the scheduler output
-from the first `Prefill batch` or `Decode batch` message through the failure.
+The updated server logs the warmup endpoint, token count, timeout, and elapsed
+time. Do not submit an external completion until it prints `The server is fired
+up and ready to roll!`. Keep the GPU/host monitor running during warmup. If the
+two-token internal request still does not finish within 1,800 seconds, retry
+once with `--skip-server-warmup --soft-watchdog-timeout 120` and issue a single
+streaming completion with `max_tokens=1`; use that only as a diagnostic to
+distinguish very slow first-token execution from a stuck scheduler. Preserve
+the scheduler and py-spy output from the first `Prefill batch` or `Decode batch`
+message through the failure.
 
 ```bash
 curl -N --max-time 1800 http://127.0.0.1:60000/v1/completions \

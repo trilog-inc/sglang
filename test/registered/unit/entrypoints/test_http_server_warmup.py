@@ -74,6 +74,7 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
         for dp_rank, (args, kwargs) in calls_by_rank.items():
             self.assertEqual(args, ("http://localhost:30000/generate",))
             self.assertEqual(kwargs["json"]["input_ids"], [10, 11, 12, 13])
+            self.assertEqual(kwargs["json"]["sampling_params"]["max_new_tokens"], 8)
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
             self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
             self.assertFalse(kwargs["ssl"])
