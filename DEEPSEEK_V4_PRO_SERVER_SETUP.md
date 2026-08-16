@@ -1310,6 +1310,61 @@ runtime. Capture `free -b`, `swapon --show`, and the planner report; do not
 disable swap on an already memory-pressured host without an administrator's
 recovery plan.
 
+### Profile hybrid decode before changing placement or quantization
+
+The target branch includes sampled diagnostics for CPU, primary-GPU, and
+helper-GPU routed experts. Enable them for one short, warmed 128-256-token
+generation:
+
+```bash
+export SGLANG_KT_HYBRID_TIMING=1
+export SGLANG_KT_HYBRID_TIMING_LAYERS=2,5,20,35,60
+export SGLANG_KT_HYBRID_TIMING_INTERVAL=16
+export SGLANG_DSPARK_DEBUG_DUMP=core,reqs,step_cpu_time,step_gpu_time,draft_gpu_time,target_verify_gpu_time
+```
+
+`[kt-hybrid-time]` reports `partition`, `cpu_submit`, remote-helper submission,
+primary GPU launch, remote collection, the blocking CPU wait, and finalization.
+The default `mode=launch` preserves normal overlap: asynchronous GPU stages are
+launch times, while `cpu_wait` is the actual host-side wait in
+`sync_forward`. For an intentionally serialized stage isolation run, also set:
+
+```bash
+export SGLANG_KT_HYBRID_TIMING_DEEP=1
+```
+
+Do not benchmark end-to-end throughput in deep mode; its synchronizations are
+supposed to slow the server. `[kt-hybrid-routes]` reports assignments, distinct
+experts, maximum rows assigned to one expert, and a multiplicity histogram.
+For example, `cpu[routes=31 unique=29 max_m=2 m_hist=m1:27,m2:2]` proves that
+nearly the entire CPU tail is running one row per expert and therefore cannot
+use an AMX kernel whose minimum is four rows.
+
+The timing switch includes route statistics by default. Set
+`SGLANG_KT_HYBRID_ROUTE_STATS=0` to omit their diagnostic GPU-to-CPU histogram
+copy, or use `SGLANG_KT_HYBRID_ROUTE_STATS=1` by itself to collect routes
+without timing. Use `SGLANG_KT_HYBRID_TIMING_LAYERS=all` only for a very short
+run because every routed layer will log.
+
+During the generation, `/v1/loads` provides the rolling acceptance summary:
+
+```bash
+curl -sS --max-time 30 \
+  'http://127.0.0.1:60000/v1/loads?include=spec' \
+  | jq '.loads[].speculative'
+```
+
+After the generation, retrieve DSpark's detailed per-step records:
+
+```bash
+curl -sS --max-time 30 http://127.0.0.1:60000/server_info \
+  | jq '.internal_states[].dspark_info_record'
+```
+
+Save both the server log and this JSON. Compare the target verification width
+(`tokens` in the KT log) with `correct_len`/`commit_lens` in the DSpark records.
+Unset all four diagnostic variables before the final throughput benchmark.
+
 ## Reference links
 
 - [Implementation strategy](DEEPSEEK_V4_PRO_SINGLE_SERVER_STRATEGY.md)

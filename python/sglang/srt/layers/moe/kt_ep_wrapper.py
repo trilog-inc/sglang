@@ -8,6 +8,20 @@ GPU-only by ``draft_worker_common.build_draft_tp_worker``.
 
 The CPU implementation consumes the checkpoint's packed E2M1 values and UE8M0
 scales directly.  It never converts the model to AMXINT4.
+
+Diagnostic environment variables (disabled by default):
+
+``SGLANG_KT_HYBRID_TIMING=1``
+    Log sampled per-layer wall-time breakdowns.  Route statistics are included
+    unless ``SGLANG_KT_HYBRID_ROUTE_STATS=0`` is set explicitly.
+``SGLANG_KT_HYBRID_TIMING_DEEP=1``
+    Synchronize after every stage so individual GPU/helper timings represent
+    completed work.  This deliberately serializes the pipeline and is only for
+    short profiling runs.
+``SGLANG_KT_HYBRID_TIMING_LAYERS=2,5,20,35,60``
+    Select instrumented layers.  Use ``all`` for every routed layer.
+``SGLANG_KT_HYBRID_TIMING_INTERVAL=16``
+    Log the first eight calls, then every Nth call for each selected layer.
 """
 
 from __future__ import annotations
@@ -15,6 +29,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
@@ -52,6 +67,72 @@ _SHARED_STAGING_BUFFER: Optional["SharedStagingBuffer"] = None
 _MXFP4_PREFILL_LAYER_REGISTRY: dict[tuple, dict[int, tuple]] = {}
 _MXFP4_LAYERWISE_MANAGERS: dict[tuple, "_Mxfp4LayerwisePrefillManager"] = {}
 _MXFP4_LAYERWISE_DISABLED_REASONS: dict[tuple, str] = {}
+
+
+@dataclass(frozen=True)
+class _KTRouteSummary:
+    assignments: int
+    active_experts: int
+    max_rows_per_expert: int
+    rows_per_expert_histogram: tuple[tuple[int, int], ...]
+
+    def format(self) -> str:
+        histogram = ",".join(
+            f"m{rows}:{experts}" for rows, experts in self.rows_per_expert_histogram
+        )
+        return (
+            f"routes={self.assignments} unique={self.active_experts} "
+            f"max_m={self.max_rows_per_expert} m_hist={histogram or '-'}"
+        )
+
+
+def _logical_route_counts_cpu(
+    logical_topk_ids: torch.Tensor, num_experts: int
+) -> torch.Tensor:
+    """Copy one compact logical-expert histogram to CPU for diagnostics."""
+    flat_ids = logical_topk_ids.detach().reshape(-1)
+    valid_ids = flat_ids[(flat_ids >= 0) & (flat_ids < num_experts)].to(torch.int64)
+    return torch.bincount(valid_ids, minlength=num_experts).to(device="cpu")
+
+
+def _summarize_route_counts(
+    logical_counts: torch.Tensor, experts_mask: torch.Tensor
+) -> _KTRouteSummary:
+    """Summarize assignment multiplicity for one tier from CPU tensors."""
+    counts = logical_counts.to(device="cpu", dtype=torch.int64)
+    mask = experts_mask.to(device="cpu", dtype=torch.bool)
+    if counts.shape != mask.shape:
+        raise ValueError(
+            "KT diagnostic route-count and tier-mask shapes differ: "
+            f"{tuple(counts.shape)} vs {tuple(mask.shape)}"
+        )
+    active_counts = counts[mask]
+    active_counts = active_counts[active_counts > 0]
+    rows = active_counts.tolist()
+    histogram: dict[int, int] = {}
+    for row_count in rows:
+        histogram[row_count] = histogram.get(row_count, 0) + 1
+    return _KTRouteSummary(
+        assignments=sum(rows),
+        active_experts=len(rows),
+        max_rows_per_expert=max(rows, default=0),
+        rows_per_expert_histogram=tuple(sorted(histogram.items())),
+    )
+
+
+def _kt_diagnostic_layer_selected(layer_idx: int, raw: str) -> bool:
+    raw = raw.strip().lower()
+    if raw == "all":
+        return True
+    try:
+        return layer_idx in {
+            int(value.strip()) for value in raw.split(",") if value.strip()
+        }
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_KT_HYBRID_TIMING_LAYERS must be 'all' or a comma-separated "
+            f"list of layer indices, got {raw!r}."
+        ) from exc
 
 
 def reset_kt_expert_placement_cache() -> None:
@@ -708,10 +789,14 @@ def _resolve_remote_expert_transport(
 ) -> tuple[str, bool]:
     """Choose direct peer copies when both transfer directions support P2P."""
     requested = (
-        requested
-        if requested is not None
-        else os.getenv("SGLANG_KT_REMOTE_EXPERT_TRANSPORT", "auto")
-    ).strip().lower()
+        (
+            requested
+            if requested is not None
+            else os.getenv("SGLANG_KT_REMOTE_EXPERT_TRANSPORT", "auto")
+        )
+        .strip()
+        .lower()
+    )
     if requested not in ("auto", "host", "p2p"):
         raise ValueError(
             "SGLANG_KT_REMOTE_EXPERT_TRANSPORT must be auto, host, or p2p, got "
@@ -719,9 +804,7 @@ def _resolve_remote_expert_transport(
         )
     peer_access = bool(
         torch.cuda.can_device_access_peer(target_device_index, helper_device_index)
-        and torch.cuda.can_device_access_peer(
-            helper_device_index, target_device_index
-        )
+        and torch.cuda.can_device_access_peer(helper_device_index, target_device_index)
     )
     if requested == "p2p" and not peer_access:
         raise RuntimeError(
@@ -878,9 +961,7 @@ class _RemoteExpertStaging:
                 assert self.host_weights is not None
                 helper_hidden.copy_(self.host_hidden[:num_tokens], non_blocking=True)
                 helper_ids.copy_(self.host_ids[:num_tokens], non_blocking=True)
-                helper_weights.copy_(
-                    self.host_weights[:num_tokens], non_blocking=True
-                )
+                helper_weights.copy_(self.host_weights[:num_tokens], non_blocking=True)
             result = apply_v4_marlin_moe(
                 hidden_states=helper_hidden,
                 prepared=prepared,
@@ -1313,6 +1394,25 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.graph_state_bridge = KTGraphStateBridge()
         self._mxfp4_pipeline_signature: Optional[tuple] = None
         self.params_dtype: Optional[torch.dtype] = None
+        self._diag_timing = os.getenv("SGLANG_KT_HYBRID_TIMING", "0") == "1"
+        route_stats_raw = os.getenv("SGLANG_KT_HYBRID_ROUTE_STATS")
+        self._diag_route_stats = (
+            self._diag_timing if route_stats_raw is None else route_stats_raw == "1"
+        )
+        self._diag_deep = os.getenv("SGLANG_KT_HYBRID_TIMING_DEEP", "0") == "1"
+        self._diag_selected = _kt_diagnostic_layer_selected(
+            self.kt_config.layer_idx,
+            os.getenv("SGLANG_KT_HYBRID_TIMING_LAYERS", "2,5,20,35,60"),
+        )
+        try:
+            self._diag_interval = max(
+                1, int(os.getenv("SGLANG_KT_HYBRID_TIMING_INTERVAL", "16"))
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_KT_HYBRID_TIMING_INTERVAL must be a positive integer."
+            ) from exc
+        self._diag_step = 0
 
     def bridge_cuda_graph_tensor(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         return self.graph_state_bridge.copy(name, tensor)
@@ -1477,6 +1577,57 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if manager is not None:
                 return manager.apply(self, layer, dispatch_output)
 
+        diagnostics_enabled = self._diag_selected and (
+            self._diag_timing or self._diag_route_stats
+        )
+        if diagnostics_enabled:
+            self._diag_step += 1
+        log_diagnostics = diagnostics_enabled and (
+            self._diag_step <= 8 or self._diag_step % self._diag_interval == 0
+        )
+        route_summaries: Optional[list[tuple[str, _KTRouteSummary]]] = None
+        invalid_routes = 0
+        if log_diagnostics and self._diag_route_stats:
+            logical_counts = _logical_route_counts_cpu(
+                topk_ids, self.gpu_experts_mask.numel()
+            )
+            valid_routes = int(logical_counts.sum())
+            invalid_routes = int(topk_ids.numel()) - valid_routes
+            route_summaries = [
+                (
+                    "primary",
+                    _summarize_route_counts(logical_counts, self.gpu_experts_mask),
+                ),
+                (
+                    "cpu",
+                    _summarize_route_counts(
+                        logical_counts, self.logical_to_cpu_index.ge(0)
+                    ),
+                ),
+            ]
+            for tier in self.remote_tiers:
+                tier_kind = "helper" if tier.host_staged else "local-tier"
+                transport = (
+                    tier.staging.transport if tier.staging is not None else "local"
+                )
+                route_summaries.append(
+                    (
+                        f"{tier_kind}@{tier.device}/{transport}",
+                        _summarize_route_counts(logical_counts, tier.experts_mask),
+                    )
+                )
+
+        def mark_stage(*, helper_devices: bool = False) -> float:
+            if log_diagnostics and self._diag_timing and self._diag_deep:
+                if helper_devices:
+                    for tier in self.remote_tiers:
+                        if tier.prepared is not None:
+                            torch.cuda.synchronize(tier.device)
+                torch.cuda.synchronize(x.device)
+            return time.perf_counter()
+
+        timing_start = mark_stage() if log_diagnostics and self._diag_timing else 0.0
+
         assert self.gpu_experts_mask_cuda is not None
         assert self.logical_to_gpu_index_cuda is not None
         assert self.logical_to_cpu_index_cuda is not None
@@ -1486,6 +1637,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self.logical_to_gpu_index_cuda,
             self.logical_to_cpu_index_cuda,
         )
+        after_partition = mark_stage() if log_diagnostics and self._diag_timing else 0.0
 
         if self.tp_rank == 0 and self.wrapper is not None:
             assert self._cpu_stream is not None
@@ -1500,10 +1652,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     topk_weights,
                     self._cpu_stream.cuda_stream,
                 )
+        after_cpu_submit = (
+            mark_stage() if log_diagnostics and self._diag_timing else 0.0
+        )
 
         submitted_remote_tiers = [
             tier for tier in self.remote_tiers if tier.submit(x, topk_ids, topk_weights)
         ]
+        after_remote_submit = (
+            mark_stage(helper_devices=True)
+            if log_diagnostics and self._diag_timing
+            else 0.0
+        )
 
         if self.num_gpu_experts > 0:
             gpu_topk_output = topk_output._replace(topk_ids=gpu_topk_ids)
@@ -1512,10 +1672,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             output = gpu_result.hidden_states
         else:
             output = torch.zeros_like(x)
+        after_primary_gpu = (
+            mark_stage() if log_diagnostics and self._diag_timing else 0.0
+        )
 
         for remote_tier in submitted_remote_tiers:
             output = output + remote_tier.collect(output.shape)
+        after_remote_collect = (
+            mark_stage(helper_devices=True)
+            if log_diagnostics and self._diag_timing
+            else 0.0
+        )
 
+        cpu_wait_start = (
+            time.perf_counter() if log_diagnostics and self._diag_timing else 0.0
+        )
         if self.tp_rank == 0 and self.wrapper is not None:
             assert staged is not None
             assert self._cpu_stream is not None
@@ -1527,6 +1698,41 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 self._cpu_done_event.record(self._cpu_stream)
             torch.cuda.current_stream(x.device).wait_event(self._cpu_done_event)
             output = output + cpu_output.reshape_as(output)
+        after_cpu_wait = mark_stage() if log_diagnostics and self._diag_timing else 0.0
+
+        if log_diagnostics:
+            if self._diag_timing:
+                timing_end = mark_stage(helper_devices=True)
+                logger.info(
+                    "[kt-hybrid-time] layer=%d step=%d mode=%s tokens=%d "
+                    "total=%.2fms partition=%.2fms cpu_submit=%.2fms "
+                    "remote_submit=%.2fms primary_gpu=%.2fms "
+                    "remote_collect=%.2fms cpu_wait=%.2fms finalize=%.2fms",
+                    self.kt_config.layer_idx,
+                    self._diag_step,
+                    "deep-serialized" if self._diag_deep else "launch",
+                    int(x.reshape(-1, x.shape[-1]).shape[0]),
+                    (timing_end - timing_start) * 1000.0,
+                    (after_partition - timing_start) * 1000.0,
+                    (after_cpu_submit - after_partition) * 1000.0,
+                    (after_remote_submit - after_cpu_submit) * 1000.0,
+                    (after_primary_gpu - after_remote_submit) * 1000.0,
+                    (after_remote_collect - after_primary_gpu) * 1000.0,
+                    (after_cpu_wait - cpu_wait_start) * 1000.0,
+                    (timing_end - after_cpu_wait) * 1000.0,
+                )
+            if route_summaries is not None:
+                logger.info(
+                    "[kt-hybrid-routes] layer=%d step=%d tokens=%d invalid=%d %s",
+                    self.kt_config.layer_idx,
+                    self._diag_step,
+                    int(x.reshape(-1, x.shape[-1]).shape[0]),
+                    invalid_routes,
+                    " ".join(
+                        f"{name}[{summary.format()}]"
+                        for name, summary in route_summaries
+                    ),
+                )
 
         return StandardCombineInput(hidden_states=output)
 

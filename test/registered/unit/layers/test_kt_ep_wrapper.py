@@ -9,13 +9,36 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTRemoteExpertTierConfig,
     _Mxfp4LayerwisePrefillManager,
     _RemoteExpertTier,
+    _kt_diagnostic_layer_selected,
     _moe_layer_indices,
     _resolve_remote_expert_transport,
+    _summarize_route_counts,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
     partition_and_remap_expert_ids,
 )
 from sglang.srt.server_args import ServerArgs
+
+
+def test_route_summary_reports_expert_row_multiplicity():
+    counts = torch.tensor([0, 1, 3, 2, 1, 0], dtype=torch.int64)
+    tier_mask = torch.tensor([False, True, True, False, True, False])
+
+    summary = _summarize_route_counts(counts, tier_mask)
+
+    assert summary.assignments == 5
+    assert summary.active_experts == 3
+    assert summary.max_rows_per_expert == 3
+    assert summary.rows_per_expert_histogram == ((1, 2), (3, 1))
+    assert summary.format() == "routes=5 unique=3 max_m=3 m_hist=m1:2,m3:1"
+
+
+def test_diagnostic_layer_selector_accepts_list_and_all():
+    assert _kt_diagnostic_layer_selected(20, "2,5,20,35,60")
+    assert not _kt_diagnostic_layer_selected(21, "2,5,20,35,60")
+    assert _kt_diagnostic_layer_selected(21, "all")
+    with pytest.raises(ValueError, match="comma-separated"):
+        _kt_diagnostic_layer_selected(2, "2,nope")
 
 
 def test_remote_expert_transport_prefers_bidirectional_p2p(monkeypatch):
