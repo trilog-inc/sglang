@@ -836,8 +836,10 @@ The MTP startup log must report primary draft `cuda:1`, helper `cuda:3`, counts
 `(192, 192)`, an `mtp.N` weight prefix for every draft stage, and no CPU-resident
 draft experts. Vocabulary operations intentionally execute on `cuda:0` so the
 two 24 GiB devices do not duplicate the target embedding and LM-head weights.
-This first version uses synchronous cross-device vocabulary transfers and must
-remain eager.
+The two-device draft itself remains eager because expert and vocabulary work
+cross CUDA devices. This no longer requires making the independent target
+model eager: the performance launch below keeps the target's breakable decode
+graph enabled.
 
 The MTP smoke launch deliberately uses `--mem-fraction-static 0.912`, while the
 target-only launch remains at `0.89`. On the measured first RTX 3090, draft
@@ -895,7 +897,152 @@ Do not substitute tensor parallelism across these heterogeneous GPUs. Do not
 put target experts on either RTX 3090, and do not let Linux swap the expert bank
 from disk during decode.
 
-## 15. Preserve the audit bundle
+## 15. Performance tuning after the correctness smoke test
+
+The Kimi K2 result is evidence that the host and memory channels can sustain a
+much faster hybrid model, but it is not an equal software path. The documented
+Kimi fast launch uses more CPU workers, permits one deferred expert, and sends
+long prefills through a layerwise GPU streamer. The DSV4 smoke launch above is
+deliberately at the opposite extreme: 54 CPU workers on the measured run, no
+deferred routes, uniform resident experts, CPU MXFP4 for every non-resident
+prefill route, eager target decode, and conservative scheduling. Model byte
+size alone therefore does not predict equal throughput.
+
+Change one variable at a time and save the full server log and response JSON
+for every run. Use at least one 2K-or-longer prompt and a 128-token decode after
+the first warm request; a one-token request mostly measures fixed overhead.
+The response `meta_info` reports `spec_accept_length` and `spec_accept_rate`.
+If the average accepted length is below about 2, DSpark overhead can exceed the
+tokens it saves, so retain a target-only result as the control.
+
+### 15.1 Enable the target decode graph
+
+The updated branch separates the graph policies: a draft split across
+`cuda:1` and `cuda:3` stays eager, while the target on `cuda:0` uses a
+breakable decode graph around KT's eager CPU and helper-GPU calls. Start from
+the two-device MTP command in Section 14, remove `--disable-cuda-graph`, and add
+these explicit phase settings:
+
+```bash
+  --cuda-graph-backend-decode breakable \
+  --cuda-graph-backend-prefill disabled \
+```
+
+Keep `--disable-overlap-schedule` for this first graph comparison. Startup must
+include:
+
+```text
+Keeping the two-device DSpark draft eager while the target decode CUDA graph remains enabled.
+```
+
+If graph capture exceeds the RTX PRO 6000 reserve, restore
+`--disable-cuda-graph`; do not raise `--mem-fraction-static` to hide that OOM.
+
+### 15.2 Use direct peer transport when the topology permits it
+
+Remote target experts now choose bidirectional CUDA P2P automatically. Each
+tier logs either `transport=p2p` or `transport=host`. P2P removes the four-leg
+GPU-to-host-to-GPU bounce for every helper invocation. A system or IOMMU that
+does not expose peer access safely retains the pinned-host path.
+
+```bash
+nvidia-smi topo -m
+nvidia-smi topo -p2p r
+unset SGLANG_KT_REMOTE_EXPERT_TRANSPORT  # auto is the default
+```
+
+For an A/B or a driver-topology bisect, force the old path with
+`SGLANG_KT_REMOTE_EXPERT_TRANSPORT=host`. Do not force `p2p` unless both
+directions are reported as available; startup intentionally fails instead of
+silently using an unintended transport.
+
+### 15.3 Give MXFP4 inference the complete physical-core budget
+
+`--kt-cpuinfer` is the total worker count and is divided across the two NUMA
+pools. Do not derive it from SMT threads. Count physical cores and inspect the
+NUMA mapping first:
+
+```bash
+lscpu -p=CORE,SOCKET | rg -v '^#' | sort -u | wc -l
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+numactl --hardware
+```
+
+The prior DSV4 run used 54 workers while the Kimi launch used 96. Test 96 first
+if the inventory shows at least 96 physical cores across NUMA nodes 0 and 1,
+then compare 80 and 64. Keep `--kt-threadpool-count 2 --kt-numa-nodes 0 1`.
+Watch memory bandwidth and CPU frequency; SMT siblings or excessive workers can
+reduce rather than improve this bandwidth-bound kernel.
+
+For DSpark, separately compare
+`--kt-mxfp4-amx-min-tokens-per-expert 1`, `2`, and `4`. Verification presents
+more tokens to the target than ordinary batch-one decode, so the best AMX
+cutover may differ from the correctness default of 4.
+
+### 15.4 Replace uniform placement with measured route coverage
+
+The current `(26, 10)` uniform tiers reserve 36 of 384 logical experts per
+layer but do not ensure that those experts are frequently selected. Record a
+representative prompt set once by adding these options to a stable launch:
+
+```bash
+  --expert-distribution-recorder-mode stat \
+  --expert-distribution-recorder-buffer-size -1 \
+```
+
+Then bracket only the representative requests:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:60000/start_expert_distribution_record
+# Send the representative prompts here.
+curl -fsS -X POST http://127.0.0.1:60000/stop_expert_distribution_record
+curl -fsS -X POST http://127.0.0.1:60000/dump_expert_distribution_record
+find "$SGLANG_SRC" -maxdepth 1 -name 'expert_distribution_recorder_*.pt' -printf '%T@ %p\n' | sort -n
+```
+
+Copy the newest file into `$DSV4_REPORT`, restart, and replace the uniform
+options with:
+
+```bash
+  --kt-expert-placement-strategy frequency \
+  --kt-expert-frequency-file "$DSV4_REPORT/expert_distribution_recorder.pt" \
+```
+
+Startup reports `coverage=...%`. That route coverage, rather than 36/384, is
+the useful predictor. The profile is workload-specific and must be recaptured
+after a material prompt-domain change.
+
+### 15.5 Test the optional approximation and scheduler overlap last
+
+`--kt-max-deferred-experts-per-token 1` skips the lowest-weight CPU expert on
+eligible layers and is the same performance/quality trade used by the Kimi
+guide. It is not bit-exact, so compare task quality and target-only output
+before adopting it. The final layer remains exact automatically.
+
+Once graphs, CPU workers, and placement are measured, remove
+`--disable-overlap-schedule` for a separate A/B. Do not combine that change
+with a different DSpark block size. Log `spec_accept_length`, decode tok/s,
+time-to-first-token, host bandwidth, and per-GPU utilization for every run.
+
+### 15.6 Remaining high-impact prefill work
+
+The 150+ tok/s Kimi path uses `--kt-gpu-prefill-token-threshold 400`, which
+streams a complete layer through a GPU once the prompt is long enough. DSV4
+currently requires threshold 0 with a remote target expert tier because the
+full 384-expert prepared slot does not fit in the RTX PRO 6000's remaining
+reserve and ten source experts live only on the RTX 4090. Simply setting the
+Kimi flag is rejected intentionally.
+
+The next implementation milestone is a bounded MXFP4 window streamer: load
+only a small window of CPU experts into reusable Marlin slots on `cuda:0`, run
+the window's routed tokens, accumulate its result, and leave the 26 local plus
+10 remote experts on their resident paths. That caps VRAM while changing long
+prefill from repeated CPU matrix work to approximately one sequential pass
+over the host expert bank. It is the change most likely to close the prefill
+gap, but it needs parity and memory-pressure testing on the server before it
+can replace the exact smoke path.
+
+## 16. Preserve the audit bundle
 
 Capture a final state snapshot for comparison with later runtime branches:
 
@@ -914,7 +1061,7 @@ Keep the report directory with the eventual benchmark results. At minimum it
 should contain source commits, the exact model revision, package resolutions,
 hardware inventory, topology, planner output, and parity-test output.
 
-## 16. Updating these branches later
+## 17. Updating these branches later
 
 Never pull new source into a running server process. Stop the process, activate
 the environment, fast-forward each clean worktree, then rebuild KT-Kernel.

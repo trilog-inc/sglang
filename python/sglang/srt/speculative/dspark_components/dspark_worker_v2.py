@@ -22,6 +22,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
@@ -79,6 +80,19 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+def _should_capture_dspark_draft_cuda_graph(
+    *, target_decode_graph_disabled: bool, draft_helper_gpu_id: Optional[int]
+) -> bool:
+    """Keep only a cross-device DSpark draft eager.
+
+    A two-device draft performs remote expert and target-hosted vocabulary
+    operations between draft stages.  Those operations cannot be captured as
+    one draft graph, but they do not require disabling the target's independent
+    breakable decode graph.
+    """
+    return not target_decode_graph_disabled and draft_helper_gpu_id is None
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -547,7 +561,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        target_decode_graph_disabled = (
+            get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+        )
+        capture_decode_cuda_graph = _should_capture_dspark_draft_cuda_graph(
+            target_decode_graph_disabled=target_decode_graph_disabled,
+            draft_helper_gpu_id=self.draft_helper_gpu_id,
+        )
+        if self.draft_helper_gpu_id is not None and not target_decode_graph_disabled:
+            logger.info(
+                "Keeping the two-device DSpark draft eager while the target "
+                "decode CUDA graph remains enabled."
+            )
         if is_cuda() and capture_decode_cuda_graph:
             with draft_cuda_device_context(self.draft_gpu_id):
                 available_mem = get_available_gpu_memory(self.device, self.draft_gpu_id)

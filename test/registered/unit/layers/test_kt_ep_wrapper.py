@@ -10,11 +10,50 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     _Mxfp4LayerwisePrefillManager,
     _RemoteExpertTier,
     _moe_layer_indices,
+    _resolve_remote_expert_transport,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
     partition_and_remap_expert_ids,
 )
 from sglang.srt.server_args import ServerArgs
+
+
+def test_remote_expert_transport_prefers_bidirectional_p2p(monkeypatch):
+    calls = []
+
+    def can_access(source, destination):
+        calls.append((source, destination))
+        return True
+
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", can_access)
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "auto")
+
+    assert transport == "p2p"
+    assert peer_access
+    assert calls == [(0, 2), (2, 0)]
+
+
+def test_remote_expert_transport_falls_back_without_reverse_p2p(monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda,
+        "can_device_access_peer",
+        lambda source, destination: (source, destination) == (0, 2),
+    )
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "auto")
+
+    assert transport == "host"
+    assert not peer_access
+
+
+def test_remote_expert_transport_can_force_host_for_bisect(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda *_args: True)
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "host")
+
+    assert transport == "host"
+    assert peer_access
 
 
 def test_graph_state_bridge_reuses_largest_stable_buffer():

@@ -100,13 +100,14 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args.speculative_draft_device = "cuda:2"
         server_args.speculative_draft_helper_device = "cuda:3"
         server_args.speculative_draft_num_gpu_experts_per_device = [192, 192]
-        server_args.disable_cuda_graph = True
+        server_args.disable_cuda_graph = False
 
         _handle_dspark(server_args)
 
         self.assertEqual(
             server_args.speculative_draft_num_gpu_experts_per_device, [192, 192]
         )
+        self.assertFalse(server_args.disable_cuda_graph)
 
     def test_two_device_draft_rejects_incomplete_expert_partition(self):
         server_args = _make_dspark_server_args(

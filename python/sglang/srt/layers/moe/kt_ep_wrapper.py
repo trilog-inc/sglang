@@ -701,8 +701,39 @@ def partition_and_remap_expert_ids(
     return cpu_ids, gpu_ids
 
 
+def _resolve_remote_expert_transport(
+    target_device_index: int,
+    helper_device_index: int,
+    requested: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Choose direct peer copies when both transfer directions support P2P."""
+    requested = (
+        requested
+        if requested is not None
+        else os.getenv("SGLANG_KT_REMOTE_EXPERT_TRANSPORT", "auto")
+    ).strip().lower()
+    if requested not in ("auto", "host", "p2p"):
+        raise ValueError(
+            "SGLANG_KT_REMOTE_EXPERT_TRANSPORT must be auto, host, or p2p, got "
+            f"{requested!r}."
+        )
+    peer_access = bool(
+        torch.cuda.can_device_access_peer(target_device_index, helper_device_index)
+        and torch.cuda.can_device_access_peer(
+            helper_device_index, target_device_index
+        )
+    )
+    if requested == "p2p" and not peer_access:
+        raise RuntimeError(
+            "Direct KT remote-expert transport was requested, but CUDA peer "
+            f"access is unavailable between cuda:{target_device_index} and "
+            f"cuda:{helper_device_index}. Use host or auto transport."
+        )
+    return ("p2p" if peer_access and requested != "host" else "host"), peer_access
+
+
 class _RemoteExpertStaging:
-    """Reusable pinned transport buffers for one helper CUDA device."""
+    """Reusable direct-peer or pinned-host transport for one helper GPU."""
 
     def __init__(
         self,
@@ -720,33 +751,47 @@ class _RemoteExpertStaging:
         self.dtype = dtype
         self.target_device = target_device
         self.helper_device = helper_device
-        try:
-            self.host_hidden = torch.empty(
-                (max_tokens, hidden_size), dtype=dtype, device="cpu", pin_memory=True
-            )
-            self.host_ids = torch.empty(
-                (max_tokens, top_k),
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-            self.host_weights = torch.empty(
-                (max_tokens, top_k),
-                dtype=torch.float32,
-                device="cpu",
-                pin_memory=True,
-            )
-            self.host_output = torch.empty(
-                (max_tokens, hidden_size),
-                dtype=dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "Remote KT expert tiers require reusable pinned host transport "
-                "buffers; reduce --chunked-prefill-size or free locked memory."
-            ) from exc
+        if target_device.index is None or helper_device.index is None:
+            raise ValueError("Remote KT expert transport requires indexed CUDA devices")
+        self.transport, self.peer_access = _resolve_remote_expert_transport(
+            target_device.index, helper_device.index
+        )
+        self.host_hidden = None
+        self.host_ids = None
+        self.host_weights = None
+        self.host_output = None
+        if self.transport == "host":
+            try:
+                self.host_hidden = torch.empty(
+                    (max_tokens, hidden_size),
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.host_ids = torch.empty(
+                    (max_tokens, top_k),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.host_weights = torch.empty(
+                    (max_tokens, top_k),
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                self.host_output = torch.empty(
+                    (max_tokens, hidden_size),
+                    dtype=dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Remote KT expert tiers require reusable pinned host transport "
+                    "buffers when CUDA P2P is unavailable; reduce "
+                    "--chunked-prefill-size or free locked memory."
+                ) from exc
 
         with torch.cuda.device(helper_device):
             self.helper_hidden = torch.empty(
@@ -769,8 +814,10 @@ class _RemoteExpertStaging:
                 (max_tokens, hidden_size), dtype=dtype, device=target_device
             )
             self.target_ready = torch.cuda.Event()
+            self.target_collected = torch.cuda.Event()
 
         self._in_flight_tokens = 0
+        self._target_copy_pending = False
 
     def submit(
         self,
@@ -799,21 +846,41 @@ class _RemoteExpertStaging:
             )
 
         target_stream = torch.cuda.current_stream(self.target_device)
-        self.host_hidden[:num_tokens].copy_(flat_hidden, non_blocking=True)
-        self.host_ids[:num_tokens].copy_(topk_ids, non_blocking=True)
-        self.host_weights[:num_tokens].copy_(topk_weights, non_blocking=True)
+        if self.transport == "host":
+            assert self.host_hidden is not None
+            assert self.host_ids is not None
+            assert self.host_weights is not None
+            self.host_hidden[:num_tokens].copy_(flat_hidden, non_blocking=True)
+            self.host_ids[:num_tokens].copy_(topk_ids, non_blocking=True)
+            self.host_weights[:num_tokens].copy_(topk_weights, non_blocking=True)
         self.target_ready.record(target_stream)
 
         with torch.cuda.device(self.helper_device), torch.cuda.stream(
             self.helper_stream
         ):
+            if self._target_copy_pending:
+                # The prior collect is asynchronous on the target stream.  Do
+                # not overwrite helper_output (P2P) or host_output (fallback)
+                # until that target-side copy has consumed it.
+                self.helper_stream.wait_event(self.target_collected)
+                self._target_copy_pending = False
             self.helper_stream.wait_event(self.target_ready)
             helper_hidden = self.helper_hidden[:num_tokens]
             helper_ids = self.helper_ids[:num_tokens]
             helper_weights = self.helper_weights[:num_tokens]
-            helper_hidden.copy_(self.host_hidden[:num_tokens], non_blocking=True)
-            helper_ids.copy_(self.host_ids[:num_tokens], non_blocking=True)
-            helper_weights.copy_(self.host_weights[:num_tokens], non_blocking=True)
+            if self.transport == "p2p":
+                helper_hidden.copy_(flat_hidden, non_blocking=True)
+                helper_ids.copy_(topk_ids, non_blocking=True)
+                helper_weights.copy_(topk_weights, non_blocking=True)
+            else:
+                assert self.host_hidden is not None
+                assert self.host_ids is not None
+                assert self.host_weights is not None
+                helper_hidden.copy_(self.host_hidden[:num_tokens], non_blocking=True)
+                helper_ids.copy_(self.host_ids[:num_tokens], non_blocking=True)
+                helper_weights.copy_(
+                    self.host_weights[:num_tokens], non_blocking=True
+                )
             result = apply_v4_marlin_moe(
                 hidden_states=helper_hidden,
                 prepared=prepared,
@@ -823,9 +890,11 @@ class _RemoteExpertStaging:
                 swiglu_limit=swiglu_limit,
             )
             self.helper_output[:num_tokens].copy_(result)
-            self.host_output[:num_tokens].copy_(
-                self.helper_output[:num_tokens], non_blocking=True
-            )
+            if self.transport == "host":
+                assert self.host_output is not None
+                self.host_output[:num_tokens].copy_(
+                    self.helper_output[:num_tokens], non_blocking=True
+                )
             self.helper_done.record(self.helper_stream)
         self._in_flight_tokens = num_tokens
 
@@ -838,7 +907,13 @@ class _RemoteExpertStaging:
         target_stream = torch.cuda.current_stream(self.target_device)
         target_stream.wait_event(self.helper_done)
         result = self.target_output[:num_tokens]
-        result.copy_(self.host_output[:num_tokens], non_blocking=True)
+        if self.transport == "p2p":
+            result.copy_(self.helper_output[:num_tokens], non_blocking=True)
+        else:
+            assert self.host_output is not None
+            result.copy_(self.host_output[:num_tokens], non_blocking=True)
+        self.target_collected.record(target_stream)
+        self._target_copy_pending = True
         self._in_flight_tokens = 0
         return result.view(output_shape)
 
@@ -1075,19 +1150,14 @@ class _RemoteExpertTier:
             )
         logger.info(
             "KT %s prepared expert tier ready: layer=%d device=%s experts=%d "
-            "backend=%s peer_access=%s",
+            "backend=%s transport=%s peer_access=%s",
             tier_kind,
             owner.kt_config.layer_idx,
             self.device,
             num_experts,
             self.config.backend,
-            (
-                torch.cuda.can_device_access_peer(
-                    target_device.index, self.device.index
-                )
-                if self.host_staged
-                else True
-            ),
+            self.staging.transport if self.staging is not None else "local",
+            self.staging.peer_access if self.staging is not None else True,
         )
 
     def submit(

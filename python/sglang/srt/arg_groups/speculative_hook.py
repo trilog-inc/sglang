@@ -343,12 +343,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "Two-device DSpark expert placement currently requires a bundled "
                 "DeepSeek-V4 MTP checkpoint."
             )
-        if not server_args.disable_cuda_graph:
-            raise ValueError(
-                "Two-device DSpark expert placement currently requires "
-                "--disable-cuda-graph because target-hosted vocabulary operations "
-                "and remote expert transport cross CUDA devices."
-            )
         server_args.speculative_draft_num_gpu_experts_per_device = counts
 
     if server_args.enable_dp_attention:
