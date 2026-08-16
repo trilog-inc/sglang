@@ -1014,6 +1014,15 @@ the current `codex/dsv4` branch and restart. Do not use
 `SGLANG_FORCE_FP8_MARLIN=1` as a blanket workaround: that process-wide setting
 also repacks target linears on the Blackwell GPU.
 
+If a one-token request succeeds but a longer request fails in
+`dequantize_k_cache_paged` with the same `fp8e4nv` message, dense-layer Marlin
+selection is already fixed and the failure is the next Ampere boundary: the
+draft starts reading its packed SWA cache on the following decode step. Pull a
+version containing the pre-SM89 byte-dequantization fallback and restart. That
+path keeps the cache compact, decodes E4M3 through a 256-entry BF16 lookup table
+inside Triton, and never exposes an unsupported FP8 pointer to the SM86
+compiler. It does not change the native FP8 cache path used by the SM120 target.
+
 ### `sparse_mla_sm120_decode_dsv4` reports an unsupported shape or illegal memory access
 
 The FlashInfer SM120 sparse-MLA kernel failed during eager-runner warmup. CUDA

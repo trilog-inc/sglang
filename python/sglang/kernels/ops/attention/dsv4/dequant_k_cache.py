@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -19,6 +20,31 @@ TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
 NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+
+
+def _can_use_native_fp8_triton(device: torch.device) -> bool:
+    """Whether Triton accepts an E4M3FN pointer on ``device``.
+
+    NVIDIA introduced native E4M3 support with SM89.  Ampere can retain the
+    compact byte representation used by the DSV4 cache, but Triton rejects an
+    E4M3FN pointer while compiling for SM80/SM86.  ROCm uses E4M3FNUZ and does
+    not follow the NVIDIA compute-capability boundary.
+    """
+    if torch.version.hip is not None:
+        return True
+    major, minor = torch.cuda.get_device_capability(device)
+    return major * 10 + minor >= 89
+
+
+@lru_cache(maxsize=None)
+def _get_fp8_bf16_lut(device_type: str, device_index: Optional[int]) -> torch.Tensor:
+    """Build the exact E4M3-to-BF16 table used by the pre-SM89 kernel."""
+    fp8_bits = torch.arange(256, dtype=torch.int16).to(torch.uint8)
+    return (
+        fp8_bits.view(fp8_dtype)
+        .to(torch.bfloat16)
+        .to(torch.device(device_type, device_index))
+    )
 
 
 def dequantize_k_cache_paged(
@@ -50,8 +76,9 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Typed views over the same underlying bytes.  Do not construct/pass an
+    # FP8 pointer on pre-SM89 NVIDIA GPUs: Triton rejects fp8e4nv in the kernel
+    # signature before it can lower any instructions.
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -65,13 +92,7 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
-    _dequantize_k_cache_paged_kernel[(num_tokens,)](
-        out,
-        buf_fp8,
-        buf_bf16,
-        buf_uint8,
-        page_table_1_flattened,
-        out.stride(0),
+    kernel_args = dict(
         BYTES_PER_PAGE=bytes_per_page,
         PAGE_SIZE=page_size,
         DIM_NOPE=DIM_NOPE,
@@ -82,6 +103,30 @@ def dequantize_k_cache_paged(
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
     )
+    if _can_use_native_fp8_triton(quant_k_cache.device):
+        buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+        _dequantize_k_cache_paged_kernel[(num_tokens,)](
+            out,
+            buf_fp8,
+            buf_bf16,
+            buf_uint8,
+            page_table_1_flattened,
+            out.stride(0),
+            **kernel_args,
+        )
+    else:
+        fp8_bf16_lut = _get_fp8_bf16_lut(
+            quant_k_cache.device.type, quant_k_cache.device.index
+        )
+        _dequantize_k_cache_paged_u8_kernel[(num_tokens,)](
+            out,
+            buf_bf16,
+            buf_uint8,
+            fp8_bf16_lut,
+            page_table_1_flattened,
+            out.stride(0),
+            **kernel_args,
+        )
     return out
 
 
@@ -120,6 +165,57 @@ def _dequantize_k_cache_paged_kernel(
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
         fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+
+        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+
+        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
+        tl.store(
+            output_ptr + out_off,
+            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+        )
+
+    rope_offs = tl.arange(0, DIM_ROPE)
+    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+    rope_data = tl.load(buf_bf16_ptr + bf16_off)
+    tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+@triton.jit
+def _dequantize_k_cache_paged_u8_kernel(
+    output_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    fp8_bf16_lut_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    """Pre-SM89 variant that never exposes an FP8 pointer to Triton."""
+    token_id = tl.program_id(0)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+    )
+    out_row_base = token_id * output_stride_0
+
+    nope_offs = tl.arange(0, TILE_SIZE)
+    for tile_id in tl.static_range(NUM_SCALE_TILES):
+        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
+        fp8_bits = tl.load(buf_uint8_ptr + fp8_off).to(tl.int32)
+        fp8_vals = tl.load(fp8_bf16_lut_ptr + fp8_bits).to(tl.float32)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
