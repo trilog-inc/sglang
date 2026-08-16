@@ -760,6 +760,27 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
+
+        # DSV4 uses a 256-token paged allocator around a much smaller SWA
+        # window (128 tokens in the current checkpoints).  Admission needs
+        # room for the live window, the current paged extend, and the next page
+        # that lets chunked prefill/decode cross a page boundary.  If the pool
+        # is smaller, PrefillAdder cannot form even its first safe batch: the
+        # request remains in waiting_queue and the scheduler spins at 100% CPU
+        # while the GPUs remain idle.  This is easy to hit with a deliberately
+        # small --max-total-tokens value because the normal 0.1 ratio rounds a
+        # 4096-token full pool down to a single 256-token SWA page.
+        min_swa_tokens = ceil_align(self.swa_page_size + 2 * page_size, page_size)
+        if swa_tokens < min_swa_tokens:
+            min_ratio = min_swa_tokens / full_token if full_token > 0 else float("inf")
+            raise ValueError(
+                f"DSV4 SWA pool ({swa_tokens} tokens) is too small for paged "
+                f"admission: window_size={self.swa_page_size}, page_size={page_size}, "
+                f"minimum={min_swa_tokens}. Increase --swa-full-tokens-ratio to "
+                f"at least {min_ratio:.6g} for --max-total-tokens={full_token}, or "
+                "increase --max-total-tokens."
+            )
+
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,

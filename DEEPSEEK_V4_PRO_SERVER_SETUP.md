@@ -758,6 +758,7 @@ python -m sglang.launch_server \
   --disable-shared-experts-fusion \
   --chunked-prefill-size 4096 \
   --max-total-tokens 4096 \
+  --swa-full-tokens-ratio 0.20 \
   --max-running-requests 1 \
   --mem-fraction-static 0.89 \
   --disable-flashinfer-autotune \
@@ -817,6 +818,7 @@ python -m sglang.launch_server \
   --disable-shared-experts-fusion \
   --chunked-prefill-size 4096 \
   --max-total-tokens 4096 \
+  --swa-full-tokens-ratio 0.20 \
   --max-running-requests 1 \
   --mem-fraction-static 0.912 \
   --disable-flashinfer-autotune \
@@ -845,6 +847,15 @@ than the observed free memory and therefore gives the draft KV configurator a
 negative budget. `0.912` reserves about 2.05 GiB and exposes about 0.21 GiB to
 the capped 4K draft cache. Treat this as a machine-specific narrow setting:
 recalculate it from the logged values if either number changes.
+
+Both 4K smoke launches deliberately set `--swa-full-tokens-ratio 0.20`.
+DeepSeek V4 uses a 128-token SWA window with 256-token allocator pages. At the
+model's ordinary 0.1 ratio, a 4096-token full cache rounds the SWA tier down to
+one 256-token page. That cannot cover the live window plus the current and next
+paged allocations, so the scheduler repeatedly rejects even a one-token
+request before model forward. A ratio of 0.20 produces a 768-token (three-page)
+SWA tier. The server now rejects a smaller DSV4 tier during initialization with
+the minimum ratio in the error message instead of starting an unusable server.
 
 Each draft stage should then report both of these bounded preparation paths:
 
@@ -1046,6 +1057,25 @@ curl -N --max-time 1800 http://127.0.0.1:60000/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"dsv4pro","prompt":"Hello","max_tokens":1,"temperature":0,"stream":true}'
 ```
+
+### `/generate` returns HTTP 200 but never emits a token
+
+If a scheduler stack repeatedly lands in `_compute_max_prefix_len`, the
+scheduler is cycling through admission rather than running attention or MoE.
+Query the live scheduler before stopping it:
+
+```bash
+curl -sS --max-time 10 \
+  'http://127.0.0.1:60000/v1/loads?include=core,memory,queues,spec' \
+  | python -m json.tool
+```
+
+For the 4K DSV4 smoke profile, `num_waiting_reqs=1`,
+`num_running_reqs=0`, flat GPU utilization, and a stack in
+`PrefillAdder`/`_compute_max_prefix_len` indicate an undersized SWA tier. Make
+sure the launch includes `--swa-full-tokens-ratio 0.20`. Do not lengthen the
+HTTP timeout: no forward has started. Updated code fails during pool sizing if
+the ratio still rounds below the three-page admission floor.
 
 ### `CUDA_HOME environment variable is not set`
 
