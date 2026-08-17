@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     _kt_diagnostic_layer_selected,
     _moe_layer_indices,
     _resolve_remote_expert_transport,
-    _resolve_gpu_tier_presence,
+    _resolve_logical_gpu_tier_presence,
     _summarize_route_counts,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
@@ -42,15 +42,21 @@ def test_diagnostic_layer_selector_accepts_list_and_all():
         _kt_diagnostic_layer_selected(2, "2,nope")
 
 
-def test_gpu_tier_presence_resolves_all_tiers_with_one_result_vector():
-    primary_ids = torch.tensor([[-1, 0, -1]])
-    empty_helper_ids = torch.full((1, 3), -1)
-    active_helper_ids = torch.tensor([[2, -1, -1]])
+def test_logical_gpu_tier_presence_uses_tier_bit_map():
+    logical_ids = torch.tensor([[0, 2, 5, -1, 6]])
+    # Logical experts 0/1 are primary (bit 0), 2/3 are helper 0 (bit 1),
+    # and expert 5 is helper 1 (bit 2). Expert 4 is CPU-only.
+    logical_to_tier_bits = (1, 1, 2, 2, 0, 4)
 
-    assert _resolve_gpu_tier_presence(
-        [primary_ids, empty_helper_ids, active_helper_ids]
-    ) == (True, False, True)
-    assert _resolve_gpu_tier_presence([]) == ()
+    assert _resolve_logical_gpu_tier_presence(
+        logical_ids, logical_to_tier_bits, num_tiers=3
+    ) == (True, True, True)
+    assert _resolve_logical_gpu_tier_presence(
+        torch.tensor([[4, -1, 8]]), logical_to_tier_bits, num_tiers=3
+    ) == (False, False, False)
+    assert _resolve_logical_gpu_tier_presence(
+        logical_ids, logical_to_tier_bits, num_tiers=0
+    ) == ()
 
 
 def test_remote_expert_transport_prefers_bidirectional_p2p(monkeypatch):

@@ -1373,14 +1373,15 @@ export SGLANG_KT_SKIP_EMPTY_GPU_TIERS=1
 export SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS=8
 ```
 
-The gate resolves primary/helper route presence with one tiny device-to-host
-copy and skips GPU tiers with no assignments. It covers batch-one target decode
-and a six-row DSpark verification window while leaving larger prefills fully
-asynchronous. It is opt-in because the synchronization cost depends on the
-PCIe topology and route coverage. Compare a warmed 256-token decode with the
-gate set to `0` and `1`; `[kt-hybrid-time]` reports `route_gate`,
-`skipped_primary`, and `skipped_remote`. Keep it only when end-to-end throughput
-improves.
+The gate copies the small logical-route-ID vector to the host once, resolves
+all tiers through an immutable bit map, and skips GPU tiers with no assignments.
+An empty helper also avoids its route-remap CUDA launch. It covers batch-one
+target decode and a six-row DSpark verification window while leaving larger
+prefills fully asynchronous. It is opt-in because the synchronization cost
+depends on the PCIe topology and route coverage. Compare a warmed 256-token
+decode with the gate set to `0` and `1`; `[kt-hybrid-time]` reports
+`route_gate`, `skipped_primary`, and `skipped_remote`. Keep it only when
+end-to-end throughput improves.
 
 Frequency placement now reports total and per-tier predicted route coverage at
 startup. Preserve those lines with the resulting throughput report; a higher

@@ -23,9 +23,10 @@ Diagnostic environment variables (disabled by default):
 ``SGLANG_KT_HYBRID_TIMING_INTERVAL=16``
     Log the first eight calls, then every Nth call for each selected layer.
 ``SGLANG_KT_SKIP_EMPTY_GPU_TIERS=1``
-    For small decode/verify batches, copy one tier-presence vector to the host
-    and skip primary/helper GPU launches that have no routed assignments.  This
-    is opt-in because the synchronization/launch tradeoff is topology-specific.
+    For small decode/verify batches, copy the logical route IDs to the host,
+    classify them through a tier bit map, and skip primary/helper GPU launches
+    that have no routed assignments.  This is opt-in because the
+    synchronization/launch tradeoff is topology-specific.
 ``SGLANG_KT_SKIP_EMPTY_GPU_TIERS_MAX_TOKENS=8``
     Maximum routed rows for the empty-tier gate.  Larger prefills retain the
     fully asynchronous path.
@@ -142,14 +143,27 @@ def _kt_diagnostic_layer_selected(layer_idx: int, raw: str) -> bool:
         ) from exc
 
 
-def _resolve_gpu_tier_presence(
-    compact_topk_ids: list[torch.Tensor],
+def _resolve_logical_gpu_tier_presence(
+    logical_topk_ids: torch.Tensor,
+    logical_to_tier_bits: tuple[int, ...],
+    num_tiers: int,
 ) -> tuple[bool, ...]:
-    """Resolve all small-batch GPU-tier hit flags with one device-to-host copy."""
-    if not compact_topk_ids:
+    """Resolve small-batch tier hits from one tiny logical-ID D2H copy.
+
+    Running a remap and reduction for every tier was more expensive than the
+    empty launches it avoided on decode.  Copy at most ``max_tokens * top_k``
+    logical IDs once and classify them with the immutable CPU tier bit map.
+    """
+    if num_tiers <= 0:
         return ()
-    presence = torch.stack([topk_ids.ge(0).any() for topk_ids in compact_topk_ids])
-    return tuple(bool(value) for value in presence.to(device="cpu").tolist())
+    active_tier_bits = 0
+    for logical_id in logical_topk_ids.detach().reshape(-1).to(device="cpu").tolist():
+        if 0 <= logical_id < len(logical_to_tier_bits):
+            active_tier_bits |= logical_to_tier_bits[logical_id]
+    return tuple(
+        bool(active_tier_bits & (1 << tier_index))
+        for tier_index in range(num_tiers)
+    )
 
 
 def reset_kt_expert_placement_cache() -> None:
@@ -1436,6 +1450,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.remote_tiers = [
             _RemoteExpertTier(config) for config in kt_config.remote_expert_tiers
         ]
+        logical_to_tier_bits = [0] * self.gpu_experts_mask.numel()
+        for logical_id in gpu_logical_ids.tolist():
+            logical_to_tier_bits[logical_id] = 1
+        for remote_index, tier in enumerate(self.remote_tiers, start=1):
+            tier_bit = 1 << remote_index
+            for logical_id in tier.logical_ids.tolist():
+                logical_to_tier_bits[logical_id] = tier_bit
+        self.logical_to_gpu_tier_bits = tuple(logical_to_tier_bits)
 
         self.gpu_experts_mask_cuda: Optional[torch.Tensor] = None
         self.logical_to_gpu_index_cuda: Optional[torch.Tensor] = None
@@ -1728,37 +1750,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Start CPU work before resolving the optional GPU-tier gate so the
         # tiny presence D2H can overlap the host expert computation.
-        remote_topk_ids = [
-            tier.remap_routes(topk_ids) if tier.prepared is not None else None
-            for tier in self.remote_tiers
-        ]
         num_routed_rows = int(x.reshape(-1, x.shape[-1]).shape[0])
         gate_empty_tiers = (
             self._skip_empty_gpu_tiers
             and num_routed_rows <= self._skip_empty_gpu_tiers_max_tokens
         )
         primary_enabled = self.num_gpu_experts > 0
-        remote_enabled = [route_ids is not None for route_ids in remote_topk_ids]
+        remote_enabled = [tier.prepared is not None for tier in self.remote_tiers]
         if gate_empty_tiers:
-            presence_inputs = []
-            primary_presence_index = None
-            remote_presence_indices: list[Optional[int]] = []
+            tier_presence = _resolve_logical_gpu_tier_presence(
+                topk_ids,
+                self.logical_to_gpu_tier_bits,
+                1 + len(self.remote_tiers),
+            )
             if primary_enabled:
-                primary_presence_index = len(presence_inputs)
-                presence_inputs.append(gpu_topk_ids)
-            for route_ids in remote_topk_ids:
-                if route_ids is None:
-                    remote_presence_indices.append(None)
-                else:
-                    remote_presence_indices.append(len(presence_inputs))
-                    presence_inputs.append(route_ids)
-            tier_presence = _resolve_gpu_tier_presence(presence_inputs)
-            if primary_presence_index is not None:
-                primary_enabled = tier_presence[primary_presence_index]
+                primary_enabled = tier_presence[0]
             remote_enabled = [
-                False if index is None else tier_presence[index]
-                for index in remote_presence_indices
+                available and tier_presence[remote_index + 1]
+                for remote_index, available in enumerate(remote_enabled)
             ]
+        # Remap a helper tier only after the small-batch gate proves that it
+        # has work.  This removes an additional compiled CUDA launch from the
+        # common empty-helper path.
+        remote_topk_ids = [
+            tier.remap_routes(topk_ids) if enabled else None
+            for tier, enabled in zip(self.remote_tiers, remote_enabled)
+        ]
         after_route_gate = (
             mark_stage() if log_diagnostics and self._diag_timing else 0.0
         )
@@ -1840,8 +1857,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     (timing_end - after_cpu_wait) * 1000.0,
                     int(self.num_gpu_experts > 0 and not primary_enabled),
                     sum(
-                        route_ids is not None and not enabled
-                        for route_ids, enabled in zip(remote_topk_ids, remote_enabled)
+                        tier.prepared is not None and not enabled
+                        for tier, enabled in zip(self.remote_tiers, remote_enabled)
                     ),
                 )
             if route_summaries is not None:
