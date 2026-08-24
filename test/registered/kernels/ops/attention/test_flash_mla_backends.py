@@ -245,8 +245,11 @@ class TestTouchedPageSplit(CustomTestCase):
         src = torch.as_strided(cache, (num_pages, src_stride), (src_stride, 1))
 
         buffers = get_resources().buffers
-        split_key = f"flash_mla_sm120_split:{device}"
-        mask_key = f"flash_mla_sm120_mask:{device}"
+        # An unindexed torch.device("cuda") creates tensors whose concrete
+        # device is cuda:0. Match the production workspace key exactly.
+        concrete_device = cache.device
+        split_key = f"flash_mla_sm120_split:{concrete_device}"
+        mask_key = f"flash_mla_sm120_mask:{concrete_device}"
         missing = object()
         old_split = buffers.get(split_key, missing)
         old_mask = buffers.get(mask_key, missing)
