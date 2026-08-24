@@ -154,6 +154,74 @@ def _build_kvcache(
     return k_cache, ref_per_token
 
 
+def _build_stable_kvcache(
+    num_pages: int,
+    page_size: int,
+    *,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """Build numerically representative DSV4 footer-layout KV pages.
+
+    Unlike the byte-stress fixture above, this pairs bounded FP8 values with
+    unit UE8M0 scales. That avoids artificial softmax saturation while still
+    exercising the production page layout and FlashInfer kernel.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    nope = (
+        torch.randn(
+            num_pages,
+            page_size,
+            _NOPE_DIM,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        .clamp(-2.0, 2.0)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .to(device)
+    )
+    rope = (
+        torch.randn(
+            num_pages,
+            page_size,
+            _ROPE_DIM,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        .clamp(-2.0, 2.0)
+        .to(torch.bfloat16)
+        .view(torch.uint8)
+        .to(device)
+    )
+
+    token_data = torch.empty(
+        num_pages,
+        page_size,
+        _NOPE_ROPE_STRIDE,
+        dtype=torch.uint8,
+        device=device,
+    )
+    token_data[:, :, :_NOPE_DIM] = nope
+    token_data[:, :, _NOPE_DIM:] = rope
+
+    scales = torch.zeros(
+        num_pages,
+        page_size,
+        _SCALE_STRIDE,
+        dtype=torch.uint8,
+        device=device,
+    )
+    scales[:, :, :_NUM_TILES] = 127  # UE8M0 encoding for scale 1.0.
+
+    page_bytes = page_size * _BYTES_PER_TOKEN
+    data_bytes = page_size * _NOPE_ROPE_STRIDE
+    flat = torch.empty(num_pages, page_bytes, dtype=torch.uint8, device=device)
+    flat[:, :data_bytes] = token_data.reshape(num_pages, data_bytes)
+    flat[:, data_bytes:] = scales.reshape(num_pages, page_size * _SCALE_STRIDE)
+    return flat.view(num_pages, page_size, 1, _BYTES_PER_TOKEN)
+
+
 def _build_q_indices(
     batch_size: int,
     num_heads: int,
@@ -575,7 +643,9 @@ class TestEntryPointDispatch(CustomTestCase):
         # intentionally restricted to num_tokens > 64.
         batch_size, num_heads, topk = 1, 128, 128
         num_pages, page_size = 4, 128
-        k_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=5)
+        k_cache = _build_stable_kvcache(
+            num_pages, page_size, device=self.device, seed=5
+        )
         q, indices = _build_q_indices(
             batch_size,
             num_heads,
