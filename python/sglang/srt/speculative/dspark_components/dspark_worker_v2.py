@@ -22,6 +22,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
@@ -81,6 +82,19 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
+def _should_capture_dspark_draft_cuda_graph(
+    *, target_decode_graph_disabled: bool, draft_helper_gpu_id: Optional[int]
+) -> bool:
+    """Keep only a cross-device DSpark draft eager.
+
+    A two-device draft performs remote expert and target-hosted vocabulary
+    operations between draft stages.  Those operations cannot be captured as
+    one draft graph, but they do not require disabling the target's independent
+    breakable decode graph.
+    """
+    return not target_decode_graph_disabled and draft_helper_gpu_id is None
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -105,6 +119,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             if server_args.speculative_draft_device is not None
             else gpu_id
         )
+        self.draft_helper_gpu_id = (
+            resolve_speculative_draft_device(
+                server_args.speculative_draft_helper_device
+            )
+            if server_args.speculative_draft_helper_device is not None
+            else None
+        )
         if (
             server_args.speculative_draft_device is not None
             and self.draft_gpu_id == gpu_id
@@ -115,6 +136,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._remote_draft = self.draft_gpu_id != gpu_id
         self.draft_device = torch.device("cuda", self.draft_gpu_id)
+        self.draft_helper_device = (
+            torch.device("cuda", self.draft_helper_gpu_id)
+            if self.draft_helper_gpu_id is not None
+            else None
+        )
         self._remote_req_generation: dict[int, int] = {}
         self._remote_req_synced_len: dict[int, int] = {}
         self._draft_fp8_gemm_backend: Optional[str] = None
@@ -157,9 +183,44 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "GPUs. DSpark will use CUDA's host-staged copy path; only hidden "
                     "states, proposal metadata, and incremental KV indices cross it."
                 )
-            ensure_flashinfer_sampling_multiarch((gpu_id, self.draft_gpu_id))
+            sampling_devices = [gpu_id, self.draft_gpu_id]
+            if self.draft_helper_gpu_id is not None:
+                if self.draft_helper_gpu_id in (gpu_id, self.draft_gpu_id):
+                    raise ValueError(
+                        "--speculative-draft-helper-device must differ from both "
+                        "the target and primary draft devices."
+                    )
+                helper_capability = torch.cuda.get_device_capability(
+                    self.draft_helper_gpu_id
+                )
+                if helper_capability < (8, 0):
+                    raise ValueError(
+                        "The DSpark expert helper requires an SM80 or newer GPU, "
+                        f"got SM{helper_capability[0]}{helper_capability[1]}."
+                    )
+                helper_peer_access = torch.cuda.can_device_access_peer(
+                    self.draft_gpu_id, self.draft_helper_gpu_id
+                )
+                logger.info(
+                    "DSpark second expert device enabled: primary=cuda:%d, "
+                    "helper=cuda:%d (%s, SM%d%d), peer_access=%s, counts=%s.",
+                    self.draft_gpu_id,
+                    self.draft_helper_gpu_id,
+                    torch.cuda.get_device_name(self.draft_helper_gpu_id),
+                    helper_capability[0],
+                    helper_capability[1],
+                    helper_peer_access,
+                    server_args.speculative_draft_num_gpu_experts_per_device,
+                )
+                sampling_devices.append(self.draft_helper_gpu_id)
+            ensure_flashinfer_sampling_multiarch(tuple(sampling_devices))
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+        if self.draft_helper_gpu_id is not None and not self._draft_is_moe:
+            raise ValueError(
+                "--speculative-draft-helper-device currently supports only the "
+                "bundled DeepSeek-V4 DSpark draft."
+            )
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
@@ -183,6 +244,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
                 fp8_gemm_backend_override=self._draft_fp8_gemm_backend,
+                expert_helper_gpu_id=self.draft_helper_gpu_id,
+                expert_counts_per_device=(
+                    tuple(
+                        int(value)
+                        for value in server_args.speculative_draft_num_gpu_experts_per_device
+                    )
+                    if self.draft_helper_gpu_id is not None
+                    else None
+                ),
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -230,7 +300,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires the target model to expose `lm_head` with `weight`."
             )
         target_embed_tokens = self._resolve_target_embed_tokens(target_model)
-        if self._remote_draft:
+        if self._remote_draft and self.draft_helper_gpu_id is None:
             with self._draft_context():
                 draft_embed_tokens = self._replicate_vocab_module(target_embed_tokens)
                 draft_lm_head = (
@@ -243,6 +313,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     lm_head=draft_lm_head,
                 )
         else:
+            # The two-device 24 GiB profile cannot afford another embedding and
+            # LM-head replica. The DSV4 draft moves only lookup inputs, hidden
+            # rows, and logits across the target/draft boundary in eager mode.
             self.draft_model.attach_shared_modules(
                 embed_tokens=target_embed_tokens,
                 lm_head=lm_head,
@@ -488,7 +561,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        target_decode_graph_disabled = (
+            get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+        )
+        capture_decode_cuda_graph = _should_capture_dspark_draft_cuda_graph(
+            target_decode_graph_disabled=target_decode_graph_disabled,
+            draft_helper_gpu_id=self.draft_helper_gpu_id,
+        )
+        if self.draft_helper_gpu_id is not None and not target_decode_graph_disabled:
+            logger.info(
+                "Keeping the two-device DSpark draft eager while the target "
+                "decode CUDA graph remains enabled."
+            )
         if is_cuda() and capture_decode_cuda_graph:
             with draft_cuda_device_context(self.draft_gpu_id):
                 available_mem = get_available_gpu_memory(self.device, self.draft_gpu_id)

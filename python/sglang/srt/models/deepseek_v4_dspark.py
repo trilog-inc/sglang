@@ -678,7 +678,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
+        draft_device = next(self.stages[0].parameters()).device
+        embed_device = self.embed_tokens.weight.device
+        x = self.embed_tokens(input_ids.to(device=embed_device, dtype=torch.int64))
+        if x.device != draft_device:
+            x = x.to(device=draft_device)
         x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
         return x
 
@@ -725,13 +729,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
+        draft_device = x.device
+        if x.device != weight.device:
+            x = x.to(device=weight.device)
         if self._use_fp32_lm_head:
             local_logits = F.linear(x.float(), weight.float())
         else:
             local_logits = torch.matmul(x.to(weight.dtype), weight.T)
         if self._opt_markov_w2_tp_shard:
-            return local_logits
-        return gather_and_crop_vocab(local_logits, self.lm_head)
+            logits = local_logits
+        else:
+            logits = gather_and_crop_vocab(local_logits, self.lm_head)
+        if logits.device != draft_device:
+            logits = logits.to(device=draft_device)
+        return logits
 
     def compute_confidence(
         self,

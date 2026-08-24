@@ -8,8 +8,10 @@ from sglang.srt.entrypoints.http_server import (
     KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64,
     KIMI_VLM_WARMUP_PNG_PICTURE_BASE64,
     MINIMUM_PNG_PICTURE_BASE64,
+    _get_server_warmup_max_new_tokens,
     _get_vlm_warmup_image_base64,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -53,6 +55,21 @@ class TestVlmWarmupImage(CustomTestCase):
             _get_vlm_warmup_image_base64({"architectures": None}),
             MINIMUM_PNG_PICTURE_BASE64,
         )
+
+
+class TestServerWarmupTokens(CustomTestCase):
+    def test_generation_token_count_can_be_reduced(self):
+        with envs.SGLANG_WARMUP_MAX_NEW_TOKENS.override(2):
+            self.assertEqual(_get_server_warmup_max_new_tokens(True), 2)
+
+    def test_non_generation_warmup_remains_one(self):
+        with envs.SGLANG_WARMUP_MAX_NEW_TOKENS.override(7):
+            self.assertEqual(_get_server_warmup_max_new_tokens(False), 1)
+
+    def test_generation_token_count_must_be_positive(self):
+        with envs.SGLANG_WARMUP_MAX_NEW_TOKENS.override(0):
+            with self.assertRaisesRegex(ValueError, "must be positive"):
+                _get_server_warmup_max_new_tokens(True)
 
 
 if __name__ == "__main__":

@@ -2023,7 +2023,15 @@ def apply_fp8_linear(
 
 def can_auto_enable_marlin_fp8() -> bool:
     try:
-        major, minor = get_device_capability()
+        # Heterogeneous speculative workers are built under
+        # ``torch.cuda.device(draft_gpu_id)``.  Querying the helper's default
+        # device_id=0 inspects the target GPU instead, so an SM86 draft paired
+        # with an SM120 target incorrectly disables the weight-only Marlin
+        # fallback and later tries to compile an unsupported FP8 Triton GEMM on
+        # the draft.  Follow the active construction context here; ordinary
+        # single-device workers still resolve to device 0.
+        device_id = torch.cuda.current_device()
+        major, minor = get_device_capability(device_id)
         sm = major * 10 + minor
         return 80 <= sm < 89
     except Exception:

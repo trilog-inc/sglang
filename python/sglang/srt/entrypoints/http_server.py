@@ -2082,6 +2082,18 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     return MINIMUM_PNG_PICTURE_BASE64
 
 
+def _get_server_warmup_max_new_tokens(is_generation: bool) -> int:
+    if not is_generation:
+        return 1
+    max_new_tokens = envs.SGLANG_WARMUP_MAX_NEW_TOKENS.get()
+    if max_new_tokens <= 0:
+        raise ValueError(
+            "SGLANG_WARMUP_MAX_NEW_TOKENS must be positive, got "
+            f"{max_new_tokens}. Use --skip-server-warmup to disable warmup."
+        )
+    return max_new_tokens
+
+
 async def _send_disaggregation_warmup_requests(
     server_args: ServerArgs,
     url: str,
@@ -2099,7 +2111,7 @@ async def _send_disaggregation_warmup_requests(
         json_data = {
             "sampling_params": {
                 "temperature": 0.0,
-                "max_new_tokens": 8,
+                "max_new_tokens": _get_server_warmup_max_new_tokens(True),
                 "ignore_eos": True,
             },
             "bootstrap_host": FAKE_BOOTSTRAP_HOST,
@@ -2167,7 +2179,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             request_name = "/generate"
     else:
         request_name = "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
+    max_new_tokens = _get_server_warmup_max_new_tokens(model_info["is_generation"])
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -2236,13 +2248,21 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
+    effective_warmup_timeout = warmup_timeout if warmup_timeout > 0 else 600
+    logger.info(
+        "Starting server warmup: endpoint=%s max_new_tokens=%d timeout=%.1fs",
+        request_name,
+        max_new_tokens,
+        effective_warmup_timeout,
+    )
+    warmup_start = time.perf_counter()
     try:
         if server_args.disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                timeout=effective_warmup_timeout,
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
@@ -2280,6 +2300,11 @@ def _execute_server_warmup(server_args: ServerArgs):
                     failed_status_codes,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+
+        logger.info(
+            "Server warmup completed in %.2f seconds",
+            time.perf_counter() - warmup_start,
+        )
 
     except Exception:
         last_traceback = get_exception_traceback()

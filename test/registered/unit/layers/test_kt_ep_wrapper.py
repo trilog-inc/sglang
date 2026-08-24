@@ -6,12 +6,95 @@ import torch
 from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTGraphStateBridge,
+    KTRemoteExpertTierConfig,
     _Mxfp4LayerwisePrefillManager,
+    _RemoteExpertTier,
+    _kt_diagnostic_layer_selected,
     _moe_layer_indices,
+    _resolve_remote_expert_transport,
+    _resolve_logical_gpu_tier_presence,
+    _summarize_route_counts,
     create_kt_config_from_server_args,
     mask_and_remap_expert_ids,
     partition_and_remap_expert_ids,
 )
+from sglang.srt.server_args import ServerArgs
+
+
+def test_route_summary_reports_expert_row_multiplicity():
+    counts = torch.tensor([0, 1, 3, 2, 1, 0], dtype=torch.int64)
+    tier_mask = torch.tensor([False, True, True, False, True, False])
+
+    summary = _summarize_route_counts(counts, tier_mask)
+
+    assert summary.assignments == 5
+    assert summary.active_experts == 3
+    assert summary.max_rows_per_expert == 3
+    assert summary.rows_per_expert_histogram == ((1, 2), (3, 1))
+    assert summary.format() == "routes=5 unique=3 max_m=3 m_hist=m1:2,m3:1"
+
+
+def test_diagnostic_layer_selector_accepts_list_and_all():
+    assert _kt_diagnostic_layer_selected(20, "2,5,20,35,60")
+    assert not _kt_diagnostic_layer_selected(21, "2,5,20,35,60")
+    assert _kt_diagnostic_layer_selected(21, "all")
+    with pytest.raises(ValueError, match="comma-separated"):
+        _kt_diagnostic_layer_selected(2, "2,nope")
+
+
+def test_logical_gpu_tier_presence_uses_tier_bit_map():
+    logical_ids = torch.tensor([[0, 2, 5, -1, 6]])
+    # Logical experts 0/1 are primary (bit 0), 2/3 are helper 0 (bit 1),
+    # and expert 5 is helper 1 (bit 2). Expert 4 is CPU-only.
+    logical_to_tier_bits = (1, 1, 2, 2, 0, 4)
+
+    assert _resolve_logical_gpu_tier_presence(
+        logical_ids, logical_to_tier_bits, num_tiers=3
+    ) == (True, True, True)
+    assert _resolve_logical_gpu_tier_presence(
+        torch.tensor([[4, -1, 8]]), logical_to_tier_bits, num_tiers=3
+    ) == (False, False, False)
+    assert _resolve_logical_gpu_tier_presence(
+        logical_ids, logical_to_tier_bits, num_tiers=0
+    ) == ()
+
+
+def test_remote_expert_transport_prefers_bidirectional_p2p(monkeypatch):
+    calls = []
+
+    def can_access(source, destination):
+        calls.append((source, destination))
+        return True
+
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", can_access)
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "auto")
+
+    assert transport == "p2p"
+    assert peer_access
+    assert calls == [(0, 2), (2, 0)]
+
+
+def test_remote_expert_transport_falls_back_without_reverse_p2p(monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda,
+        "can_device_access_peer",
+        lambda source, destination: (source, destination) == (0, 2),
+    )
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "auto")
+
+    assert transport == "host"
+    assert not peer_access
+
+
+def test_remote_expert_transport_can_force_host_for_bisect(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda *_args: True)
+
+    transport, peer_access = _resolve_remote_expert_transport(0, 2, "host")
+
+    assert transport == "host"
+    assert peer_access
 
 
 def test_graph_state_bridge_reuses_largest_stable_buffer():
@@ -278,6 +361,244 @@ def test_frequency_placement_rejects_incomplete_profile(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="no recorded routes"):
         kt_ep_wrapper._build_gpu_expert_masks(server_args)
+
+
+def test_explicit_gpu_tiers_assign_compact_disjoint_expert_sets(monkeypatch):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=6,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[2, 1],
+        kt_gpu_expert_backends=["flashinfer_mxfp4", "marlin_mxfp4"],
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=None,
+        kt_expert_placement_strategy="uniform",
+        kt_expert_frequency_file=None,
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERT_TIER_MAP", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_size=1),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        kt_ep_wrapper.dist,
+        "broadcast",
+        lambda *args, **kwargs: pytest.fail("TP=1 must not broadcast the tier map"),
+    )
+
+    primary_masks = kt_ep_wrapper._build_gpu_expert_masks(server_args)
+    tier_map = kt_ep_wrapper._KT_GPU_EXPERT_TIER_MAP
+
+    assert primary_masks.tolist() == [
+        [True, True, False, False, False, False],
+        [True, True, False, False, False, False],
+    ]
+    assert tier_map.tolist() == [
+        [0, 0, 1, -1, -1, -1],
+        [0, 0, 1, -1, -1, -1],
+    ]
+
+
+def test_explicit_gpu_tier_counts_reject_overcommit(monkeypatch):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=4,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[3, 2],
+        kt_gpu_expert_backends=["flashinfer_mxfp4", "marlin_mxfp4"],
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=None,
+        kt_expert_placement_strategy="uniform",
+        kt_expert_frequency_file=None,
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERT_TIER_MAP", None)
+
+    with pytest.raises(ValueError, match="total no more than 4"):
+        kt_ep_wrapper._build_gpu_expert_masks(server_args)
+
+
+def test_create_config_exposes_remote_tier_without_counting_it_as_cpu(monkeypatch):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        n_routed_experts=6,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_weight_path="/weights",
+        kt_weight_prefix="mtp",
+        enable_eplb=False,
+        kt_method="MXFP4",
+        kt_mxfp4_backend="amx",
+        kt_mxfp4_amx_min_tokens_per_expert=4,
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[2, 1],
+        kt_gpu_expert_backends=["flashinfer_mxfp4", "marlin_mxfp4"],
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=None,
+        kt_expert_placement_strategy="uniform",
+        kt_expert_frequency_file=None,
+        init_expert_location="trivial",
+        kt_threadpool_count=1,
+        kt_cpuinfer=8,
+        kt_numa_nodes=[0],
+        chunked_prefill_size=64,
+        kt_gpu_prefill_token_threshold=0,
+        kt_mxfp4_prefill_slots="auto",
+        kt_mxfp4_prefill_host_staging_experts=8,
+        kt_max_deferred_experts_per_token=None,
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERT_TIER_MAP", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_size=1),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+
+    config = create_kt_config_from_server_args(server_args, layer_idx=1)
+
+    assert config.weight_base_key == "mtp.1"
+    assert config.gpu_experts_mask.tolist() == [True, True, False, False, False, False]
+    assert config.expert_tier_map.tolist() == [0, 0, 1, -1, -1, -1]
+    assert len(config.remote_expert_tiers) == 1
+    remote = config.remote_expert_tiers[0]
+    assert remote.device_id == 1
+    assert remote.backend == "marlin_mxfp4"
+    assert remote.experts_mask.tolist() == [False, False, True, False, False, False]
+
+
+def test_mtp_marlin_primary_uses_local_streamed_preparation(monkeypatch):
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        n_routed_experts=6,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+        kt_weight_path="/weights",
+        kt_weight_prefix="mtp",
+        enable_eplb=False,
+        kt_method="MXFP4",
+        kt_mxfp4_backend="amx",
+        kt_mxfp4_amx_min_tokens_per_expert=4,
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[3, 3],
+        kt_gpu_expert_backends=["marlin_mxfp4", "marlin_mxfp4"],
+        kt_gpu_experts_ratio=None,
+        kt_num_gpu_experts=None,
+        kt_expert_placement_strategy="uniform",
+        kt_expert_frequency_file=None,
+        init_expert_location="trivial",
+        kt_threadpool_count=1,
+        kt_cpuinfer=8,
+        kt_numa_nodes=[0],
+        chunked_prefill_size=64,
+        kt_gpu_prefill_token_threshold=0,
+        kt_mxfp4_prefill_slots="auto",
+        kt_mxfp4_prefill_host_staging_experts=8,
+        kt_max_deferred_experts_per_token=None,
+    )
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERTS_MASKS", None)
+    monkeypatch.setattr(kt_ep_wrapper, "_KT_GPU_EXPERT_TIER_MAP", None)
+    monkeypatch.setattr(
+        kt_ep_wrapper,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_rank=0, tp_size=1),
+    )
+    monkeypatch.setattr(kt_ep_wrapper.dist, "is_initialized", lambda: False)
+
+    config = create_kt_config_from_server_args(server_args, layer_idx=1)
+
+    assert not bool(config.gpu_experts_mask.any())
+    assert config.expert_tier_map.tolist() == [0, 0, 0, 1, 1, 1]
+    assert len(config.remote_expert_tiers) == 2
+    helper, local = config.remote_expert_tiers
+    assert (helper.device_id, helper.host_staged) == (1, True)
+    assert helper.experts_mask.tolist() == [False, False, False, True, True, True]
+    assert (local.device_id, local.host_staged) == (0, False)
+    assert local.experts_mask.tolist() == [True, True, True, False, False, False]
+
+
+def test_remote_tier_builds_compact_logical_mapping_without_cuda():
+    tier = _RemoteExpertTier(
+        KTRemoteExpertTierConfig(
+            device_id=1,
+            backend="marlin_mxfp4",
+            experts_mask=torch.tensor([False, True, False, False, True]),
+        )
+    )
+
+    assert tier.logical_ids.tolist() == [1, 4]
+    assert tier.logical_to_compact.tolist() == [-1, 0, -1, -1, 1]
+
+
+def test_primary_remote_and_cpu_routes_are_disjoint_and_exhaustive():
+    logical_ids = torch.tensor([[0, 2, 3, 1, -1, 4]])
+    primary_mask = torch.tensor([True, True, False, False])
+    primary_map = torch.tensor([0, 1, -1, -1])
+    remote_mask = torch.tensor([False, False, True, False])
+    remote_map = torch.tensor([-1, -1, 0, -1])
+    cpu_map = torch.tensor([-1, -1, -1, 0])
+
+    cpu_ids, primary_ids = partition_and_remap_expert_ids(
+        logical_ids, primary_mask, primary_map, cpu_map
+    )
+    remote_ids = mask_and_remap_expert_ids(logical_ids, remote_mask, remote_map)
+
+    torch.testing.assert_close(primary_ids, torch.tensor([[0, -1, -1, 1, -1, -1]]))
+    torch.testing.assert_close(remote_ids, torch.tensor([[-1, 0, -1, -1, -1, -1]]))
+    torch.testing.assert_close(cpu_ids, torch.tensor([[-1, -1, 0, -1, -1, -1]]))
+    valid_routes = (primary_ids >= 0).int()
+    valid_routes += (remote_ids >= 0).int()
+    valid_routes += (cpu_ids >= 0).int()
+    torch.testing.assert_close(valid_routes, torch.tensor([[1, 1, 1, 1, 0, 0]]))
+
+
+def test_server_args_validates_remote_expert_topology_contract():
+    args = SimpleNamespace(
+        kt_expert_placement_strategy="uniform",
+        kt_gpu_expert_devices=[0, 1],
+        kt_num_gpu_experts_per_device=[26, 10],
+        kt_gpu_expert_backends=["flashinfer_mxfp4", "marlin_mxfp4"],
+        kt_num_gpu_experts=None,
+        kt_gpu_experts_ratio=None,
+        tp_size=1,
+        dp_size=1,
+        pp_size=1,
+        base_gpu_id=0,
+        kt_weight_path="/weights",
+        kt_expert_frequency_file=None,
+        enable_eplb=False,
+        init_expert_location="trivial",
+    )
+
+    ServerArgs._handle_moe_expert_placement(args)
+
+    args.kt_num_gpu_experts = 26
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ServerArgs._handle_moe_expert_placement(args)
 
 
 def test_create_config_uses_server_args_model_config(monkeypatch):

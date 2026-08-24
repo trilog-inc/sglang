@@ -9,9 +9,8 @@ Validates the SM120-specific FlashMLA implementation that replaces the upstream
 - ``_sm120_sparse_decode_fwd``: pure-PyTorch reference path.
 - ``flash_mla_sparse_decode_triton``: tiled Triton kernel.
 - ``_apply_attn_sink`` / ``_merge_partial_attn``: post-processing helpers.
-- ``flash_mla_with_kvcache_sm120``: entry-point dispatch on
-  ``SGLANG_SM120_TRITON_FLASHMLA`` selects torch/triton paths and both yield
-  matching output.
+- ``flash_mla_with_kvcache_sm120``: FlashInfer/Triton/torch entry-point
+  dispatch and output agreement.
 
 DSv4 cache layout (per page):
     data section:  page_size * 576 bytes   = 64 tokens * (448 nope + 128 rope)
@@ -232,6 +231,100 @@ class TestGatherAndDequant(CustomTestCase):
 
 
 @unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
+class TestTouchedPageSplit(CustomTestCase):
+    def test_only_touched_pages_are_rewritten(self):
+        from sglang.srt.runtime_context import get_resources
+
+        device = torch.device("cuda")
+        num_pages, page_size = 3, 128
+        ratio = page_size // fmod._PBS_DST
+        sentinel = 0xA5
+        k_cache, _ = _build_kvcache(num_pages, page_size, device=device, seed=17)
+        cache = k_cache.view(torch.uint8)
+        src_stride = cache.stride(0)
+        src = torch.as_strided(cache, (num_pages, src_stride), (src_stride, 1))
+
+        buffers = get_resources().buffers
+        split_key = f"flash_mla_sm120_split:{device}"
+        mask_key = f"flash_mla_sm120_mask:{device}"
+        missing = object()
+        old_split = buffers.get(split_key, missing)
+        old_mask = buffers.get(mask_key, missing)
+
+        def restore_buffers():
+            for key, old_value in (
+                (split_key, old_split),
+                (mask_key, old_mask),
+            ):
+                if old_value is missing:
+                    buffers.pop(key, None)
+                else:
+                    buffers[key] = old_value
+
+        self.addCleanup(restore_buffers)
+        dst = torch.full(
+            (num_pages * ratio, fmod._BYTES_PER_DST_PAGE_PADDED),
+            sentinel,
+            dtype=torch.uint8,
+            device=device,
+        )
+        buffers[split_key] = dst
+        indices = torch.tensor(
+            [0, 5, 2 * page_size + 3, -1],
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # Exercise allocation under the same inference-mode state used by the
+        # scheduler, then reset sentinels for the byte-exact assertion.
+        with torch.inference_mode():
+            fmod._split_kv_pages_to_64(cache, page_size, indices)
+        torch.cuda.synchronize()
+        self.assertFalse(buffers[mask_key].is_inference())
+
+        dst.fill_(sentinel)
+        buffers[mask_key].fill_(-7)
+        out = fmod._split_kv_pages_to_64(cache, page_size, indices)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            out.shape,
+            (num_pages * ratio, fmod._PBS_DST, 1, _BYTES_PER_TOKEN),
+        )
+        self.assertEqual(buffers[mask_key][:num_pages].tolist(), [1, 0, 1])
+
+        data_size = fmod._PBS_DST * _NOPE_ROPE_STRIDE
+        scale_size = fmod._PBS_DST * _SCALE_STRIDE
+        src_scale_offset = page_size * _NOPE_ROPE_STRIDE
+        for page in (0, 2):
+            for subpage in range(ratio):
+                dst_page = dst[page * ratio + subpage]
+                torch.testing.assert_close(
+                    dst_page[:data_size],
+                    src[
+                        page,
+                        subpage * data_size : (subpage + 1) * data_size,
+                    ],
+                    atol=0,
+                    rtol=0,
+                )
+                scale_offset = src_scale_offset + subpage * scale_size
+                torch.testing.assert_close(
+                    dst_page[data_size : data_size + scale_size],
+                    src[page, scale_offset : scale_offset + scale_size],
+                    atol=0,
+                    rtol=0,
+                )
+                self.assertTrue(
+                    bool((dst_page[fmod._BYTES_PER_DST_PAGE :] == sentinel).all())
+                )
+
+        # Page 1 was not referenced and must remain untouched in the persistent
+        # workspace.
+        self.assertTrue(bool((dst[ratio : 2 * ratio] == sentinel).all()))
+
+
+@unittest.skipUnless(_IS_SM120, "SM120 (compute capability 12.0) required")
 class TestSparseDecodeTritonVsTorch(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -438,7 +531,7 @@ class TestEntryPointDispatch(CustomTestCase):
         cls.device = torch.device("cuda")
 
     def test_torch_backend_matches_triton_backend(self):
-        """SGLANG_SM120_TRITON_FLASHMLA toggles backend; both return matching out."""
+        """The torch and Triton fallback backends return matching output."""
         k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
         q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
         topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)

@@ -18,6 +18,7 @@ _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
 def _bundled_hf_config() -> SimpleNamespace:
     return SimpleNamespace(
         architectures=["DeepseekV4ForCausalLM"],
+        n_routed_experts=384,
         dspark_block_size=5,
         dspark_markov_rank=256,
         dspark_target_layer_ids=[40, 41, 42],
@@ -90,6 +91,34 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args.speculative_draft_device = "cuda:2"
         server_args.tp_size = 2
         with self.assertRaisesRegex(ValueError, "tp-size 1"):
+            _handle_dspark(server_args)
+
+    def test_two_device_draft_accepts_complete_expert_partition(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_draft_device = "cuda:2"
+        server_args.speculative_draft_helper_device = "cuda:3"
+        server_args.speculative_draft_num_gpu_experts_per_device = [192, 192]
+        server_args.disable_cuda_graph = False
+
+        _handle_dspark(server_args)
+
+        self.assertEqual(
+            server_args.speculative_draft_num_gpu_experts_per_device, [192, 192]
+        )
+        self.assertFalse(server_args.disable_cuda_graph)
+
+    def test_two_device_draft_rejects_incomplete_expert_partition(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.speculative_draft_device = "cuda:2"
+        server_args.speculative_draft_helper_device = "cuda:3"
+        server_args.speculative_draft_num_gpu_experts_per_device = [192, 191]
+        server_args.disable_cuda_graph = True
+
+        with self.assertRaisesRegex(ValueError, "must sum"):
             _handle_dspark(server_args)
 
 

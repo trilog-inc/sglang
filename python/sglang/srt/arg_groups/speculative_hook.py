@@ -104,10 +104,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
     if (
         server_args.speculative_draft_device is not None
-        and server_args.speculative_algorithm != "DSPARK"
-    ):
+        or server_args.speculative_draft_helper_device is not None
+        or server_args.speculative_draft_num_gpu_experts_per_device is not None
+    ) and server_args.speculative_algorithm != "DSPARK":
         raise ValueError(
-            "--speculative-draft-device is currently supported only with "
+            "Remote speculative draft device options are currently supported only with "
             "--speculative-algorithm DSPARK."
         )
 
@@ -310,6 +311,39 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "rebuilt alongside the target KV. In-memory radix-cache reuse is "
                 "supported."
             )
+
+    helper_device = server_args.speculative_draft_helper_device
+    helper_counts = server_args.speculative_draft_num_gpu_experts_per_device
+    if helper_device is not None and server_args.speculative_draft_device is None:
+        raise ValueError(
+            "--speculative-draft-helper-device requires --speculative-draft-device."
+        )
+    if (helper_device is None) != (helper_counts is None):
+        raise ValueError(
+            "--speculative-draft-helper-device and "
+            "--speculative-draft-num-gpu-experts-per-device must be provided "
+            "together."
+        )
+    if helper_counts is not None:
+        counts = [int(value) for value in helper_counts]
+        if len(counts) != 2 or any(count <= 0 for count in counts):
+            raise ValueError(
+                "--speculative-draft-num-gpu-experts-per-device requires exactly "
+                f"two positive counts, got {counts}."
+            )
+        hf_config = server_args.get_model_config().hf_config
+        num_experts = int(getattr(hf_config, "n_routed_experts", 0) or 0)
+        if num_experts <= 0 or sum(counts) != num_experts:
+            raise ValueError(
+                "Two-device DSpark expert counts must sum to the checkpoint's "
+                f"n_routed_experts ({num_experts}), got {counts}."
+            )
+        if not _target_checkpoint_bundles_dspark_draft(server_args):
+            raise ValueError(
+                "Two-device DSpark expert placement currently requires a bundled "
+                "DeepSeek-V4 MTP checkpoint."
+            )
+        server_args.speculative_draft_num_gpu_experts_per_device = counts
 
     if server_args.enable_dp_attention:
         if not server_args.enable_dp_lm_head:
