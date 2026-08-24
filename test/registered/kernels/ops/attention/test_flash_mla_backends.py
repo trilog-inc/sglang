@@ -563,9 +563,11 @@ class TestEntryPointDispatch(CustomTestCase):
 
     def test_flashinfer_backend_matches_triton(self):
         """FlashInfer SM120 sparse MLA decode matches Triton reference."""
-        import importlib
-
-        if importlib.util.find_spec("flashinfer.sparse_mla_sm120") is None:
+        try:
+            from flashinfer.mla._sparse_mla_sm120 import (  # noqa: F401
+                _sparse_mla_sm120_paged_attention,
+            )
+        except (AttributeError, ImportError, ModuleNotFoundError):
             self.skipTest("FlashInfer SM120 sparse MLA not available")
 
         k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
