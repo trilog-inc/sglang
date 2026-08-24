@@ -570,16 +570,34 @@ class TestEntryPointDispatch(CustomTestCase):
         except (AttributeError, ImportError, ModuleNotFoundError):
             self.skipTest("FlashInfer SM120 sparse MLA not available")
 
-        k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
-        q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
-        topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
+        # Use the production DSV4 decode envelope. Smaller toy head/top-k
+        # shapes are routed by FlashInfer to generic paged attention, which is
+        # intentionally restricted to num_tokens > 64.
+        batch_size, num_heads, topk = 1, 128, 128
+        num_pages, page_size = 4, 128
+        k_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=5)
+        q, indices = _build_q_indices(
+            batch_size,
+            num_heads,
+            topk,
+            num_pages,
+            page_size,
+            device=self.device,
+            seed=13,
+        )
+        topk_length = torch.full(
+            (batch_size,), topk, dtype=torch.int32, device=self.device
+        )
+        attn_sink = torch.full(
+            (num_heads,), -4.0, dtype=torch.float32, device=self.device
+        )
 
         kwargs = dict(
             q=q,
             k_cache=k_cache,
             indices=indices,
             topk_length=topk_length,
-            attn_sink=None,
+            attn_sink=attn_sink,
             head_dim_v=_D,
             softmax_scale=_D**-0.5,
         )
