@@ -234,7 +234,7 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
         self.assertFalse(args.enable_hierarchical_cache)
         self.assertTrue(args.disable_radix_cache)
 
-    def test_pd_dp_attention_tbo_spec_and_cp_are_rejected(self):
+    def test_pd_dp_attention_tbo_non_native_spec_and_cp_are_rejected(self):
         cases = (
             ({"disaggregation_mode": "prefill"}, "PD/disaggregation"),
             ({"disaggregation_mode": "decode"}, "PD/disaggregation"),
@@ -245,7 +245,7 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 {"enable_piecewise_cuda_graph": True},
                 "piecewise-cuda-graph",
             ),
-            ({"speculative_algorithm": "EAGLE"}, "MTP/speculative"),
+            ({"speculative_algorithm": "EAGLE3"}, "checkpoint-native"),
             (
                 {"enable_nsa_prefill_context_parallel": True},
                 "context-parallel",
@@ -255,6 +255,16 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
             with self.subTest(overrides=overrides):
                 with self.assertRaisesRegex(ValueError, message):
                     self.validate(_boundary_args(**overrides))
+
+    def test_checkpoint_native_eagle_mtp_is_accepted(self):
+        for algorithm in ("EAGLE", "NEXTN"):
+            with self.subTest(algorithm=algorithm):
+                args = _boundary_args(speculative_algorithm=algorithm)
+
+                self.validate(args)
+
+                self.assertEqual(args.speculative_algorithm, algorithm)
+                self.assertTrue(args._glm5_next_session_ab_active)
 
     def test_tp1_tp2_tp4_and_tp8_are_accepted(self):
         for tp_size in (1, 2, 4, 8):

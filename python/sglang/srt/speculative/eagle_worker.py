@@ -1,5 +1,9 @@
+import copy
+import dataclasses
 import logging
+import os
 import time
+from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import torch
@@ -32,6 +36,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_device import (
+    draft_cuda_device_context,
+    resolve_speculative_draft_device,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -96,8 +104,57 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.enable_nan_detection = server_args.enable_nan_detection
+        self.target_gpu_id = gpu_id
         self.gpu_id = gpu_id
         self.device = server_args.device
+        self.target_device = (
+            torch.device("cuda", gpu_id) if is_cuda() else server_args.device
+        )
+        self.draft_gpu_id = (
+            resolve_speculative_draft_device(server_args.speculative_draft_device)
+            if server_args.speculative_draft_device is not None
+            else gpu_id
+        )
+        if (
+            server_args.speculative_draft_device is not None
+            and self.draft_gpu_id == gpu_id
+        ):
+            raise ValueError(
+                "--speculative-draft-device resolves to the target CUDA device "
+                f"{gpu_id}; omit it for same-GPU drafting or select another GPU."
+            )
+        self._remote_draft = self.draft_gpu_id != gpu_id
+        self.draft_device = (
+            torch.device("cuda", self.draft_gpu_id)
+            if is_cuda()
+            else torch.device(server_args.device)
+        )
+        self._remote_req_owner: dict[int, int] = {}
+        self._remote_req_synced_len: dict[int, int] = {}
+        self._remote_req_owner_serial = 0
+        if self._remote_draft:
+            capability = torch.cuda.get_device_capability(self.draft_gpu_id)
+            if capability != (8, 9):
+                raise ValueError(
+                    "GLM-5-Next remote MTP is currently validated for an RTX "
+                    f"4090-class SM89 GPU, got SM{capability[0]}{capability[1]}."
+                )
+            peer_access = torch.cuda.can_device_access_peer(
+                gpu_id, self.draft_gpu_id
+            )
+            logger.info(
+                "GLM-5-Next heterogeneous MTP enabled: target=cuda:%d, "
+                "draft=cuda:%d (%s), peer_access=%s.",
+                gpu_id,
+                self.draft_gpu_id,
+                torch.cuda.get_device_name(self.draft_gpu_id),
+                peer_access,
+            )
+            if not peer_access:
+                logger.warning(
+                    "CUDA peer access is unavailable between target and draft; "
+                    "PyTorch will use its host-staged copy path."
+                )
         self.target_worker = target_worker
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -113,9 +170,11 @@ class EAGLEWorker(TpModelWorker):
         server_args.disable_cuda_graph = True
         # Share the allocator with a target worker.
         # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+        target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
+        self.req_to_token_pool = target_req_to_token_pool
+        self.token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
 
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -139,10 +198,10 @@ class EAGLEWorker(TpModelWorker):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
+        ), self._draft_cuda_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
             super().__init__(
                 server_args=server_args,
-                gpu_id=gpu_id,
+                gpu_id=self.draft_gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
@@ -151,8 +210,57 @@ class EAGLEWorker(TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                req_to_token_pool=(None if self._remote_draft else self.req_to_token_pool),
+                token_to_kv_pool_allocator=(
+                    None if self._remote_draft else self.token_to_kv_pool_allocator
+                ),
+            )
+
+        # TpModelWorker represents the draft runner and therefore records its
+        # GPU.  EAGLEWorker itself still coordinates target-side allocation and
+        # verification, so retain an explicit target identity here.
+        self.gpu_id = self.target_gpu_id
+        self.device = server_args.device
+        self._preserve_heterogeneous_flashinfer_arches()
+
+        if self._remote_draft:
+            # EAGLE's scheduling and verification logic must continue to use
+            # the target allocator.  The draft ModelRunner owns a same-sized
+            # physical KV pool on the 4090 and writes the same logical cache
+            # locations there.
+            self.draft_req_to_token_pool = self.draft_model_runner.req_to_token_pool
+            self.draft_token_to_kv_pool_allocator = (
+                self.draft_model_runner.token_to_kv_pool_allocator
+            )
+            self.req_to_token_pool = target_req_to_token_pool
+            self.token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
+            if (
+                self.draft_model_runner.max_total_num_tokens
+                < self.target_worker.model_runner.max_total_num_tokens
+            ):
+                raise RuntimeError(
+                    "The remote MTP KV pool is smaller than the target KV pool; "
+                    "reduce --max-total-tokens or increase available memory on "
+                    "the draft GPU."
+                )
+            target_mapping_shape = target_req_to_token_pool.req_to_token.shape
+            draft_mapping_shape = self.draft_req_to_token_pool.req_to_token.shape
+            if any(
+                draft_size < target_size
+                for draft_size, target_size in zip(
+                    draft_mapping_shape, target_mapping_shape
+                )
+            ):
+                raise RuntimeError(
+                    "The remote MTP request mapping is smaller than the target "
+                    f"mapping ({tuple(draft_mapping_shape)} < "
+                    f"{tuple(target_mapping_shape)}); reduce the target request "
+                    "or context limits."
+                )
+        else:
+            self.draft_req_to_token_pool = self.req_to_token_pool
+            self.draft_token_to_kv_pool_allocator = (
+                self.token_to_kv_pool_allocator
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -174,6 +282,8 @@ class EAGLEWorker(TpModelWorker):
                     embed.device
                 )
 
+        elif self._remote_draft:
+            self._copy_embed_and_head_to_remote_draft(embed, head)
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
@@ -199,7 +309,7 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
+        with self._draft_cuda_context(), self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
@@ -210,6 +320,152 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def _draft_cuda_context(self):
+        return (
+            draft_cuda_device_context(self.draft_gpu_id)
+            if self._remote_draft
+            else nullcontext()
+        )
+
+    def _preserve_heterogeneous_flashinfer_arches(self) -> None:
+        """Keep lazy FlashInfer builds valid for both GPUs in this process."""
+
+        if (
+            not self._remote_draft
+            or "FLASHINFER_CUDA_ARCH_LIST" not in os.environ
+        ):
+            return
+
+        def arch_for(device_id: int) -> str:
+            major, minor = torch.cuda.get_device_capability(device_id)
+            return f"{major}.{minor}{'a' if major >= 9 else ''}"
+
+        arches = os.environ["FLASHINFER_CUDA_ARCH_LIST"].split()
+        arches.extend((arch_for(self.target_gpu_id), arch_for(self.draft_gpu_id)))
+        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = " ".join(dict.fromkeys(arches))
+
+    def _copy_embed_and_head_to_remote_draft(self, embed, head) -> None:
+        """Populate the already-allocated draft vocabulary modules on RTX 4090."""
+
+        draft_embed, draft_head = (
+            self.draft_model_runner.model.get_embed_and_head()
+        )
+        with self._draft_cuda_context(), torch.no_grad():
+            draft_embed.copy_(embed, non_blocking=True)
+            draft_head.copy_(head, non_blocking=True)
+            torch.cuda.current_stream(self.draft_gpu_id).synchronize()
+
+    @staticmethod
+    def _copy_spec_to_device(spec_info, device):
+        if spec_info is None:
+            return None
+        copied = copy.copy(spec_info)
+        if not dataclasses.is_dataclass(copied):
+            return copied
+        for field in dataclasses.fields(copied):
+            value = getattr(copied, field.name)
+            if isinstance(value, torch.Tensor) and not field.name.endswith("_cpu"):
+                setattr(
+                    copied,
+                    field.name,
+                    value.to(device=device, non_blocking=True),
+                )
+        return copied
+
+    def _model_worker_batch_to_draft(self, model_worker_batch):
+        if not self._remote_draft:
+            return model_worker_batch
+        copied = copy.copy(model_worker_batch)
+        for field in dataclasses.fields(copied):
+            value = getattr(copied, field.name)
+            if isinstance(value, torch.Tensor) and not field.name.endswith("_cpu"):
+                setattr(
+                    copied,
+                    field.name,
+                    value.to(device=self.draft_device, non_blocking=True),
+                )
+        copied.spec_info = self._copy_spec_to_device(
+            model_worker_batch.spec_info, self.draft_device
+        )
+        return copied
+
+    def _remote_owner_for_request(self, req, row: int) -> int:
+        """Return a collision-free owner generation for a request-pool row."""
+
+        if req is None:
+            return row
+        owner = getattr(req, "_glm5_next_remote_mtp_owner", None)
+        if owner is None:
+            self._remote_req_owner_serial += 1
+            owner = self._remote_req_owner_serial
+            setattr(req, "_glm5_next_remote_mtp_owner", owner)
+        return owner
+
+    def _sync_remote_req_to_token(self, model_worker_batch) -> None:
+        """Mirror active target request rows into the independent draft pool."""
+
+        if not self._remote_draft or model_worker_batch.req_pool_indices.numel() == 0:
+            return
+        if model_worker_batch.reqs is not None:
+            rows = [req.req_pool_idx for req in model_worker_batch.reqs]
+        else:
+            rows = model_worker_batch.req_pool_indices.detach().cpu().tolist()
+        if model_worker_batch.seq_lens_cpu is not None:
+            seq_lens = model_worker_batch.seq_lens_cpu.tolist()
+        else:
+            seq_lens = model_worker_batch.seq_lens.detach().cpu().tolist()
+        reqs = model_worker_batch.reqs or [None] * len(rows)
+        target_mapping = self.req_to_token_pool.req_to_token
+        draft_mapping = self.draft_model_runner.req_to_token_pool.req_to_token
+        margin = self.page_size + self.speculative_num_steps + 2
+
+        target_ready = torch.cuda.Event()
+        with torch.cuda.device(self.gpu_id):
+            torch.cuda.current_stream(self.gpu_id).record_event(target_ready)
+        with self._draft_cuda_context():
+            torch.cuda.current_stream(self.draft_gpu_id).wait_event(target_ready)
+            for row, seq_len, req in zip(rows, seq_lens, reqs):
+                row = int(row)
+                owner = self._remote_owner_for_request(req, row)
+                end = min(
+                    int(seq_len) + margin,
+                    int(target_mapping.shape[1]),
+                )
+                if self._remote_req_owner.get(row) != owner:
+                    start = 0
+                else:
+                    start = max(
+                        0,
+                        min(self._remote_req_synced_len.get(row, 0), end) - margin,
+                    )
+                if start < end:
+                    draft_mapping[row, start:end].copy_(
+                        target_mapping[row, start:end], non_blocking=True
+                    )
+                self._remote_req_owner[row] = owner
+                self._remote_req_synced_len[row] = end
+
+    def _copy_draft_capture_to_target(self, target_spec, draft_spec) -> None:
+        for name in ("topk_p", "topk_index", "hidden_states"):
+            value = getattr(draft_spec, name, None)
+            setattr(
+                target_spec,
+                name,
+                None
+                if value is None
+                else value.to(device=self.target_device, non_blocking=True),
+            )
+
+    def _handoff_draft_to_target(self) -> None:
+        """Make target work wait for asynchronous draft-to-target copies."""
+
+        if not self._remote_draft:
+            return
+        ready = torch.cuda.Event()
+        torch.cuda.current_stream(self.draft_gpu_id).record_event(ready)
+        with torch.cuda.device(self.gpu_id):
+            torch.cuda.current_stream(self.gpu_id).wait_event(ready)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -236,6 +492,16 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
+            return
+
+        if self._remote_draft:
+            # The existing graph runners assume target and draft buffers share
+            # one CUDA device.  Keep target graphs enabled while running the
+            # comparatively small MTP model eagerly on the 4090.
+            logger.info(
+                "Draft CUDA graphs are disabled for heterogeneous MTP; "
+                "target-model CUDA graphs remain enabled."
+            )
             return
 
         Device2DraftCudaGraphRunner = {
@@ -537,81 +803,97 @@ class EAGLEWorker(TpModelWorker):
         else:
             self._draft_preprocess_decode(batch)
 
-        spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
+        target_spec_info = batch.spec_info
+        assert isinstance(target_spec_info, EagleDraftInput)
 
-        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_req = self.topk
-        spec_info.num_tokens_for_logprob_per_req = self.topk
+        target_spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        target_spec_info.num_tokens_per_req = self.topk
+        target_spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
-        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
-        )
-        if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
-            )
-        else:
-            forward_batch.can_run_dp_cuda_graph = False
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for idle mode or 1-step draft
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
-            )
+        self._sync_remote_req_to_token(model_worker_batch)
 
-        if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
-                self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
+        with self._draft_cuda_context():
+            model_worker_batch = self._model_worker_batch_to_draft(
+                model_worker_batch
             )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            spec_info = forward_batch.spec_info
+            assert isinstance(spec_info, EagleDraftInput)
+            can_cuda_graph = (
+                self.cuda_graph_runner
+                and self.cuda_graph_runner.can_run(forward_batch)
+            )
+            if can_cuda_graph:
+                parent_list, top_scores_index, draft_tokens = (
+                    self.cuda_graph_runner.replay(forward_batch)
+                )
+            else:
+                forward_batch.can_run_dp_cuda_graph = False
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    # Skip attention backend init for idle mode or 1-step draft
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                # Run forward steps
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
 
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            batch.seq_lens,
-            batch.seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-        )
+            if batch.forward_mode.is_idle():
+                verify_input = EagleVerifyInput.create_idle_input(
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                )
+            else:
+                (
+                    tree_mask,
+                    position,
+                    retrive_index,
+                    retrive_next_token,
+                    retrive_next_sibling,
+                    draft_tokens,
+                ) = build_tree_kernel_efficient(
+                    spec_info.verified_id,
+                    parent_list,
+                    top_scores_index,
+                    draft_tokens,
+                    forward_batch.seq_lens,
+                    batch.seq_lens_sum,
+                    self.topk,
+                    self.speculative_num_steps,
+                    self.speculative_num_draft_tokens,
+                )
 
-        return EagleVerifyInput(
-            draft_token=draft_tokens,
-            custom_mask=tree_mask,
-            positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
-            topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-        )
+                verify_input = EagleVerifyInput(
+                    draft_token=draft_tokens,
+                    custom_mask=tree_mask,
+                    positions=position,
+                    retrive_index=retrive_index,
+                    retrive_next_token=retrive_next_token,
+                    retrive_next_sibling=retrive_next_sibling,
+                    retrive_cum_len=None,
+                    spec_steps=self.speculative_num_steps,
+                    topk=self.topk,
+                    draft_token_num=self.server_args.speculative_num_draft_tokens,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=forward_batch.seq_lens_sum,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
+                )
+
+            if self._remote_draft:
+                verify_input = self._copy_spec_to_device(
+                    verify_input, self.target_device
+                )
+                self._handoff_draft_to_target()
+            return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -700,8 +982,14 @@ class EAGLEWorker(TpModelWorker):
         return parent_list, top_scores_index, draft_tokens
 
     def clear_cache_pool(self):
-        # allocator and kv cache pool are shared with target worker
-        pass
+        if not self._remote_draft:
+            # Allocator and request rows are shared with the target worker.
+            return
+        with self._draft_cuda_context():
+            self.draft_req_to_token_pool.clear()
+            self.draft_token_to_kv_pool_allocator.clear()
+        self._remote_req_owner.clear()
+        self._remote_req_synced_len.clear()
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
@@ -901,18 +1189,34 @@ class EAGLEWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
-        forward_batch.return_logprob = False
-        if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        target_spec_info = batch.spec_info
+        self._sync_remote_req_to_token(model_worker_batch)
+        with self._draft_cuda_context():
+            model_worker_batch = self._model_worker_batch_to_draft(
+                model_worker_batch
+            )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            forward_batch.return_logprob = False
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds.to(
+                    self.draft_device, non_blocking=True
+                )
+            logits_output = self.draft_model_runner.forward(
+                forward_batch
+            ).logits_output
+            if self.enable_nan_detection:
+                detect_nan(logits_output)
+            assert isinstance(forward_batch.spec_info, EagleDraftInput)
+            if not self._remote_draft:
+                assert forward_batch.spec_info is target_spec_info
+            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            if self._remote_draft:
+                self._copy_draft_capture_to_target(
+                    target_spec_info, forward_batch.spec_info
+                )
+                self._handoff_draft_to_target()
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         assert isinstance(batch.spec_info, EagleDraftInput)
@@ -955,43 +1259,56 @@ class EAGLEWorker(TpModelWorker):
         )
 
         batch.return_hidden_states = False
+        target_spec_info = batch.spec_info
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
-        if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-        else:
-            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+        self._sync_remote_req_to_token(model_worker_batch)
+        with self._draft_cuda_context():
+            model_worker_batch = self._model_worker_batch_to_draft(
+                model_worker_batch
+            )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            if forward_batch.seq_lens_cpu is not None:
+                forward_batch.seq_lens_sum = (
+                    forward_batch.seq_lens_cpu.sum().item()
+                )
+            else:
+                forward_batch.seq_lens_sum = forward_batch.seq_lens.sum().item()
 
-        # Run
-        can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
-        )
-        if can_cuda_graph:
-            logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                forward_batch
+            # Run
+            can_cuda_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
             )
-            forward_batch.spec_info.topk_p, forward_batch.spec_info.topk_index = (
-                logits_output.topk_p,
-                logits_output.topk_index,
-            )
-            forward_batch.spec_info.hidden_states = logits_output.hidden_states
-        else:
-            forward_batch.can_run_dp_cuda_graph = False
-            if not forward_batch.forward_mode.is_idle():
-                self.draft_model_runner.attn_backend.init_forward_metadata(
+            if can_cuda_graph:
+                logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch
                 )
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+                (
+                    forward_batch.spec_info.topk_p,
+                    forward_batch.spec_info.topk_index,
+                ) = (logits_output.topk_p, logits_output.topk_index)
+                forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            else:
+                forward_batch.can_run_dp_cuda_graph = False
+                if not forward_batch.forward_mode.is_idle():
+                    self.draft_model_runner.attn_backend.init_forward_metadata(
+                        forward_batch
+                    )
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+                self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+            if self.enable_nan_detection:
+                detect_nan(logits_output)
+            if self._remote_draft:
+                self._copy_draft_capture_to_target(
+                    target_spec_info, forward_batch.spec_info
+                )
+                self._handoff_draft_to_target()
 
         # Restore backup.
         # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
@@ -1016,10 +1333,11 @@ class EAGLEWorker(TpModelWorker):
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
-        success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
-            load_format=recv_req.load_format,
-        )
+        with self._draft_cuda_context():
+            success, message = self.model_runner.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=recv_req.load_format,
+            )
         if not success:
             return success, message
 

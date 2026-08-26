@@ -413,6 +413,11 @@ class TestGlm5NextConfig(unittest.TestCase):
         self.assertTrue(capabilities.uses_zero_rope_mla)
         self.assertTrue(capabilities.uses_mhc)
 
+        root.architectures = ["Glm5NextForConditionalGenerationNextN"]
+        draft_capabilities = self.config_module.get_glm5_next_capabilities(root)
+        self.assertTrue(draft_capabilities.is_glm5_next)
+        self.assertTrue(draft_capabilities.uses_kpool4_compress)
+
         non_glm = SimpleNamespace(
             model_type="kimi_linear",
             architectures=["KimiLinearForCausalLM"],

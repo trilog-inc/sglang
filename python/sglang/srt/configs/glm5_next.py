@@ -15,6 +15,9 @@ from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
 
 _GLM5_NEXT_ARCH = "Glm5NextForConditionalGeneration"
+_GLM5_NEXT_ARCHES = frozenset(
+    (_GLM5_NEXT_ARCH, "Glm5NextForConditionalGenerationNextN")
+)
 GLM5_NEXT_SUPPORTED_TP_SIZES = frozenset((1, 2, 4, 8))
 
 
@@ -563,7 +566,9 @@ def is_glm5_next(config: Any) -> bool:
     architectures = getattr(root, "architectures", None) or getattr(
         text, "architectures", None
     )
-    architecture_matches = architectures is None or _GLM5_NEXT_ARCH in architectures
+    architecture_matches = architectures is None or bool(
+        _GLM5_NEXT_ARCHES.intersection(architectures)
+    )
     return architecture_matches and (
         root_type == Glm5NextConfig.model_type
         or text_type == Glm5NextTextConfig.model_type

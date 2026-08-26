@@ -126,8 +126,6 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
             raise NotImplementedError(
                 "GLM-5-Next KPool does not support NSA prefill context parallel"
             )
-        if is_nextn:
-            raise NotImplementedError("GLM-5-Next KPool does not support MTP layers")
         if not skip_rope:
             raise ValueError("GLM-5-Next DSA requires skip_rope=True")
         if layer_id is None:
@@ -195,7 +193,11 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
         )
         self.use_nsa = True
         self.nsa_enable_prefill_cp = False
-        self.is_nextn = False
+        # The appended NextN block owns a complete DSA indexer and computes
+        # fresh top-k indices on every draft step. Keep the base constructor
+        # on its non-sharing path, but retain the marker for the inherited
+        # attention forward and model introspection.
+        self.is_nextn = is_nextn
         self.skip_rope = True
         self.rotary_emb = None
 

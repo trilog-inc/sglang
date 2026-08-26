@@ -1722,7 +1722,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         model is accidentally routed through the stateful KDA scheduler.
         """
 
-        if getattr(self.model_config, "is_glm5_next", False):
+        if (
+            getattr(self.model_config, "is_glm5_next", False)
+            and not self.is_draft_worker
+        ):
             return self.model_config.hf_text_config
         return None
 

@@ -5,9 +5,8 @@ GLM-5-Next capability gate.  It does not add KPool fields to the shared NSA
 or hybrid pools, so existing Kimi and DeepSeek models retain their original
 allocation and indexing contracts.
 
-Only eager, non-speculative execution is part of the initial bring-up.  PD,
-MTP, CP, and CUDA-graph state transfer are intentionally not implemented
-here.
+PD and CP state transfer remain outside this isolated implementation. The
+checkpoint-native draft path allocates a compact one-layer DSA pool.
 """
 
 from __future__ import annotations
@@ -245,11 +244,11 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         target[loc] = scale
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        """Fail closed for the speculative-only cache relocation contract."""
+        """Fail closed for the top-k tree cache-relocation contract."""
 
         raise NotImplementedError(
-            "GLM-5-Next KV-cache relocation is outside the current boundary: "
-            "MTP/speculative decoding is not supported"
+            "GLM-5-Next MTP supports topk=1 only; KV-cache relocation for "
+            "multi-branch speculative trees is not implemented"
         )
 
     def clear_compress_tail_rows(
@@ -334,11 +333,11 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
     is_glm5_next_kpool = True
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
-        """Reject the speculative-only relocation API at the public pool seam."""
+        """Reject multi-branch speculative relocation at the public seam."""
 
         raise NotImplementedError(
-            "GLM-5-Next KV-cache relocation is outside the current boundary: "
-            "MTP/speculative decoding is not supported"
+            "GLM-5-Next MTP supports topk=1 only; KV-cache relocation for "
+            "multi-branch speculative trees is not implemented"
         )
 
     def __init__(
@@ -538,22 +537,55 @@ def _glm5_next_pool_predicate(model_config, server_args) -> bool:
     return is_glm5_next(model_config) and uses_kpool4_compress(model_config)
 
 
-def build_glm5_next_kv_pool(*, model_runner: "ModelRunner") -> Glm5NextHybridKVPool:
+def build_glm5_next_kv_pool(
+    *, model_runner: "ModelRunner"
+) -> Glm5NextHybridKVPool | Glm5NextNSATokenToKVPool:
     """ModelRunner-facing factory registered only for exact GLM-5-Next KPool4."""
 
     model_config = model_runner.model_config
     if not _glm5_next_pool_predicate(model_config, model_runner.server_args):
         raise ValueError("GLM-5-Next KV pool factory received a non-GLM configuration")
-    if model_runner.is_draft_worker:
-        raise NotImplementedError("GLM-5-Next MTP/draft KV pools are out of scope")
     if not model_runner.use_mla_backend:
         raise ValueError("GLM-5-Next DSA requires the MLA backend")
-    if not hasattr(model_runner.req_to_token_pool, "mamba_pool"):
+    if (
+        not model_runner.is_draft_worker
+        and not hasattr(model_runner.req_to_token_pool, "mamba_pool")
+    ):
         raise RuntimeError(
             "GLM-5-Next requires HybridReqToTokenPool before constructing its KV pool"
         )
 
     text_config = model_config.hf_text_config
+    if model_runner.is_draft_worker:
+        # The appended block is one DSA layer.  Do not allocate the target's
+        # 34 KDA recurrent states merely because they share one HF config.
+        pool = Glm5NextNSATokenToKVPool(
+            size=model_runner.max_total_num_tokens,
+            page_size=model_runner.page_size,
+            kv_lora_rank=model_config.kv_lora_rank,
+            dtype=model_runner.kv_cache_dtype,
+            qk_rope_head_dim=model_config.qk_rope_head_dim,
+            layer_num=1,
+            device=model_runner.device,
+            index_head_dim=text_config.index_head_dim,
+            enable_memory_saver=model_runner.server_args.enable_memory_saver,
+            kv_cache_dim=model_runner.calculate_mla_kv_cache_dim(),
+            req_pool_size=model_runner.req_to_token_pool.size,
+            index_kpool=text_config.index_kpool,
+            index_kpool_compress=text_config.index_kpool_compress,
+            index_kpool_always_select_tail=(
+                text_config.index_kpool_always_select_tail
+            ),
+            start_layer=0,
+            end_layer=1,
+        )
+        from sglang.srt.managers.glm5_next_kpool_coordinator import (
+            attach_glm5_next_kpool_lifecycle,
+        )
+
+        pool.kpool_lifecycle_coordinator = attach_glm5_next_kpool_lifecycle(pool)
+        return pool
+
     full_attention_layer_ids = [
         layer_id
         for layer_id in text_config.full_attention_layer_ids

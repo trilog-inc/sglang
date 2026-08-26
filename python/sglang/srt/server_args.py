@@ -640,6 +640,7 @@ class ServerArgs:
     speculative_algorithm: Optional[str] = None
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
+    speculative_draft_device: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
@@ -1426,10 +1427,11 @@ class ServerArgs:
                 f"accepted topology. Got {topology}."
             )
 
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm not in (None, "EAGLE", "NEXTN"):
             raise ValueError(
-                "GLM-5-Next MTP/speculative decoding is outside the current "
-                "Session AB adaptation boundary."
+                "GLM-5-Next supports only its checkpoint-native EAGLE/NextN "
+                "MTP path; got speculative_algorithm="
+                f"{self.speculative_algorithm!r}."
             )
         if self.enable_nsa_prefill_context_parallel:
             raise ValueError(
@@ -3024,6 +3026,15 @@ class ServerArgs:
 
     def _handle_speculative_decoding(self):
         if (
+            self.speculative_draft_device is not None
+            and self.speculative_algorithm not in ("EAGLE", "NEXTN")
+        ):
+            raise ValueError(
+                "--speculative-draft-device requires "
+                "--speculative-algorithm EAGLE or NEXTN."
+            )
+
+        if (
             self.speculative_draft_model_path is not None
             and self.speculative_draft_model_revision is None
         ):
@@ -3090,6 +3101,40 @@ class ServerArgs:
                 )
 
             model_arch = self.get_model_config().hf_config.architectures[0]
+            if (
+                model_arch == "Glm5NextForConditionalGeneration"
+                and envs.SGLANG_ENABLE_SPEC_V2.get()
+            ):
+                raise ValueError(
+                    "GLM-5-Next checkpoint-native MTP currently requires spec "
+                    "v1; unset SGLANG_ENABLE_SPEC_V2."
+                )
+            if self.speculative_draft_device is not None:
+                if model_arch != "Glm5NextForConditionalGeneration":
+                    raise ValueError(
+                        "--speculative-draft-device is currently validated only "
+                        "for GLM-5-Next's checkpoint-native MTP block."
+                    )
+                if not self.device.startswith("cuda"):
+                    raise ValueError(
+                        "--speculative-draft-device requires a CUDA target."
+                    )
+                if (self.tp_size, self.dp_size, self.pp_size) != (1, 1, 1):
+                    raise ValueError(
+                        "A single remote MTP GPU currently requires "
+                        "tp_size=dp_size=pp_size=1; multi-rank targets need "
+                        "distributed proposal broadcast."
+                    )
+                if self.enable_dp_attention:
+                    raise ValueError(
+                        "--speculative-draft-device does not support DP attention."
+                    )
+                if self.speculative_token_map is not None:
+                    raise ValueError(
+                        "--speculative-draft-device does not support a reduced "
+                        "speculative token map; the remote GLM MTP head uses the "
+                        "checkpoint vocabulary."
+                    )
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
@@ -3097,6 +3142,7 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
+                "Glm5NextForConditionalGeneration",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "BailingMoeV2_5ForCausalLM",
@@ -3125,6 +3171,22 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+            elif model_arch == "Glm5NextForConditionalGeneration":
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
+                if self.speculative_num_draft_tokens is None:
+                    self.speculative_num_draft_tokens = (
+                        self.speculative_num_steps + 1
+                    )
+
+            if (
+                model_arch == "Glm5NextForConditionalGeneration"
+                and self.speculative_eagle_topk != 1
+            ):
+                raise ValueError(
+                    "GLM-5-Next checkpoint-native MTP currently supports only "
+                    "--speculative-eagle-topk 1."
+                )
 
             if (
                 self.attention_backend == "trtllm_mha"
@@ -4660,6 +4722,14 @@ class ServerArgs:
             help="The specific draft model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--speculative-draft-device",
+            type=str,
+            default=ServerArgs.speculative_draft_device,
+            help="Optional CUDA device for GLM-5-Next's MTP draft block. "
+            "Accepts a logical index such as '4', 'cuda:4', or a CUDA GPU UUID. "
+            "The heterogeneous path currently requires TP=DP=PP=1 and spec v1.",
         )
         parser.add_argument(
             "--speculative-draft-load-format",

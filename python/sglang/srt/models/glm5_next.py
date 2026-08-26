@@ -416,10 +416,11 @@ def build_glm5_next_attention(
     quant_config: Optional[QuantizationConfig],
     prefix: str,
     alt_stream: Optional[torch.cuda.Stream] = None,
+    is_nextn: bool = False,
 ) -> nn.Module:
     """Build one attention layer through a GLM-only integration seam."""
 
-    if config.is_kda_layer(layer_idx):
+    if not is_nextn and config.is_kda_layer(layer_idx):
         return Glm5NextLinearAttention(
             layer_idx=layer_idx,
             hidden_size=config.hidden_size,
@@ -445,6 +446,7 @@ def build_glm5_next_attention(
         max_position_embeddings=config.max_position_embeddings,
         alt_stream=alt_stream,
         skip_rope=True,
+        is_nextn=is_nextn,
     )
 
 
@@ -458,6 +460,7 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         if config.mhc is not True:
@@ -468,6 +471,7 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
         self.hidden_size = config.hidden_size
         self.config = config
         self.layer_idx = layer_idx
+        self.is_nextn = is_nextn
         self.alt_stream = alt_stream
         self.is_moe = config.is_moe
         self.mhc_enabled = True
@@ -478,6 +482,7 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             alt_stream=alt_stream,
+            is_nextn=is_nextn,
         )
         if self.mhc_enabled:
             # The mHC communicator owns the attention-output TP all-reduce.
@@ -488,8 +493,13 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
         if (
             self.is_moe
             and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
+            and (
+                is_nextn
+                or (
+                    layer_idx >= config.first_k_dense_replace
+                    and layer_idx % config.moe_layer_freq == 0
+                )
+            )
         ):
             # Register the sparse module only under ``mlp``.  Registering the
             # same module first as ``block_sparse_moe`` makes
@@ -502,6 +512,7 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -540,10 +551,14 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
             is_layer_sparse = self._is_layer_sparse(layer_idx)
             layer_scatter_modes = LayerScatterModes.init_new(
                 layer_id=layer_idx,
-                num_layers=config.num_hidden_layers,
+                num_layers=1 if is_nextn else config.num_hidden_layers,
                 is_layer_sparse=is_layer_sparse,
-                is_previous_layer_sparse=self._is_layer_sparse(layer_idx - 1),
-                is_next_layer_sparse=self._is_layer_sparse(layer_idx + 1),
+                is_previous_layer_sparse=(
+                    False if is_nextn else self._is_layer_sparse(layer_idx - 1)
+                ),
+                is_next_layer_sparse=(
+                    False if is_nextn else self._is_layer_sparse(layer_idx + 1)
+                ),
             )
             if any(
                 mode is ScatterMode.SCATTERED
@@ -564,28 +579,32 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 allow_reduce_scatter=False,
-                is_last_layer=(layer_idx == config.num_hidden_layers - 1),
+                is_last_layer=(
+                    is_nextn or layer_idx == config.num_hidden_layers - 1
+                ),
                 # DSA's absorb path fetches its Q/KV latent through the
                 # attention-TP context after mHC has normalized the layer
                 # input.  KDA consumes the normalized input directly and must
                 # not install a stale DSA callback.
                 qkv_latent_func=(
                     None
-                    if config.is_kda_layer(layer_idx)
+                    if not isinstance(self.self_attn, Glm5NextDSAAttention)
                     else self.self_attn.prepare_qkv_latent
                 ),
-                is_first_layer=(layer_idx == 0),
+                is_first_layer=(is_nextn or layer_idx == 0),
                 hc_mult=hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
                 attn_all_reduce_output_dtype=(
-                    torch.bfloat16 if config.is_kda_layer(layer_idx) else None
+                    torch.bfloat16
+                    if not isinstance(self.self_attn, Glm5NextDSAAttention)
+                    else None
                 ),
             )
 
     def _is_layer_sparse(self, layer_idx: int) -> bool:
-        return (
+        return self.is_nextn or (
             self.is_moe
             and self.config.num_experts is not None
             and layer_idx >= self.config.first_k_dense_replace
@@ -661,7 +680,7 @@ class Glm5NextDecoderLayer(KimiDecoderLayer):
                 "GLM-5-Next mHC expects its cross-layer residual state to be None"
             )
         expected_width = self.hidden_size * (
-            1 if self.layer_idx == 0 else self.config.hc_mult
+            1 if self.is_nextn or self.layer_idx == 0 else self.config.hc_mult
         )
         if hidden_states.shape[-1] != expected_width:
             raise RuntimeError(
@@ -943,6 +962,18 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @property
     def start_layer(self) -> int:
@@ -1350,10 +1381,10 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
                 layer_match = _GLM5_NEXT_LAYER_WEIGHT_RE.match(normalized_name)
                 layer_id = int(layer_match.group(1)) if layer_match else None
 
-                # MTP is deliberately absent from the Session-AB runtime.  The
-                # only legal decoder-layer exclusion is the one configured
-                # appended layer (45 in the pinned checkpoint); a layer 46 or
-                # broader ``>= num_hidden_layers`` skip must fail closed.
+                # The appended MTP block is loaded by the dedicated NextN
+                # draft model.  The only legal target-model exclusion is that
+                # one configured layer (45 in the pinned checkpoint); a layer
+                # 46 or broader ``>= num_hidden_layers`` skip must fail closed.
                 if num_nextn_layers == 1 and layer_id == num_hidden_layers:
                     skipped_mtp.append(source_name)
                     continue
@@ -1441,7 +1472,8 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> None:
         if is_nextn:
             raise RuntimeError(
-                "GLM-5-Next MTP/NextN loading is outside the Session-AB boundary."
+                "Load GLM-5-Next MTP weights through "
+                "Glm5NextForConditionalGenerationNextN, not the target model."
             )
 
         require_complete = not self._checkpoint_source_contract_complete

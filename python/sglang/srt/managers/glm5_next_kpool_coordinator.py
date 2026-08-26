@@ -10,7 +10,12 @@ from sglang.srt.managers.coordinator_registry import register_request_coordinato
 from sglang.srt.managers.forward_hooks_registry import register_forward_hook
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.glm5_next_memory_pool import Glm5NextHybridKVPool
+    from sglang.srt.mem_cache.glm5_next_memory_pool import (
+        Glm5NextHybridKVPool,
+        Glm5NextNSATokenToKVPool,
+    )
+
+    Glm5NextKVPool = Glm5NextHybridKVPool | Glm5NextNSATokenToKVPool
 
 
 class Glm5NextKPoolCoordinator:
@@ -24,7 +29,7 @@ class Glm5NextKPoolCoordinator:
     cleanup points.
     """
 
-    def __init__(self, pool: "Glm5NextHybridKVPool") -> None:
+    def __init__(self, pool: "Glm5NextKVPool") -> None:
         if not getattr(pool, "is_glm5_next_kpool", False):
             raise TypeError("Glm5NextKPoolCoordinator only accepts the exact GLM KPool")
         self.pool = pool
@@ -85,40 +90,43 @@ class Glm5NextKPoolCoordinator:
 
 
 class _Glm5NextKPoolHookAdapter:
-    """Global hook proxy; inert until the exact GLM pool factory attaches."""
+    """Global hook proxy for the target and optional draft KPool instances."""
 
-    _coordinator: Optional[Glm5NextKPoolCoordinator] = None
+    _coordinators: list[Glm5NextKPoolCoordinator] = []
 
     @classmethod
     def attach(cls, coordinator: Optional[Glm5NextKPoolCoordinator]) -> None:
-        cls._coordinator = coordinator
+        if coordinator is None:
+            cls._coordinators = []
+        elif all(item.pool is not coordinator.pool for item in cls._coordinators):
+            cls._coordinators.append(coordinator)
 
     def prepare_kpool_request(self, req_pool_indices) -> None:
-        if self._coordinator is not None:
-            self._coordinator.prepare_kpool_request(req_pool_indices)
+        for coordinator in self._coordinators:
+            coordinator.prepare_kpool_request(req_pool_indices)
 
     def on_request_admit(self, req) -> None:
-        if self._coordinator is not None:
-            self._coordinator.on_request_admit(req)
+        for coordinator in self._coordinators:
+            coordinator.on_request_admit(req)
 
     def on_request_finished(self, req) -> None:
-        if self._coordinator is not None:
-            self._coordinator.on_request_finished(req)
+        for coordinator in self._coordinators:
+            coordinator.on_request_finished(req)
 
     def on_request_retract(self, req) -> None:
-        if self._coordinator is not None:
-            self._coordinator.on_request_retract(req)
+        for coordinator in self._coordinators:
+            coordinator.on_request_retract(req)
 
     def on_cache_flush(self) -> None:
-        if self._coordinator is not None:
-            self._coordinator.reset()
+        for coordinator in self._coordinators:
+            coordinator.reset()
 
 
 _GLM5_NEXT_KPOOL_HOOK = _Glm5NextKPoolHookAdapter()
 
 
 def attach_glm5_next_kpool_lifecycle(
-    pool: "Glm5NextHybridKVPool",
+    pool: "Glm5NextKVPool",
 ) -> Glm5NextKPoolCoordinator:
     coordinator = Glm5NextKPoolCoordinator(pool)
     _Glm5NextKPoolHookAdapter.attach(coordinator)
@@ -132,7 +140,8 @@ def detach_glm5_next_kpool_lifecycle() -> None:
 
 
 def get_glm5_next_kpool_coordinator() -> Optional[Glm5NextKPoolCoordinator]:
-    return _Glm5NextKPoolHookAdapter._coordinator
+    coordinators = _Glm5NextKPoolHookAdapter._coordinators
+    return coordinators[-1] if coordinators else None
 
 
 register_request_coordinator("glm5_next_kpool", Glm5NextKPoolCoordinator)

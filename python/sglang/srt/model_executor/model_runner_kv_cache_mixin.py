@@ -598,9 +598,13 @@ class ModelRunnerKVCacheMixin:
         if getattr(self.model_config, "is_glm5_next", False) and getattr(
             self.model_config, "uses_kpool4_compress", False
         ):
-            local_dsa_layers = sum(
-                self.start_layer <= layer_id < self.end_layer
-                for layer_id in self.model_config.hf_text_config.full_attention_layer_ids
+            local_dsa_layers = (
+                1
+                if self.is_draft_worker
+                else sum(
+                    self.start_layer <= layer_id < self.end_layer
+                    for layer_id in self.model_config.hf_text_config.full_attention_layer_ids
+                )
             )
             self.max_total_num_tokens = self._reserve_glm5_next_kpool_tail(
                 max_total_num_tokens=self.max_total_num_tokens,

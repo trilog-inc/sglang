@@ -39,6 +39,9 @@ class _FakeNSATokenToKVPool:
         self.layer_num = kwargs["layer_num"]
         self.device = kwargs["device"]
         self.start_layer = kwargs.get("start_layer") or 0
+        self.end_layer = kwargs.get("end_layer") or (
+            self.start_layer + self.layer_num
+        )
         self.custom_mem_pool = None
         self.memory_saver_adapter = SimpleNamespace(region=lambda tag: _NullContext())
         self.nsa_kv_cache_store_fp8 = (
@@ -270,7 +273,7 @@ class TestGlm5NextKPoolMemoryPool(unittest.TestCase):
     def test_speculative_cache_move_fails_closed(self):
         pool = _make_hybrid_pool()
         with self.assertRaisesRegex(
-            NotImplementedError, "MTP/speculative decoding is not supported"
+            NotImplementedError, "multi-branch speculative trees"
         ):
             pool.move_kv_cache(
                 torch.tensor([5], dtype=torch.long),
@@ -411,6 +414,63 @@ class TestGlm5NextKPoolMemoryPool(unittest.TestCase):
 
         self.assertEqual(pool.full_attention_layer_id_mapping, {7: 0, 11: 1})
         self.assertIs(pool.mamba_pool, runner.req_to_token_pool.mamba_pool)
+        self.assertIs(pool.kpool_lifecycle_coordinator, lifecycle)
+
+    def test_model_runner_factory_builds_one_compact_draft_dsa_layer(self):
+        text_config = SimpleNamespace(
+            full_attention_layer_ids=[3, 7, 11],
+            index_head_dim=128,
+            index_kpool=4,
+            index_kpool_compress=True,
+            index_kpool_always_select_tail=True,
+        )
+        model_config = SimpleNamespace(
+            exact_glm=True,
+            exact_kpool=True,
+            hf_text_config=text_config,
+            head_dim=256,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            get_num_kv_heads=lambda tp: 1,
+        )
+        runner = SimpleNamespace(
+            model_config=model_config,
+            server_args=SimpleNamespace(enable_memory_saver=False),
+            is_draft_worker=True,
+            use_mla_backend=True,
+            req_to_token_pool=SimpleNamespace(size=6),
+            start_layer=0,
+            end_layer=1,
+            max_total_num_tokens=128,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            page_size=64,
+            device="cpu",
+            calculate_mla_kv_cache_dim=lambda: 512,
+        )
+
+        layers_package = types.ModuleType("sglang.srt.layers")
+        layers_package.__path__ = []
+        dp_attention = types.ModuleType("sglang.srt.layers.dp_attention")
+        dp_attention.get_attention_tp_size = lambda: 1
+        coordinator = types.ModuleType(
+            "sglang.srt.managers.glm5_next_kpool_coordinator"
+        )
+        lifecycle = object()
+        coordinator.attach_glm5_next_kpool_lifecycle = lambda pool: lifecycle
+        with patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.layers": layers_package,
+                dp_attention.__name__: dp_attention,
+                coordinator.__name__: coordinator,
+            },
+        ):
+            pool = POOL.build_glm5_next_kv_pool(model_runner=runner)
+
+        self.assertIsInstance(pool, POOL.Glm5NextNSATokenToKVPool)
+        self.assertEqual(pool.layer_num, 1)
+        self.assertEqual(pool.start_layer, 0)
+        self.assertEqual(pool.end_layer, 1)
         self.assertIs(pool.kpool_lifecycle_coordinator, lifecycle)
 
 

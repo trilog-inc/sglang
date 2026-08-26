@@ -245,7 +245,7 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, message):
                     _build(self.module.Glm5NextDSAAttention, config=config)
 
-    def test_rejects_cp_mtp_and_index_sharing_modes(self):
+    def test_rejects_cp_and_index_sharing_modes_but_accepts_mtp(self):
         invalid_configs = (
             ("index_topk_freq", 2),
             ("index_topk_pattern", "N"),
@@ -258,8 +258,9 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _build(self.module.Glm5NextDSAAttention, config=config)
 
-        with self.assertRaisesRegex(NotImplementedError, "MTP"):
-            _build(self.module.Glm5NextDSAAttention, is_nextn=True)
+        mtp_attention = _build(self.module.Glm5NextDSAAttention, is_nextn=True)
+        self.assertTrue(mtp_attention.is_nextn)
+        self.assertFalse(mtp_attention.skip_topk)
 
         cp_module = _load_module(cp_enabled=True)
         with self.assertRaisesRegex(NotImplementedError, "context parallel"):
