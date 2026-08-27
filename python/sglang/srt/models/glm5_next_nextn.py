@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Optional
 
@@ -32,6 +33,50 @@ from sglang.srt.models.glm5_next import (
 from sglang.srt.models.glm5_next_norm import Glm5NextRMSNorm
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils.common import BumpAllocator
+
+
+_NEXTN_SPECIFIC_WEIGHT_NAMES = (
+    "shared_head.norm",
+    "eh_proj",
+    "enorm",
+    "hnorm",
+)
+
+
+def _remap_nextn_quant_config(
+    config: Glm5NextTextConfig,
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Map checkpoint FP8 exclusions into the compact draft namespace.
+
+    The serialized configuration describes the appended layer as
+    ``model.layers.<num_hidden_layers>``.  The generic NextN loader maps its
+    decoder tensors to ``model.decoder`` and its four MTP-only tensors to
+    ``model``.  Preserve that exact mixed-precision contract during module
+    construction instead of allocating checkpoint-native BF16 tensors as FP8.
+    """
+
+    ignored_layers = getattr(quant_config, "ignored_layers", None)
+    if quant_config is None or not ignored_layers:
+        return quant_config
+
+    layer_prefix = f"model.layers.{config.num_hidden_layers}"
+    remapped_layers = list(ignored_layers)
+    for checkpoint_name in ignored_layers:
+        if not checkpoint_name.startswith(layer_prefix):
+            continue
+        runtime_prefix = (
+            "model"
+            if any(name in checkpoint_name for name in _NEXTN_SPECIFIC_WEIGHT_NAMES)
+            else "model.decoder"
+        )
+        remapped_layers.append(
+            checkpoint_name.replace(layer_prefix, runtime_prefix, 1)
+        )
+
+    draft_quant_config = copy.copy(quant_config)
+    draft_quant_config.ignored_layers = list(dict.fromkeys(remapped_layers))
+    return draft_quant_config
 
 
 class Glm5NextModelNextN(nn.Module):
@@ -132,7 +177,8 @@ class Glm5NextForConditionalGenerationNextN(Glm5NextForConditionalGeneration):
         nn.Module.__init__(self)
         text_config = getattr(config, "text_config", config)
         self.config = text_config
-        self.quant_config = quant_config
+        draft_quant_config = _remap_nextn_quant_config(text_config, quant_config)
+        self.quant_config = draft_quant_config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_group = get_pp_group()
         self.num_fused_shared_experts = 0
@@ -140,13 +186,15 @@ class Glm5NextForConditionalGenerationNextN(Glm5NextForConditionalGeneration):
 
         self.model = Glm5NextModelNextN(
             text_config,
-            quant_config=quant_config,
+            quant_config=draft_quant_config,
             prefix=maybe_prefix(prefix, "model"),
         )
+        # The checkpoint excludes lm_head from FP8 and both local/remote draft
+        # paths replace this allocation with the target head after loading.
         self.lm_head = ParallelLMHead(
             text_config.vocab_size,
             text_config.hidden_size,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=maybe_prefix(prefix, "model.shared_head.head"),
         )
         self.logits_processor = LogitsProcessor(text_config)
