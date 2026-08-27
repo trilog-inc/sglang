@@ -12,7 +12,12 @@ except:
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
-except ImportError:
+except Exception:
+    # FA4 is optional.  In particular, importing its CUTE sources can fail with
+    # an API error when the installed CUTLASS DSL is newer than the version used
+    # to generate the wheel.  Keep FA3 usable for backends that do not select
+    # FA4; an explicit ver=4 request still fails at the existing availability
+    # check below.
     flash_attn_varlen_func_v4 = None
 
 
