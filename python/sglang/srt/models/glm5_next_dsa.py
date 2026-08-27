@@ -70,17 +70,18 @@ def _validate_glm5_next_dsa_config(config: Glm5NextTextConfig) -> None:
     if config.qk_rope_head_dim != 0:
         raise ValueError("GLM-5-Next DSA is zero-RoPE and requires qk_rope_head_dim=0")
 
-    # KPool's CP/MTP and cross-layer top-k reuse contracts are deliberately
-    # not enabled yet.  Refuse those modes instead of silently entering the
-    # generic DeepSeek paths with a wider (index_topk + 3) index tensor.
+    # KPool's CP and cross-layer top-k reuse contracts are deliberately not
+    # enabled yet.  MTP iteration sharing is checkpoint-native and is handled
+    # by the single-branch speculative KPool transaction below the model
+    # boundary; keep rejecting the unrelated cross-layer forms here.
     if config.index_topk_freq != 1:
         raise ValueError("GLM-5-Next KPool does not support index_topk_freq != 1")
     if config.index_topk_pattern is not None:
         raise ValueError("GLM-5-Next KPool does not support index_topk_pattern")
     if config.index_skip_topk_offset is not None:
         raise ValueError("GLM-5-Next KPool does not support index_skip_topk_offset")
-    if config.index_share_for_mtp_iteration is not False:
-        raise ValueError("GLM-5-Next KPool does not support index sharing for MTP")
+    if not isinstance(config.index_share_for_mtp_iteration, bool):
+        raise ValueError("GLM-5-Next index_share_for_mtp_iteration must be boolean")
 
 
 class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
@@ -193,10 +194,9 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
         )
         self.use_nsa = True
         self.nsa_enable_prefill_cp = False
-        # The appended NextN block owns a complete DSA indexer and computes
-        # fresh top-k indices on every draft step. Keep the base constructor
-        # on its non-sharing path, but retain the marker for the inherited
-        # attention forward and model introspection.
+        # The appended NextN block owns a complete DSA indexer.  For the
+        # released checkpoint it computes top-k on the first MTP iteration and
+        # reuses that row for the remaining single-branch draft steps.
         self.is_nextn = is_nextn
         self.skip_rope = True
         self.rotary_emb = None
@@ -206,8 +206,10 @@ class Glm5NextDSAAttention(DeepseekV2AttentionMLA):
         self.index_topk_freq = 1
         self.index_topk_pattern = None
         self.index_skip_topk_offset = None
-        self.skip_topk = False
-        self.next_skip_topk = False
+        self.skip_topk = bool(
+            is_nextn and config.index_share_for_mtp_iteration
+        )
+        self.next_skip_topk = self.skip_topk
 
         self.indexer = IndexerKPool(
             hidden_size=hidden_size,

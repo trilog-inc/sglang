@@ -280,6 +280,69 @@ class TestGlm5NextKPoolMemoryPool(unittest.TestCase):
                 torch.tensor([3], dtype=torch.long),
             )
 
+    def test_speculative_snapshot_restores_only_touched_pages_and_tails(self):
+        pool = _make_hybrid_pool()
+        index_buffer = pool.get_index_k_with_scale_buffer(7)
+        tail_k, tail_score = pool.get_compress_tail_buffers(7)
+        index_buffer[0].fill_(3)
+        tail_k[2].fill_(5)
+        tail_score[2].fill_(7)
+
+        snapshot = pool.snapshot_speculative_kpool_state(
+            layer_id=7,
+            req_pool_indices=torch.tensor([2]),
+            packed_write_locs=torch.tensor([0]),
+        )
+        index_buffer[0].zero_()
+        tail_k[2].zero_()
+        tail_score[2].zero_()
+        snapshot.restore()
+
+        self.assertTrue(torch.all(index_buffer[0] == 3))
+        self.assertTrue(torch.all(tail_k[2] == 5))
+        self.assertTrue(torch.all(tail_score[2] == 7))
+
+    def test_single_branch_speculative_commit_keeps_only_accepted_prefix(self):
+        pool = _make_hybrid_pool()
+        sparse = pool.full_kv_pool
+        sparse.kpool_decode_update_index_cache = Mock()
+        rows = 8
+        key = torch.arange(rows * 128, dtype=torch.float32).view(rows, 128).to(
+            torch.bfloat16
+        )
+        score = key + 1
+        req_rows = torch.tensor([1] * 4 + [2] * 4)
+        positions = torch.tensor([10, 11, 12, 13, 20, 21, 22, 23])
+        seq_lens = positions + 1
+        out_cache_loc = torch.arange(30, 30 + rows)
+        block_tables = torch.arange(rows).view(rows, 1)
+
+        pool.stage_speculative_kpool_layer(
+            layer_id=7,
+            key=key,
+            slot_score=score,
+            ape=torch.zeros((4, 128), dtype=torch.float32),
+            block_tables=block_tables,
+            req_pool_indices=req_rows,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            batch_size=2,
+            tokens_per_request=4,
+            round_scale=True,
+        )
+        pool.commit_speculative_kpool([2, 1])
+
+        self.assertEqual(sparse.kpool_decode_update_index_cache.call_count, 2)
+        first = sparse.kpool_decode_update_index_cache.call_args_list[0].kwargs
+        second = sparse.kpool_decode_update_index_cache.call_args_list[1].kwargs
+        self.assertEqual(first["layer_id"], 1)
+        self.assertTrue(torch.equal(first["req_pool_indices"], torch.tensor([1, 2])))
+        self.assertTrue(torch.equal(first["positions"], torch.tensor([10, 20])))
+        self.assertTrue(torch.equal(second["req_pool_indices"], torch.tensor([1])))
+        self.assertTrue(torch.equal(second["positions"], torch.tensor([11])))
+        self.assertEqual(sparse._speculative_kpool_layers, {})
+
     def test_zero_rope_fp8_uses_raw_trtllm_cache_layout(self):
         pool = _make_hybrid_pool()
         self.assertEqual(pool.kv_cache_dim, 512)

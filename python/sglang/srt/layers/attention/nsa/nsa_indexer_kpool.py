@@ -297,8 +297,10 @@ class IndexerKPool(MultiPlatformOp):
     ):
         """Apply the eager multi-pool compression plan and update the tail.
 
-        CP, speculative decoding, and CUDA-graph write plans intentionally live
-        outside this GLM-5-Next bring-up path.
+        Target verification uses this same plan transactionally and rolls the
+        tentative mutation back after top-k. Draft-extend commits an accepted
+        single-branch prefix normally. CP and speculative CUDA-graph write
+        plans remain outside this path.
         """
         assert not return_compressed, "deferred KPool cache writes are unsupported"
         assert write_cache, "eager KPool extend always writes the cache"
@@ -388,7 +390,7 @@ class IndexerKPool(MultiPlatformOp):
                 layer_id=layer_id,
                 metadata=metadata,
             )
-        elif forward_batch.forward_mode.is_extend_without_speculative():
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             return self._compress_write_extend(
                 key=key,
                 gate_score=gate_score,
@@ -401,7 +403,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         else:
             raise NotImplementedError(
-                "index_kpool_compress currently supports decode and extend only."
+                "index_kpool_compress supports decode, extend, and single-branch MTP only."
             )
         return None
 
@@ -1022,7 +1024,7 @@ class IndexerKPool(MultiPlatformOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
         assert _token_pool_from_batch(forward_batch).page_size == 64, (
             "only support page size 64"
         )
@@ -1063,6 +1065,93 @@ class IndexerKPool(MultiPlatformOp):
         x_meta = x[0] if isinstance(x, tuple) else x
         return self._full_topk_for_short_sequence(metadata, x_meta.device)
 
+    def _begin_speculative_kpool_transaction(
+        self,
+        *,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+    ):
+        """Stage/rollback tentative top-k=1 KPool mutations."""
+
+        mode = forward_batch.forward_mode
+        reuse_draft_indices = bool(
+            mode.is_decode()
+            and getattr(forward_batch, "reuse_mtp_topk_indices", False)
+        )
+        if not (mode.is_target_verify() or reuse_draft_indices):
+            return None
+
+        pool = _token_pool_from_batch(forward_batch)
+        batch_size = forward_batch.batch_size
+        if mode.is_target_verify():
+            tokens_per_request = key.shape[0] // batch_size
+            if tokens_per_request * batch_size != key.shape[0]:
+                raise ValueError(
+                    "target-verification KPool rows must be request-major"
+                )
+            expanded_requests = torch.repeat_interleave(
+                forward_batch.req_pool_indices[:batch_size],
+                repeats=tokens_per_request,
+            )
+            plan = getattr(metadata.attn_metadata, "kpool_extend_plan", None)
+            if plan is None:
+                raise RuntimeError(
+                    "target-verification KPool requires an extend transaction plan"
+                )
+            packed_write_locs = plan.writes.write_loc
+            transaction = pool.snapshot_speculative_kpool_state(
+                layer_id=layer_id,
+                req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+                packed_write_locs=packed_write_locs,
+            )
+            pool.stage_speculative_kpool_layer(
+                layer_id=layer_id,
+                key=key,
+                slot_score=gate_score,
+                ape=self.index_kpool_compress_ape,
+                block_tables=metadata.get_page_table_64(),
+                req_pool_indices=expanded_requests,
+                positions=positions,
+                seq_lens=metadata.get_seqlens_expanded(),
+                out_cache_loc=forward_batch.out_cache_loc,
+                batch_size=batch_size,
+                tokens_per_request=tokens_per_request,
+                round_scale=self.scale_fmt is not None,
+            )
+            return transaction
+        else:
+            block_tables = metadata.get_page_table_64()
+            positions_i64 = positions[: key.shape[0]].to(torch.int64)
+            pool_ids = torch.div(
+                positions_i64, self.index_kpool, rounding_mode="floor"
+            )
+            page_columns = (
+                torch.div(
+                    pool_ids, pool.slots_per_page, rounding_mode="floor"
+                )
+                * self.index_kpool
+            )
+            rows = torch.arange(
+                key.shape[0], dtype=torch.long, device=block_tables.device
+            )
+            physical_pages = block_tables[
+                rows, page_columns.to(torch.long)
+            ].to(torch.int64)
+            packed_write_locs = (
+                physical_pages * pool.slots_per_page
+                + torch.remainder(pool_ids, pool.slots_per_page)
+            )
+
+        return pool.snapshot_speculative_kpool_state(
+            layer_id=layer_id,
+            req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+            packed_write_locs=packed_write_locs,
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1074,8 +1163,9 @@ class IndexerKPool(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         """GLM-5-Next KPool forward path.
 
-        Decode (including CUDA-graph replay) and non-speculative extend are
-        supported. CP and MTP remain outside this model-local contract.
+        Decode (including CUDA-graph replay), extend, and the checkpoint's
+        single-branch MTP modes are supported. CP remains outside this
+        model-local contract.
         """
         if is_hip():
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
@@ -1099,10 +1189,12 @@ class IndexerKPool(MultiPlatformOp):
                 dtype=torch.int,
                 device=x_meta.device,
             )
-        if not (mode.is_decode() or mode.is_extend_without_speculative()):
+        if not (
+            mode.is_decode()
+            or mode.is_extend(include_draft_extend_v2=True)
+        ):
             raise NotImplementedError(
-                "GLM-5-Next KPool supports decode (including CUDA graphs) and "
-                "non-speculative extend only"
+                "GLM-5-Next KPool supports decode, extend, and single-branch MTP only"
             )
 
         if mode.is_extend_without_speculative():
@@ -1134,21 +1226,35 @@ class IndexerKPool(MultiPlatformOp):
             )
         else:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-        self._compress_write(
-            x=x,
+        transaction = self._begin_speculative_kpool_transaction(
             key=key,
+            gate_score=gate_score,
             positions=positions,
             forward_batch=forward_batch,
             layer_id=layer_id,
             metadata=metadata,
-            gate_score=gate_score,
         )
-        if not return_indices:
-            return None
+        try:
+            self._compress_write(
+                x=x,
+                key=key,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
+                gate_score=gate_score,
+            )
+            if not return_indices:
+                return None
 
-        weights = self._get_logits_head_gate(x, q_scale)
-        if mode.is_decode():
-            return self._get_topk_paged(
+            weights = self._get_logits_head_gate(x, q_scale)
+            if mode.is_decode():
+                return self._get_topk_paged(
+                    forward_batch, layer_id, q_fp8, weights, metadata
+                )
+            return self._get_topk_ragged(
                 forward_batch, layer_id, q_fp8, weights, metadata
             )
-        return self._get_topk_ragged(forward_batch, layer_id, q_fp8, weights, metadata)
+        finally:
+            if transaction is not None:
+                transaction.restore()

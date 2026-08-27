@@ -500,6 +500,10 @@ class NativeSparseAttnBackend(
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+        # KPool compression writes are request-grouped, while speculative
+        # attention below expands this table to one row per tentative token.
+        # Preserve the request-level view for the write plan.
+        request_page_table = page_table
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -794,7 +798,7 @@ class NativeSparseAttnBackend(
                 "slots_per_page",
                 self.real_page_size // self.nsa_index_kpool,
             )
-            if forward_batch.forward_mode.is_extend_without_speculative():
+            if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
                 coordinator = getattr(
                     forward_batch.token_to_kv_pool,
                     "kpool_lifecycle_coordinator",
@@ -803,15 +807,24 @@ class NativeSparseAttnBackend(
                 assert coordinator is not None, (
                     "GLM-5-Next KPool requests must be initialized before prefill"
                 )
-                request_rows = [
-                    int(row)
-                    for row in forward_batch.req_pool_indices.detach().cpu().tolist()
-                ]
-                unprepared_rows = [
-                    row for row in request_rows if not coordinator.is_prepared(row)
-                ]
-                if unprepared_rows:
-                    coordinator.prepare_kpool_request(unprepared_rows)
+                if forward_batch.forward_mode.is_extend_without_speculative():
+                    request_rows = [
+                        int(row)
+                        for row in forward_batch.req_pool_indices.detach().cpu().tolist()
+                    ]
+                    unprepared_rows = [
+                        row for row in request_rows if not coordinator.is_prepared(row)
+                    ]
+                    if unprepared_rows:
+                        coordinator.prepare_kpool_request(unprepared_rows)
+
+                write_extend_seq_lens_cpu = extend_seq_lens_cpu
+                write_seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+                if forward_batch.forward_mode.is_target_verify():
+                    write_seq_lens_cpu = [
+                        seq_len + self.speculative_num_draft_tokens
+                        for seq_len in write_seq_lens_cpu
+                    ]
                 metadata = init_kpool_extend_metadata(
                     metadata,
                     forward_batch,
@@ -819,8 +832,17 @@ class NativeSparseAttnBackend(
                     real_page_size=self.real_page_size,
                     slots_per_page=slots_per_page,
                     topk_transform_method=topk_transform_method,
-                    full_real_page_table=metadata.real_page_table,
+                    full_real_page_table=self._transform_table_1_to_real(
+                        request_page_table
+                    ),
                     full_seqlens_expanded=seqlens_expanded,
+                    local_real_page_table=metadata.real_page_table,
+                    local_seqlens_expanded=seqlens_expanded,
+                    write_extend_seq_lens_cpu=write_extend_seq_lens_cpu,
+                    write_seq_lens_cpu=write_seq_lens_cpu,
+                    local_extend_seq_lens_cpu=extend_seq_lens_cpu,
+                    local_seq_lens_cpu=write_seq_lens_cpu,
+                    local_req_pool_indices=forward_batch.req_pool_indices,
                     index_cache_dtype=getattr(
                         forward_batch.token_to_kv_pool,
                         "index_cache_dtype",

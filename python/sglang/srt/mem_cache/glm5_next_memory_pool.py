@@ -12,6 +12,7 @@ checkpoint-native draft path allocates a compact one-layer DSA pool.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
 import torch
@@ -30,6 +31,50 @@ GLM5_NEXT_INDEX_HEAD_DIM = 128
 GLM5_NEXT_REAL_PAGE_SIZE = 64
 GLM5_NEXT_LATENT_SCALE_GROUP_SIZE = 128
 GLM5_NEXT_LATENT_SCALE_GROUPS = 4
+
+
+@dataclass
+class _KPoolStateSnapshot:
+    """Small rollback record for one speculative KPool layer invocation."""
+
+    index_buffer: torch.Tensor
+    page_indices: torch.Tensor
+    page_values: torch.Tensor
+    tail_k: torch.Tensor
+    tail_score: torch.Tensor
+    request_indices: torch.Tensor
+    tail_k_values: torch.Tensor
+    tail_score_values: torch.Tensor
+
+    def restore(self) -> None:
+        if self.page_indices.numel() != 0:
+            self.index_buffer.index_copy_(
+                0, self.page_indices, self.page_values
+            )
+        if self.request_indices.numel() != 0:
+            self.tail_k.index_copy_(
+                0, self.request_indices, self.tail_k_values
+            )
+            self.tail_score.index_copy_(
+                0, self.request_indices, self.tail_score_values
+            )
+
+
+@dataclass
+class _KPoolSpeculativeLayer:
+    """Raw target-verification KPool rows awaiting acceptance."""
+
+    key: torch.Tensor
+    slot_score: torch.Tensor
+    ape: torch.Tensor
+    block_tables: torch.Tensor
+    req_pool_indices: torch.Tensor
+    positions: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    batch_size: int
+    tokens_per_request: int
+    round_scale: bool
 
 
 def _normalize_req_pool_indices(
@@ -148,6 +193,7 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         self.tail_extra_slots = 0
         self.slots_per_page = self.page_size
         self.req_pool_size = req_pool_size
+        self._speculative_kpool_layers: dict[int, _KPoolSpeculativeLayer] = {}
 
         allocation_context = (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -256,6 +302,7 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
     ) -> None:
         """Clear stale live-tail state before reuse or before releasing rows."""
 
+        self.discard_speculative_kpool()
         if not self._compress_tail_k:
             return
         rows = _normalize_req_pool_indices(
@@ -280,6 +327,149 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         """Initialize newly allocated rows before their first prefill write."""
 
         self.clear_compress_tail_rows(req_pool_indices)
+
+    def snapshot_speculative_kpool_state(
+        self,
+        *,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        packed_write_locs: torch.Tensor,
+    ) -> _KPoolStateSnapshot:
+        """Snapshot only pages/tails a speculative KPool call can mutate."""
+
+        local_idx = self._local_layer_index(layer_id)
+        index_buffer = self.get_index_k_with_scale_buffer(layer_id)
+        page_indices = torch.unique(
+            torch.div(
+                packed_write_locs.to(device=index_buffer.device, dtype=torch.long),
+                self.slots_per_page,
+                rounding_mode="floor",
+            )
+        )
+        request_indices = _normalize_req_pool_indices(
+            req_pool_indices, device=self._compress_tail_k[local_idx].device
+        )
+        return _KPoolStateSnapshot(
+            index_buffer=index_buffer,
+            page_indices=page_indices,
+            page_values=index_buffer.index_select(0, page_indices).clone(),
+            tail_k=self._compress_tail_k[local_idx],
+            tail_score=self._compress_tail_score[local_idx],
+            request_indices=request_indices,
+            tail_k_values=self._compress_tail_k[local_idx]
+            .index_select(0, request_indices)
+            .clone(),
+            tail_score_values=self._compress_tail_score[local_idx]
+            .index_select(0, request_indices)
+            .clone(),
+        )
+
+    def stage_speculative_kpool_layer(
+        self,
+        *,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        batch_size: int,
+        tokens_per_request: int,
+        round_scale: bool,
+    ) -> None:
+        """Retain target-verification rows until the verifier accepts a prefix."""
+
+        local_idx = self._local_layer_index(layer_id)
+        rows = batch_size * tokens_per_request
+        tensors = {
+            "key": key,
+            "slot_score": slot_score,
+            "block_tables": block_tables,
+            "req_pool_indices": req_pool_indices,
+            "positions": positions,
+            "seq_lens": seq_lens,
+            "out_cache_loc": out_cache_loc,
+        }
+        for name, tensor in tensors.items():
+            if tensor.shape[0] < rows:
+                raise ValueError(
+                    f"speculative KPool {name} has {tensor.shape[0]} rows; "
+                    f"expected at least {rows}"
+                )
+        self._speculative_kpool_layers[local_idx] = _KPoolSpeculativeLayer(
+            key=key[:rows].detach(),
+            slot_score=slot_score[:rows].detach(),
+            ape=ape.detach(),
+            block_tables=block_tables[:rows].detach(),
+            req_pool_indices=req_pool_indices[:rows].detach(),
+            positions=positions[:rows].detach(),
+            seq_lens=seq_lens[:rows].detach(),
+            out_cache_loc=out_cache_loc[:rows].detach(),
+            batch_size=batch_size,
+            tokens_per_request=tokens_per_request,
+            round_scale=round_scale,
+        )
+
+    def commit_speculative_kpool(
+        self, accepted_token_counts: Iterable[int]
+    ) -> None:
+        """Commit only each request's accepted top-k=1 verification prefix."""
+
+        counts = [int(count) for count in accepted_token_counts]
+        staged_layers = self._speculative_kpool_layers
+        self._speculative_kpool_layers = {}
+        for layer_id, staged in staged_layers.items():
+            if len(counts) != staged.batch_size:
+                raise ValueError(
+                    "accepted KPool counts must match the staged batch size; "
+                    f"got {len(counts)} and {staged.batch_size}"
+                )
+            if any(
+                count < 0 or count > staged.tokens_per_request
+                for count in counts
+            ):
+                raise ValueError(
+                    "accepted KPool counts must remain inside the single-branch "
+                    f"verification width {staged.tokens_per_request}; got {counts}"
+                )
+
+            if hasattr(self, "invalidate_index_buffer_for_layer"):
+                self.invalidate_index_buffer_for_layer(layer_id)
+
+            for step in range(staged.tokens_per_request):
+                active_requests = [
+                    request for request, count in enumerate(counts) if count > step
+                ]
+                if not active_requests:
+                    continue
+                rows = torch.tensor(
+                    [
+                        request * staged.tokens_per_request + step
+                        for request in active_requests
+                    ],
+                    dtype=torch.long,
+                    device=staged.key.device,
+                )
+                self.kpool_decode_update_index_cache(
+                    layer_id=layer_id,
+                    key=staged.key.index_select(0, rows),
+                    slot_score=staged.slot_score.index_select(0, rows),
+                    ape=staged.ape,
+                    block_tables=staged.block_tables.index_select(0, rows),
+                    req_pool_indices=staged.req_pool_indices.index_select(0, rows),
+                    positions=staged.positions.index_select(0, rows),
+                    seq_lens=staged.seq_lens.index_select(0, rows),
+                    out_cache_loc=staged.out_cache_loc.index_select(0, rows),
+                    round_scale=staged.round_scale,
+                )
+
+    def discard_speculative_kpool(self) -> None:
+        """Drop uncommitted verification rows during request/error cleanup."""
+
+        self._speculative_kpool_layers.clear()
 
     def kpool_decode_update_index_cache(
         self,
@@ -530,6 +720,26 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
         self.full_kv_pool.kpool_decode_update_index_cache(
             layer_id=self._transfer_full_attention_id(layer_id), **kwargs
         )
+
+    def snapshot_speculative_kpool_state(
+        self, *, layer_id: int, **kwargs
+    ) -> _KPoolStateSnapshot:
+        return self.full_kv_pool.snapshot_speculative_kpool_state(
+            layer_id=self._transfer_full_attention_id(layer_id), **kwargs
+        )
+
+    def stage_speculative_kpool_layer(self, *, layer_id: int, **kwargs) -> None:
+        self.full_kv_pool.stage_speculative_kpool_layer(
+            layer_id=self._transfer_full_attention_id(layer_id), **kwargs
+        )
+
+    def commit_speculative_kpool(
+        self, accepted_token_counts: Iterable[int]
+    ) -> None:
+        self.full_kv_pool.commit_speculative_kpool(accepted_token_counts)
+
+    def discard_speculative_kpool(self) -> None:
+        self.full_kv_pool.discard_speculative_kpool()
 
 
 def _glm5_next_pool_predicate(model_config, server_args) -> bool:

@@ -444,6 +444,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
 
+        # GLM-5.3 KPool evaluates target-verification rows transactionally:
+        # tentative compressed-index writes are rolled back after attention,
+        # then only this accepted single-branch prefix is committed.  Keep the
+        # hook capability-gated so every existing speculative KV pool retains
+        # its byte-for-byte lifecycle.
+        target_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        commit_speculative_kpool = getattr(
+            target_kv_pool, "commit_speculative_kpool", None
+        )
+        if commit_speculative_kpool is not None:
+            if self.topk != 1:
+                raise RuntimeError(
+                    "GLM-5-Next KPool speculative commit supports topk=1 only"
+                )
+            commit_speculative_kpool(
+                accepted_length + 1 for accepted_length in accept_length_list
+            )
+
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])

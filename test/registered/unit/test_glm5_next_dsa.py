@@ -44,7 +44,7 @@ class _Glm5NextTextConfig:
             index_topk_freq=1,
             index_topk_pattern=None,
             index_skip_topk_offset=None,
-            index_share_for_mtp_iteration=False,
+            index_share_for_mtp_iteration=True,
             indexer_rope_interleave=True,
             architectures=["Glm5NextForConditionalGeneration"],
         )
@@ -245,12 +245,12 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, message):
                     _build(self.module.Glm5NextDSAAttention, config=config)
 
-    def test_rejects_cp_and_index_sharing_modes_but_accepts_mtp(self):
+    def test_rejects_cross_layer_sharing_but_accepts_checkpoint_mtp_sharing(self):
         invalid_configs = (
             ("index_topk_freq", 2),
             ("index_topk_pattern", "N"),
             ("index_skip_topk_offset", 1),
-            ("index_share_for_mtp_iteration", True),
+            ("index_share_for_mtp_iteration", "yes"),
         )
         for field, value in invalid_configs:
             with self.subTest(field=field):
@@ -260,7 +260,8 @@ class TestGlm5NextDSAAttention(unittest.TestCase):
 
         mtp_attention = _build(self.module.Glm5NextDSAAttention, is_nextn=True)
         self.assertTrue(mtp_attention.is_nextn)
-        self.assertFalse(mtp_attention.skip_topk)
+        self.assertTrue(mtp_attention.skip_topk)
+        self.assertTrue(mtp_attention.next_skip_topk)
 
         cp_module = _load_module(cp_enabled=True)
         with self.assertRaisesRegex(NotImplementedError, "context parallel"):

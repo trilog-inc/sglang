@@ -246,15 +246,25 @@ def _kpool_cpu_plan(
     pool_size: int,
     slots_per_page: int,
     *,
+    write_extend_seq_lens_cpu: Optional[List[int]] = None,
+    write_seq_lens_cpu: Optional[List[int]] = None,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
 ) -> _KPoolCpuPlan:
     plan = _KPoolCpuPlan()
 
-    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+    extend_seq_lens_cpu = (
+        forward_batch.extend_seq_lens_cpu
+        if write_extend_seq_lens_cpu is None
+        else write_extend_seq_lens_cpu
+    )
     if isinstance(extend_seq_lens_cpu, torch.Tensor):
         extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
-    seq_lens_cpu = forward_batch.seq_lens_cpu.tolist()
+    seq_lens_cpu = (
+        forward_batch.seq_lens_cpu.tolist()
+        if write_seq_lens_cpu is None
+        else write_seq_lens_cpu
+    )
     req_pool_indices_cpu = forward_batch.req_pool_indices.tolist()
 
     _append_compress_rows(
@@ -479,13 +489,15 @@ def init_kpool_extend_metadata(
     full_seqlens_expanded: torch.Tensor,
     local_real_page_table: Optional[torch.Tensor] = None,
     local_seqlens_expanded: Optional[torch.Tensor] = None,
+    write_extend_seq_lens_cpu: Optional[List[int]] = None,
+    write_seq_lens_cpu: Optional[List[int]] = None,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
     local_req_pool_indices: Optional[torch.Tensor] = None,
     index_cache_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> NSAMetadata:
     mode = forward_batch.forward_mode
-    is_extend_like = mode.is_extend_without_speculative()
+    is_extend_like = mode.is_extend(include_draft_extend_v2=True)
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_extend_like
@@ -505,6 +517,8 @@ def init_kpool_extend_metadata(
         forward_batch,
         pool_size,
         slots_per_page,
+        write_extend_seq_lens_cpu=write_extend_seq_lens_cpu,
+        write_seq_lens_cpu=write_seq_lens_cpu,
         local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
         local_seq_lens_cpu=local_seq_lens_cpu,
     )

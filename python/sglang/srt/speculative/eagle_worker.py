@@ -425,6 +425,7 @@ class EAGLEWorker(TpModelWorker):
             torch.cuda.current_stream(self.gpu_id).record_event(target_ready)
         with self._draft_cuda_context():
             torch.cuda.current_stream(self.draft_gpu_id).wait_event(target_ready)
+            newly_owned_rows = []
             for row, seq_len, req in zip(rows, seq_lens, reqs):
                 row = int(row)
                 owner = self._remote_owner_for_request(req, row)
@@ -434,6 +435,7 @@ class EAGLEWorker(TpModelWorker):
                 )
                 if self._remote_req_owner.get(row) != owner:
                     start = 0
+                    newly_owned_rows.append(row)
                 else:
                     start = max(
                         0,
@@ -445,6 +447,12 @@ class EAGLEWorker(TpModelWorker):
                     )
                 self._remote_req_owner[row] = owner
                 self._remote_req_synced_len[row] = end
+            draft_kv_pool = self.draft_model_runner.token_to_kv_pool
+            prepare_kpool_request = getattr(
+                draft_kv_pool, "prepare_kpool_request", None
+            )
+            if prepare_kpool_request is not None and newly_owned_rows:
+                prepare_kpool_request(newly_owned_rows)
 
     def _copy_draft_capture_to_target(self, target_spec, draft_spec) -> None:
         for name in ("topk_p", "topk_index", "hidden_states"):

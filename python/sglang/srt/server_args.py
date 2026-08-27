@@ -1433,6 +1433,16 @@ class ServerArgs:
                 "MTP path; got speculative_algorithm="
                 f"{self.speculative_algorithm!r}."
             )
+        if self.speculative_algorithm is not None and not self.disable_cuda_graph:
+            # Target verification mutates the compressed KPool tentatively and
+            # commits only the accepted prefix after sampling.  That lifecycle
+            # crosses the Python/CUDA-graph boundary, so keep MTP eager until a
+            # graph-native transaction buffer and acceptance kernel exist.
+            self.disable_cuda_graph = True
+            logger.warning(
+                "Disabling CUDA graphs for GLM-5-Next MTP: transactional "
+                "KPool target verification currently requires eager execution."
+            )
         if self.enable_nsa_prefill_context_parallel:
             raise ValueError(
                 "GLM-5-Next context-parallel prefill is outside the current "

@@ -68,6 +68,7 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
             "remote MTP request mapping is smaller than the target",
             "FLASHINFER_CUDA_ARCH_LIST",
             "Draft CUDA graphs are disabled for heterogeneous MTP",
+            "prepare_kpool_request",
         ):
             self.assertIn(required, source)
 
@@ -86,6 +87,17 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         self.assertIn("is_nextn=True", source)
         self.assertIn("DeepseekV2WeightLoaderMixin.do_load_weights", source)
         self.assertIn("EntryClass = [Glm5NextForConditionalGenerationNextN]", source)
+
+    def test_target_verification_commits_only_the_accepted_kpool_prefix(self):
+        source = (ROOT / "python/sglang/srt/speculative/eagle_info.py").read_text()
+        self.assertIn("commit_speculative_kpool", source)
+        self.assertIn("accepted_length + 1", source)
+        self.assertIn("supports topk=1 only", source)
+
+    def test_target_verify_kpool_transaction_remains_eager(self):
+        source = (ROOT / "python/sglang/srt/server_args.py").read_text()
+        self.assertIn("KPool target verification currently", source)
+        self.assertIn("self.disable_cuda_graph = True", source)
 
 
 if __name__ == "__main__":
