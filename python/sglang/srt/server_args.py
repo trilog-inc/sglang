@@ -6194,6 +6194,14 @@ class ServerArgs:
                 if cudnn_version is not None:
                     version_float = float(str(cudnn_version)[:3]) / 100
                     if version_float < 9.15:
+                        torch_cuda_major = str(torch.version.cuda or "").split(
+                            ".", 1
+                        )[0]
+                        cudnn_package = (
+                            "nvidia-cudnn-cu13"
+                            if torch_cuda_major == "13"
+                            else "nvidia-cudnn-cu12"
+                        )
                         RED = "\033[91m"
                         BOLD = "\033[1m"
                         RESET = "\033[0m"
@@ -6208,7 +6216,7 @@ class ServerArgs:
                             "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
                             "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
                             "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                            f"    python -m pip install --force-reinstall --no-deps {cudnn_package}==9.16.0.29\n\n"
                             "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
                             "--------------------------------------------------------------------------------\n"
                             f"{RESET}"

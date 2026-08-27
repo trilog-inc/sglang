@@ -75,6 +75,46 @@ class _LoggerStub:
         pass
 
 
+class TestCudnnCompatibilityMessage(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.check = staticmethod(
+            _compile_function(
+                "check_torch_2_9_1_cudnn_compatibility",
+                class_name="ServerArgs",
+                globals_={
+                    "get_bool_env_var": lambda _name: False,
+                    "torch_release": (2, 9, 1),
+                },
+            )
+        )
+
+    def _check_message(self, cuda_version: str) -> str:
+        torch_stub = ModuleType("torch")
+        torch_stub.__version__ = f"2.9.1+cu{cuda_version.replace('.', '')}"
+        torch_stub.version = SimpleNamespace(cuda=cuda_version)
+        torch_stub.backends = SimpleNamespace(
+            cudnn=SimpleNamespace(version=lambda: 91300)
+        )
+        args = SimpleNamespace(
+            get_model_config=lambda: SimpleNamespace(is_multimodal=True)
+        )
+        with mock.patch.dict(sys.modules, {"torch": torch_stub}):
+            with self.assertRaises(RuntimeError) as context:
+                self.check(args)
+        return str(context.exception)
+
+    def test_cuda_13_uses_cuda_13_cudnn_package(self):
+        message = self._check_message("13.0")
+        self.assertIn("nvidia-cudnn-cu13==9.16.0.29", message)
+        self.assertNotIn("nvidia-cudnn-cu12==9.16.0.29", message)
+
+    def test_cuda_12_uses_cuda_12_cudnn_package(self):
+        message = self._check_message("12.9")
+        self.assertIn("nvidia-cudnn-cu12==9.16.0.29", message)
+        self.assertNotIn("nvidia-cudnn-cu13==9.16.0.29", message)
+
+
 def _boundary_args(**overrides):
     values = dict(
         speculative_algorithm=None,
