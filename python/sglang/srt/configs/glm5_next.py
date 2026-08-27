@@ -350,21 +350,12 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.gate_lower_bound = (
             gate_lower_bound if gate_lower_bound is not None else linear_lower_bound
         )
-        # The pinned checkpoint names DSA layers
-        # ``deepseek_sparse_attention``.  transformers-kt 5.6 validates the
-        # generic ``PreTrainedConfig.layer_types`` field against its closed
-        # vocabulary, where the corresponding public name is ``sparse``.
-        # Keep the checkpoint-native names separately for provenance while
-        # exposing validator-compatible generic names to shared Transformers
-        # and SGLang helpers.  GLM runtime selection remains driven by the
-        # exact ``linear_attn_config`` partition below.
+        # transformers-kt 5.6.0.post3 validates layer_types against a closed
+        # vocabulary that includes the checkpoint-native DSA spelling
+        # ``deepseek_sparse_attention`` (but not the older ``sparse`` alias).
+        # Preserve those names for both validation and runtime dispatch.
         self._glm5_next_checkpoint_layer_types = list(layer_types)
-        self.layer_types = [
-            "linear_attention"
-            if layer_type == "linear_attention"
-            else "sparse"
-            for layer_type in layer_types
-        ]
+        self.layer_types = list(layer_types)
         self.mlp_layer_types = list(mlp_layer_types)
 
         if linear_attn_config is None:

@@ -14,7 +14,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = REPO_ROOT / "python/sglang/srt/configs/glm5_next.py"
 PINNED_DIST = "transformers-kt"
-PINNED_VERSION = "5.6.0.post1"
+PINNED_VERSION = "5.6.0.post3"
 CHILD_FLAG = "--runtime-config-child"
 SKIP_EXIT_CODE = 77
 SUCCESS_MARKER = "GLM5_NEXT_RUNTIME_CONFIG_STRICT_OK"
@@ -97,12 +97,8 @@ def _child_main() -> int:
         }
     )
 
-    generic_layer_types = [
-        "linear_attention" if layer_type == "linear_attention" else "sparse"
-        for layer_type in checkpoint_layer_types
-    ]
-    assert config.layer_types == generic_layer_types
-    assert config.text_config.layer_types == generic_layer_types
+    assert config.layer_types == checkpoint_layer_types
+    assert config.text_config.layer_types == checkpoint_layer_types
     assert (
         config.text_config._glm5_next_checkpoint_layer_types
         == checkpoint_layer_types
