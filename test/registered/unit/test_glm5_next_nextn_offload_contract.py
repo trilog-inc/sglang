@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 NEXTN_MODEL_PATH = ROOT / "python/sglang/srt/models/glm5_next_nextn.py"
+ATTENTION_REGISTRY_PATH = (
+    ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
+)
 
 
 def _compile_nextn_helper(name):
@@ -158,6 +161,75 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         ).read_text()
         self.assertIn("if model_runner.is_draft_worker:", pool_source)
         self.assertIn("layer_num=1", pool_source)
+
+    def test_draft_runner_uses_native_dsa_backend_without_kda_sidecar(self):
+        tree = ast.parse(ATTENTION_REGISTRY_PATH.read_text(encoding="utf-8"))
+        wrapper_node = copy.deepcopy(
+            next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "attn_backend_wrapper"
+            )
+        )
+        wrapper_module = ast.fix_missing_locations(
+            ast.Module(body=[wrapper_node], type_ignores=[])
+        )
+        namespace = {"__builtins__": __builtins__}
+        exec(
+            compile(wrapper_module, str(ATTENTION_REGISTRY_PATH), "exec"),
+            namespace,
+        )
+
+        class NativeSparseAttnBackend:
+            pass
+
+        model_config_module = types.ModuleType(
+            "sglang.srt.configs.model_config"
+        )
+        model_config_module.is_minimax_sparse = lambda _config: False
+        nsa_backend_module = types.ModuleType(
+            "sglang.srt.layers.attention.nsa_backend"
+        )
+        nsa_backend_module.NativeSparseAttnBackend = NativeSparseAttnBackend
+        runner = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(
+                hf_config=object(), is_glm5_next=True
+            ),
+            is_draft_worker=True,
+            hybrid_gdn_config=None,
+            use_mla_backend=True,
+        )
+        backend = NativeSparseAttnBackend()
+
+        with patch.dict(
+            sys.modules,
+            {
+                model_config_module.__name__: model_config_module,
+                nsa_backend_module.__name__: nsa_backend_module,
+            },
+        ):
+            result = namespace["attn_backend_wrapper"](runner, backend)
+
+        self.assertIs(result, backend)
+
+        glm_branch = next(
+            node
+            for node in wrapper_node.body
+            if isinstance(node, ast.If)
+            and "is_glm5_next" in ast.unparse(node.test)
+        )
+        draft_guard = next(
+            node
+            for node in glm_branch.body
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "runner.is_draft_worker"
+        )
+        self.assertEqual(len(draft_guard.body), 1)
+        self.assertIsInstance(draft_guard.body[0], ast.Return)
+        self.assertEqual(
+            ast.unparse(draft_guard.body[0].value), "full_attn_backend"
+        )
 
     def test_nextn_model_uses_checkpoint_appended_decoder_contract(self):
         source = (ROOT / "python/sglang/srt/models/glm5_next_nextn.py").read_text()

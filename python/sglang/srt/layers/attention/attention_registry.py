@@ -209,6 +209,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if getattr(runner.model_config, "is_glm5_next", False):
+        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+
+        if not isinstance(full_attn_backend, NativeSparseAttnBackend):
+            raise ValueError(
+                "GLM-5-Next requires the nsa attention backend for its DSA layers."
+            )
+
+        # The checkpoint-appended NextN model contains one DSA/MoE block and
+        # no KDA layers.  In particular, a heterogeneous draft runner owns an
+        # independent ReqToTokenPool on its GPU, not the target's hybrid Mamba
+        # state pool.  Keep the draft on its native NSA backend so metadata and
+        # layer-id dispatch never enter the target-only KDA sidecar.
+        if runner.is_draft_worker:
+            return full_attn_backend
+
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             HybridLinearAttnBackend,
@@ -219,12 +234,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
-        from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
-
-        if not isinstance(full_attn_backend, NativeSparseAttnBackend):
-            raise ValueError(
-                "GLM-5-Next requires the nsa attention backend for its DSA layers."
-            )
         check_environments()
         initialize_linear_attn_config(runner.server_args)
         linear_attn_backend = Glm5NextKDAAttnBackend(runner)
