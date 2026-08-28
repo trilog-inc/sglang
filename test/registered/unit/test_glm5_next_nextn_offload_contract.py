@@ -1,5 +1,6 @@
 import ast
 import copy
+import dataclasses
 import importlib.util
 import sys
 import types
@@ -13,6 +14,7 @@ NEXTN_MODEL_PATH = ROOT / "python/sglang/srt/models/glm5_next_nextn.py"
 ATTENTION_REGISTRY_PATH = (
     ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
 )
+EAGLE_WORKER_PATH = ROOT / "python/sglang/srt/speculative/eagle_worker.py"
 
 
 def _compile_nextn_helper(name):
@@ -41,6 +43,27 @@ def _compile_nextn_helper(name):
         ),
     }
     exec(compile(module, str(NEXTN_MODEL_PATH), "exec"), namespace)
+    return namespace[name]
+
+
+def _compile_eagle_worker_method(name, globals_):
+    tree = ast.parse(EAGLE_WORKER_PATH.read_text(encoding="utf-8"))
+    worker = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EAGLEWorker"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in worker.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+    )
+    method.decorator_list = []
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    namespace = {"__builtins__": __builtins__, **globals_}
+    exec(compile(module, str(EAGLE_WORKER_PATH), "exec"), namespace)
     return namespace[name]
 
 
@@ -92,6 +115,36 @@ class TestGlm5NextDraftDevice(unittest.TestCase):
 
 
 class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
+    def test_remote_spec_copy_includes_dynamic_position_tensor(self):
+        class FakeTensor:
+            def __init__(self, name):
+                self.name = name
+
+            def to(self, *, device, non_blocking):
+                self.last_copy = (device, non_blocking)
+                return FakeTensor(f"{self.name}@{device}")
+
+        @dataclasses.dataclass
+        class DraftInput:
+            hidden_states: FakeTensor
+            seq_lens_cpu: FakeTensor
+
+        fake_torch = types.SimpleNamespace(Tensor=FakeTensor)
+        copy_spec = _compile_eagle_worker_method(
+            "_copy_spec_to_device",
+            {"copy": copy, "dataclasses": dataclasses, "torch": fake_torch},
+        )
+        cpu_metadata = FakeTensor("cpu-metadata")
+        original = DraftInput(FakeTensor("hidden"), cpu_metadata)
+        original.positions = FakeTensor("positions")
+
+        copied = copy_spec(original, "cuda:1")
+
+        self.assertIsNot(copied, original)
+        self.assertEqual(copied.hidden_states.name, "hidden@cuda:1")
+        self.assertEqual(copied.positions.name, "positions@cuda:1")
+        self.assertIs(copied.seq_lens_cpu, cpu_metadata)
+
     def test_fp8_exclusions_follow_compact_nextn_namespace(self):
         remap = _compile_nextn_helper("_remap_nextn_quant_config")
         config = types.SimpleNamespace(num_hidden_layers=45)

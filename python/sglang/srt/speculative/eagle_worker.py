@@ -363,12 +363,15 @@ class EAGLEWorker(TpModelWorker):
         copied = copy.copy(spec_info)
         if not dataclasses.is_dataclass(copied):
             return copied
-        for field in dataclasses.fields(copied):
-            value = getattr(copied, field.name)
-            if isinstance(value, torch.Tensor) and not field.name.endswith("_cpu"):
+        # Speculative inputs attach some tensors dynamically.  In particular,
+        # EagleDraftInput.positions is not a declared dataclass field.  Walk
+        # the instance dictionary so those tensors cross the heterogeneous
+        # target/draft boundary as well.
+        for name, value in vars(copied).items():
+            if isinstance(value, torch.Tensor) and not name.endswith("_cpu"):
                 setattr(
                     copied,
-                    field.name,
+                    name,
                     value.to(device=device, non_blocking=True),
                 )
         return copied
