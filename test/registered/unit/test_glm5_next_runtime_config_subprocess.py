@@ -97,8 +97,12 @@ def _child_main() -> int:
         }
     )
 
-    assert config.layer_types == checkpoint_layer_types
-    assert config.text_config.layer_types == checkpoint_layer_types
+    generic_layer_types = [
+        "linear_attention" if layer_type == "linear_attention" else "sparse"
+        for layer_type in checkpoint_layer_types
+    ]
+    assert config.layer_types == generic_layer_types
+    assert config.text_config.layer_types == generic_layer_types
     assert (
         config.text_config._glm5_next_checkpoint_layer_types
         == checkpoint_layer_types
