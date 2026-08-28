@@ -1129,15 +1129,24 @@ class IndexerKPool(MultiPlatformOp):
                 req_pool_indices=forward_batch.req_pool_indices[:batch_size],
                 packed_write_locs=packed_write_locs,
             )
+            # Metadata fields can be absent in the eager target-verify batch.
+            # ``seq_lens`` for the tentative rows equals position + 1 and the
+            # page-1 table is the same as the real table when page_size == 1.
+            block_tables = metadata.get_page_table_64()
+            if block_tables is None:
+                block_tables = metadata.get_page_table_1()
+            seq_lens = metadata.get_seqlens_expanded()
+            if seq_lens is None:
+                seq_lens = positions + 1
             pool.stage_speculative_kpool_layer(
                 layer_id=layer_id,
                 key=key,
                 slot_score=gate_score,
                 ape=self.index_kpool_compress_ape,
-                block_tables=metadata.get_page_table_64(),
+                block_tables=block_tables,
                 req_pool_indices=expanded_requests,
                 positions=positions,
-                seq_lens=metadata.get_seqlens_expanded(),
+                seq_lens=seq_lens,
                 out_cache_loc=forward_batch.out_cache_loc,
                 batch_size=batch_size,
                 tokens_per_request=tokens_per_request,

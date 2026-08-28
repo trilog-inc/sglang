@@ -394,6 +394,12 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
             "out_cache_loc": out_cache_loc,
         }
         for name, tensor in tensors.items():
+            if tensor is None:
+                raise ValueError(
+                    f"speculative KPool staged {name} is None for layer {layer_id} "
+                    f"(batch_size={batch_size}, tokens_per_request="
+                    f"{tokens_per_request})"
+                )
             if tensor.shape[0] < rows:
                 raise ValueError(
                     f"speculative KPool {name} has {tensor.shape[0]} rows; "
