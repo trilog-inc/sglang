@@ -15,6 +15,9 @@ ATTENTION_REGISTRY_PATH = (
     ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
 )
 EAGLE_WORKER_PATH = ROOT / "python/sglang/srt/speculative/eagle_worker.py"
+KPOOL_INDEXER_PATH = (
+    ROOT / "python/sglang/srt/layers/attention/nsa/nsa_indexer_kpool.py"
+)
 
 
 def _compile_nextn_helper(name):
@@ -67,6 +70,44 @@ def _compile_eagle_worker_method(name, globals_):
     return namespace[name]
 
 
+def _compile_kpool_helper(name):
+    tree = ast.parse(KPOOL_INDEXER_PATH.read_text(encoding="utf-8"))
+    function = copy.deepcopy(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+    )
+    function.decorator_list = []
+    module = ast.fix_missing_locations(
+        ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__",
+                    names=[ast.alias(name="annotations")],
+                    level=0,
+                ),
+                function,
+            ],
+            type_ignores=[],
+        )
+    )
+    namespace = {"__builtins__": __builtins__}
+    exec(compile(module, str(KPOOL_INDEXER_PATH), "exec"), namespace)
+    return namespace[name]
+
+
+class _FakeRows:
+    def __init__(self, rows):
+        self.shape = (rows,)
+
+    def __getitem__(self, index):
+        assert isinstance(index, slice) and index.start is None
+        stop = self.shape[0] if index.stop is None else index.stop
+        return _FakeRows(min(self.shape[0], stop))
+
+
 class _FakeCuda:
     def __init__(self):
         self.properties = [
@@ -112,6 +153,37 @@ class TestGlm5NextDraftDevice(unittest.TestCase):
             module.resolve_speculative_draft_device("cuda:2")
         with self.assertRaisesRegex(ValueError, "Could not resolve"):
             module.resolve_speculative_draft_device("GPU-deadbeef")
+
+
+class TestGlm5NextKPoolDraftRows(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.align = staticmethod(
+            _compile_kpool_helper("_align_kpool_paged_decode_rows")
+        )
+
+    def test_trims_page_table_when_draft_query_is_smaller(self):
+        for seqlen_rows in (1, 2):
+            with self.subTest(seqlen_rows=seqlen_rows):
+                aligned = self.align(
+                    _FakeRows(1),
+                    _FakeRows(1),
+                    _FakeRows(2),
+                    _FakeRows(seqlen_rows),
+                )
+                self.assertEqual(
+                    [tensor.shape[0] for tensor in aligned[:4]], [1, 1, 1, 1]
+                )
+                self.assertIsNone(aligned[4])
+
+    def test_preserves_output_padding_when_lengths_are_smaller(self):
+        aligned = self.align(_FakeRows(2), _FakeRows(2), _FakeRows(2), _FakeRows(1))
+        self.assertEqual([tensor.shape[0] for tensor in aligned[:4]], [1, 1, 1, 1])
+        self.assertEqual(aligned[4], 2)
+
+    def test_rejects_missing_page_table_rows(self):
+        with self.assertRaisesRegex(ValueError, "fewer rows than the scorer"):
+            self.align(_FakeRows(2), _FakeRows(2), _FakeRows(1), _FakeRows(2))
 
 
 class TestGlm5NextNextNSourceBoundary(unittest.TestCase):

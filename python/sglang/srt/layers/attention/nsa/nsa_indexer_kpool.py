@@ -53,6 +53,47 @@ def _token_pool_from_batch(forward_batch: ForwardBatch) -> "KVCache":
     return pool
 
 
+def _align_kpool_paged_decode_rows(
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seqlens_32: torch.Tensor,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[int],
+]:
+    """Align graph-padded KPool metadata with the rows entering the scorer."""
+
+    num_query_rows = q_fp8.shape[0]
+    if weights.shape[0] != num_query_rows:
+        raise ValueError(
+            "KPool query/weight row mismatch: "
+            f"q={num_query_rows}, weights={weights.shape[0]}"
+        )
+
+    scorer_rows = min(num_query_rows, seqlens_32.shape[0])
+    if scorer_rows == 0:
+        raise ValueError("KPool paged decode requires at least one scorer row")
+    if block_tables.shape[0] < scorer_rows:
+        raise ValueError(
+            "KPool page table has fewer rows than the scorer: "
+            f"page_table={block_tables.shape[0]}, scorer={scorer_rows}"
+        )
+
+    # CUDA-graph and speculative draft metadata can be padded independently.
+    # Slice every scorer input even when the query is the smaller tensor: the
+    # observed heterogeneous MTP case is q=1, seqlens=1, page_table=2.
+    q_fp8 = q_fp8[:scorer_rows]
+    weights = weights[:scorer_rows]
+    block_tables = block_tables[:scorer_rows]
+    seqlens_32 = seqlens_32[:scorer_rows]
+    out_rows = num_query_rows if scorer_rows < num_query_rows else None
+    return q_fp8, weights, block_tables, seqlens_32, out_rows
+
+
 def _use_native_kpool_layernorm(device: torch.device) -> bool:
     """Keep consumer-GPU KPool normalization out of FlashInfer's CUTE JIT.
 
@@ -706,16 +747,13 @@ class IndexerKPool(MultiPlatformOp):
         blocksize = page_size
         seqlens_32 = metadata.get_seqlens_int32()
         assert len(q_fp8.shape) == 3
-        num_q_padded = q_fp8.shape[0]
-        n_real = seqlens_32.shape[0]
-        if n_real < num_q_padded:
-            q_fp8 = q_fp8[:n_real]
-            weights = weights[:n_real]
-            # The padded decode batch trims the query and weight rows above but
-            # leaves the page table and lengths at the padded count, which the
-            # scorer rejects (one row per query).  Trim them to the same size.
-            block_tables = block_tables[:n_real]
-            seqlens_32 = seqlens_32[:n_real]
+        (
+            q_fp8,
+            weights,
+            block_tables,
+            seqlens_32,
+            out_rows,
+        ) = _align_kpool_paged_decode_rows(q_fp8, weights, block_tables, seqlens_32)
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache.shape) == 2
         block_kv = 64
@@ -810,7 +848,7 @@ class IndexerKPool(MultiPlatformOp):
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
-            out_rows=num_q_padded if num_q_padded != n_real else None,
+            out_rows=out_rows,
         )
         return topk_result
 
