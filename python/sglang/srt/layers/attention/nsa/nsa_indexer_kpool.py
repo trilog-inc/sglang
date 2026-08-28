@@ -1248,6 +1248,7 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             precompute_compress_gate=False,
         )
+        gate_score = self._compute_gate_score_if_missing(x, gate_score)
         pool = _token_pool_from_batch(forward_batch)
         if getattr(pool, "index_cache_is_bf16", False):
             q_fp8 = query.contiguous()
