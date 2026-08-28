@@ -154,6 +154,20 @@ class TestGlm5NextConsumerGPUKernels(unittest.TestCase):
         flashinfer_import = forward.index("import flashinfer.decode")
         self.assertLess(native_dispatch, flashinfer_import)
 
+    def test_consumer_kpool_layernorm_avoids_flashinfer_cute_jit(self):
+        route = _function_source(INDEXER_CALLER_PATH, "_normalize_key")
+        capability = _function_source(
+            INDEXER_CALLER_PATH, "_use_native_kpool_layernorm"
+        )
+
+        self.assertIn("(8, 6)", capability)
+        self.assertIn("(8, 9)", capability)
+        self.assertIn("self.k_norm.forward_native(key)", route)
+        self.assertIn("return self.k_norm(key)", route)
+
+        source = INDEXER_CALLER_PATH.read_text(encoding="utf-8")
+        self.assertEqual(source.count("key = self._normalize_key(key)"), 3)
+
     @unittest.skipUnless(
         _consumer_capability() is not None,
         "an SM86 or SM89 GPU is required",

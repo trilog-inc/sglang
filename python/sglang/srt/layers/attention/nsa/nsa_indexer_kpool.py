@@ -53,6 +53,22 @@ def _token_pool_from_batch(forward_batch: ForwardBatch) -> "KVCache":
     return pool
 
 
+def _use_native_kpool_layernorm(device: torch.device) -> bool:
+    """Keep consumer-GPU KPool normalization out of FlashInfer's CUTE JIT.
+
+    A heterogeneous SM120 target can initialize FlashInfer's CUTLASS-DSL
+    layernorm before the SM86/SM89 draft model runs.  That process-global JIT
+    state does not reliably produce a kernel image for the second architecture.
+    PyTorch's native layernorm has the same FP32 accumulation contract and is
+    used only for the small consumer-GPU KPool projection.
+    """
+
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) in (
+        (8, 6),
+        (8, 9),
+    )
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -159,6 +175,11 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+    def _normalize_key(self, key: torch.Tensor) -> torch.Tensor:
+        if _use_native_kpool_layernorm(key.device):
+            return self.k_norm.forward_native(key)
+        return self.k_norm(key)
 
     @staticmethod
     def _materialize_gate_input(x: torch.Tensor) -> torch.Tensor:
@@ -443,7 +464,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
-                key = self.k_norm(key)
+                key = self._normalize_key(key)
 
                 k_rope, _ = torch.split(
                     key,
@@ -466,7 +487,7 @@ class IndexerKPool(MultiPlatformOp):
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
             key, _ = self.wk(x)
-            key = self.k_norm(key)
+            key = self._normalize_key(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
@@ -487,7 +508,7 @@ class IndexerKPool(MultiPlatformOp):
         positions: torch.Tensor,
     ):
         key, _ = self.wk(x)
-        key = self.k_norm(key)
+        key = self._normalize_key(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
