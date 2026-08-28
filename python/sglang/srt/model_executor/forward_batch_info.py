@@ -415,7 +415,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mm_inputs=batch.multimodal_inputs,
             glm5_next_force_hybrid_prefill=bool(
-                batch.forward_mode.is_extend()
+                batch.forward_mode == ForwardMode.EXTEND
                 and any(
                     mm_input is not None
                     and getattr(mm_input, "glm5_next_force_hybrid_prefill", False)

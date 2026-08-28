@@ -5418,11 +5418,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     "ForwardMode metadata"
                 )
             forward_mode_name = _glm5_next_forward_mode_name(forward_mode)
-            if forward_mode_name not in ("EXTEND", "DECODE", "IDLE"):
+            if forward_mode_name not in (
+                "EXTEND",
+                "DECODE",
+                "TARGET_VERIFY",
+                "IDLE",
+            ):
                 raise RuntimeError(
                     "GLM-5-Next FP8 layerwise prefill supports only plain "
                     "EXTEND (text layerwise or multimodal hybrid) and bypasses "
-                    "only DECODE/IDLE; got "
+                    "DECODE/TARGET_VERIFY/IDLE; got "
                     f"ForwardMode.{forward_mode_name}"
                 )
             if forward_mode_name == "EXTEND":

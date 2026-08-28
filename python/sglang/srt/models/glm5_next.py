@@ -1159,10 +1159,12 @@ class Glm5NextForConditionalGeneration(nn.Module, DeepseekV2WeightLoaderMixin):
         if has_multimodal_inputs and forward_mode_name not in (
             "EXTEND",
             "DECODE",
+            "TARGET_VERIFY",
             "IDLE",
         ):
             raise RuntimeError(
-                "GLM-5-Next accepts multimodal data only in plain EXTEND; "
+                "GLM-5-Next embeds multimodal data only in plain EXTEND and "
+                "retains it as metadata only for decode/verification; "
                 f"got ForwardMode.{forward_mode_name}."
             )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):

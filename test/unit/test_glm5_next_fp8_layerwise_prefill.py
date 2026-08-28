@@ -289,8 +289,13 @@ class TestGlm5NextFp8GenericRouting(unittest.TestCase):
             ],
         )
 
-    def test_image_extend_and_decode_idle_bypass_generic_context(self):
-        cases = (("EXTEND", True), ("DECODE", False), ("IDLE", False))
+    def test_image_extend_and_decode_verify_idle_bypass_generic_context(self):
+        cases = (
+            ("EXTEND", True),
+            ("DECODE", False),
+            ("TARGET_VERIFY", False),
+            ("IDLE", False),
+        )
         for mode, has_image in cases:
             with self.subTest(mode=mode, has_image=has_image):
                 kt_ep_wrapper._SHARED_FULL_CONTEXT = None

@@ -180,8 +180,9 @@ def test_multimodal_hybrid_prefill_marker_survives_chunked_prefill():
     assert schedule_source.count("glm5_next_force_hybrid_prefill") >= 4
     assert "additional_stop_token_ids = getattr(" in schedule_source
     assert 'self.tokenizer, "additional_stop_token_ids", None' in schedule_source
-    assert "batch.forward_mode.is_extend()" in forward_source
+    assert "batch.forward_mode == ForwardMode.EXTEND" in forward_source
     assert "batch.multimodal_inputs or []" in forward_source
+    assert '"TARGET_VERIFY"' in model_source
 
 
 def test_finish_check_tolerates_tokenizer_without_optional_stop_ids():

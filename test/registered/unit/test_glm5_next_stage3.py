@@ -903,6 +903,15 @@ class TestGlm5NextMHCModelBoundary(unittest.TestCase):
             self.assertEqual(calls, ["multimodal", "direct"])
             self.assertFalse(decode_batch.glm5_next_has_image_inputs)
 
+            verify_batch = batch("TARGET_VERIFY")
+            model(
+                input_ids=torch.tensor([0]),
+                positions=torch.tensor([0]),
+                forward_batch=verify_batch,
+            )
+            self.assertEqual(calls, ["multimodal", "direct", "direct"])
+            self.assertFalse(verify_batch.glm5_next_has_image_inputs)
+
     def test_general_mm_embed_routine_matches_inner_model_input_embed_abi(self):
         general_mm_embed_routine = _compile_function(
             MM_UTILS_PATH, "general_mm_embed_routine"
