@@ -906,10 +906,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # Use fully fused kernel that handles masking internally
         # This avoids separate nonzero() and index_select() calls
@@ -919,12 +917,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             state_indices_tensor,
             accepted_steps,
         )
-        fused_mamba_state_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            accepted_steps,
-        )
+        for conv_states, intermediate_conv_window_cache in zip(
+            mamba_caches.conv,
+            mamba_caches.intermediate_conv_window,
+            strict=True,
+        ):
+            fused_mamba_state_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                accepted_steps,
+            )
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
@@ -936,9 +939,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-            fused_mamba_state_scatter_with_mask(
-                conv_states,
-                intermediate_conv_window_cache,
-                mamba_track_indices,
-                mamba_steps_to_track,
-            )
+            for conv_states, intermediate_conv_window_cache in zip(
+                mamba_caches.conv,
+                mamba_caches.intermediate_conv_window,
+                strict=True,
+            ):
+                fused_mamba_state_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window_cache,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )

@@ -296,6 +296,11 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         self.assertIn("accepted_length + 1", source)
         self.assertIn("supports topk=1 only", source)
 
+    def test_target_verification_commits_glm_linear_state(self):
+        source = EAGLE_WORKER_PATH.read_text(encoding="utf-8")
+        self.assertIn("model_runner.glm5_next_linear_config is not None", source)
+        self.assertIn("self._mamba_verify_update(", source)
+
     def test_target_verify_kpool_transaction_remains_eager(self):
         source = (ROOT / "python/sglang/srt/server_args.py").read_text()
         self.assertIn("KPool target verification currently", source)

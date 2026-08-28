@@ -356,6 +356,139 @@ class TestGlm5NextKDAReference(unittest.TestCase):
             torch.allclose(actual_states, expected_states, atol=1e-6, rtol=1e-6)
         )
 
+    def test_target_verify_caches_each_state_without_committing_final_state(self):
+        torch.manual_seed(17)
+        tokens, heads, head_dim, value_dim = 4, 2, 2, 3
+        q = torch.randn(1, tokens, heads, head_dim)
+        k = torch.randn_like(q)
+        v = torch.randn(1, tokens, heads, value_dim)
+        raw_gate = torch.randn(1, tokens, heads, head_dim)
+        raw_beta = torch.randn(1, tokens, heads).to(torch.bfloat16)
+        A_log = torch.tensor([0.0, math.log(1.5)]).view(1, 1, heads, 1)
+        dt_bias = torch.linspace(-0.2, 0.3, heads * head_dim)
+        state_indices = torch.tensor([1], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, tokens], dtype=torch.int32)
+        initial_states = torch.randn(3, heads, head_dim, value_dim) * 0.1
+        live_states = initial_states.clone()
+        intermediate = torch.zeros(1, tokens, heads, head_dim, value_dim)
+
+        actual = self.ops.glm5_next_safe_decode(
+            A_log=A_log,
+            raw_gate=raw_gate,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+            q=q,
+            k=k,
+            v=v,
+            raw_beta=raw_beta,
+            state_source=live_states,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate,
+            intermediate_state_indices=torch.tensor([0], dtype=torch.int32),
+            cache_steps=tokens,
+            disable_state_update=True,
+        )
+
+        expected_states = initial_states.clone()
+        expected = _small_decode_reference(
+            q=q,
+            k=k,
+            v=v,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+            states=expected_states,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+        )
+        running_states = initial_states.clone()
+        for step in range(tokens):
+            _small_decode_reference(
+                q=q[:, step : step + 1],
+                k=k[:, step : step + 1],
+                v=v[:, step : step + 1],
+                raw_gate=raw_gate[:, step : step + 1],
+                raw_beta=raw_beta[:, step : step + 1],
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=-5.0,
+                states=running_states,
+                state_indices=state_indices,
+                query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            )
+            torch.testing.assert_close(
+                intermediate[0, step], running_states[1], rtol=1e-6, atol=1e-6
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(live_states, initial_states, rtol=0, atol=0)
+        torch.testing.assert_close(intermediate[0, -1], expected_states[1])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_target_verify_cuda_matches_cpu_intermediate_state_contract(self):
+        generator = torch.Generator().manual_seed(23)
+        tokens, heads, head_dim, value_dim = 4, 2, 8, 8
+
+        def random_bf16(shape):
+            return (torch.randn(*shape, generator=generator) * 0.2).to(torch.bfloat16)
+
+        inputs = {
+            "q": random_bf16((1, tokens, heads, head_dim)),
+            "k": random_bf16((1, tokens, heads, head_dim)),
+            "v": random_bf16((1, tokens, heads, value_dim)),
+            "raw_gate": random_bf16((1, tokens, heads, head_dim)),
+            "raw_beta": random_bf16((1, tokens, heads)),
+        }
+        A_log = torch.tensor([0.0, math.log(1.5)]).view(1, 1, heads, 1)
+        dt_bias = torch.linspace(-0.2, 0.3, heads * head_dim)
+        state_indices = torch.tensor([1], dtype=torch.int32)
+        query_start_loc = torch.tensor([0, tokens], dtype=torch.int32)
+        intermediate_indices = torch.tensor([0], dtype=torch.int32)
+        initial_states = random_bf16((3, heads, head_dim, value_dim))
+        expected_live = initial_states.clone()
+        expected_intermediate = torch.zeros(
+            1, tokens, heads, head_dim, value_dim, dtype=torch.bfloat16
+        )
+        expected = self.ops.glm5_next_safe_decode(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=-5.0,
+            state_source=expected_live,
+            state_indices=state_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=expected_intermediate,
+            intermediate_state_indices=intermediate_indices,
+            cache_steps=tokens,
+            disable_state_update=True,
+            **inputs,
+        )
+
+        live = initial_states.cuda()
+        intermediate = torch.zeros_like(expected_intermediate, device="cuda")
+        actual = self.ops.glm5_next_safe_decode(
+            A_log=A_log.cuda(),
+            dt_bias=dt_bias.cuda(),
+            lower_bound=-5.0,
+            state_source=live,
+            state_indices=state_indices.cuda(),
+            query_start_loc=query_start_loc.cuda(),
+            intermediate_states_buffer=intermediate,
+            intermediate_state_indices=intermediate_indices.cuda(),
+            cache_steps=tokens,
+            disable_state_update=True,
+            **{name: tensor.cuda() for name, tensor in inputs.items()},
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(
+            intermediate.cpu(), expected_intermediate, rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(live.cpu(), initial_states, rtol=0, atol=0)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_bf16_beta_decode_graph_a_poison_a_resets_state_and_keeps_pointers(self):
         generator = torch.Generator().manual_seed(20260812)
@@ -600,6 +733,20 @@ class TestGlm5NextKDAIsolation(unittest.TestCase):
         } | {node.attr for node in ast.walk(backend) if isinstance(node, ast.Attribute)}
         self.assertFalse(any("rope" in name.lower() for name in identifiers))
         self.assertFalse(any("position" in name.lower() for name in identifiers))
+
+    def test_topk1_verify_caches_all_recurrent_state_components(self):
+        backend_source = BACKEND_PATH.read_text(encoding="utf-8")
+        hybrid_source = (
+            REPO_ROOT
+            / "python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _target_verify_conv(", backend_source)
+        self.assertIn("self.kernel.target_verify(", backend_source)
+        self.assertIn("forward_batch.spec_info.topk != 1", backend_source)
+        self.assertIn("intermediate_states_buffer=", backend_source)
+        self.assertIn("mamba_caches.conv,", hybrid_source)
+        self.assertIn("mamba_caches.intermediate_conv_window,", hybrid_source)
 
     def test_glm_kernel_requires_explicit_lower_bound(self):
         tree = ast.parse(KERNEL_PATH.read_text(encoding="utf-8"))

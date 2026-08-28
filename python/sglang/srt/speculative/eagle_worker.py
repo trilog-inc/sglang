@@ -1076,6 +1076,7 @@ class EAGLEWorker(TpModelWorker):
 
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.glm5_next_linear_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):

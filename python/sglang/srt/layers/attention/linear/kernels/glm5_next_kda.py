@@ -120,3 +120,49 @@ class Glm5NextTritonKDAKernel(TritonKDAKernel):
             cu_seqlens=query_start_loc,
         )
         return output.to(input_dtype)
+
+    def target_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_gate: torch.Tensor,
+        raw_beta: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+    ) -> torch.Tensor:
+        """Verify a linear top-k=1 branch without committing its final state."""
+
+        head_k_dim = q.shape[-1]
+        if raw_gate.ndim == 2:
+            raw_gate = raw_gate.unsqueeze(0)
+        if raw_gate.ndim == 3:
+            raw_gate = raw_gate.unflatten(-1, (-1, head_k_dim))
+        if raw_beta.ndim == 2:
+            raw_beta = raw_beta.unsqueeze(0)
+        return glm5_next_safe_decode(
+            A_log=A_log,
+            raw_gate=raw_gate,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            q=q,
+            k=k,
+            v=v,
+            raw_beta=raw_beta,
+            state_source=ssm_states,
+            state_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_steps,
+            disable_state_update=True,
+        )

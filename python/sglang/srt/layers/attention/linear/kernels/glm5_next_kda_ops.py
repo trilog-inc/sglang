@@ -254,6 +254,8 @@ def _glm5_next_safe_decode_kernel(
     output,
     state_source,
     state_indices,
+    intermediate_states_buffer,
+    intermediate_state_indices,
     query_start_loc,
     scale,
     T,
@@ -268,6 +270,9 @@ def _glm5_next_safe_decode_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     SPLIT_N_HV_GRID: tl.constexpr,
+    CACHE_STEPS: tl.constexpr,
+    SAVE_INTERMEDIATE: tl.constexpr,
+    UPDATE_STATE: tl.constexpr,
 ):
     if SPLIT_N_HV_GRID:
         i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -316,7 +321,7 @@ def _glm5_next_safe_decode_kernel(
             )
             state += tl.load(state_ptr, mask=mask_state, other=0).to(tl.float32)
 
-    for _ in range(0, T):
+    for step in range(0, T):
         q_value = tl.load(q_ptr, mask=mask_k, other=0).to(tl.float32)
         k_value = tl.load(k_ptr, mask=mask_k, other=0).to(tl.float32)
         v_value = tl.load(v_ptr, mask=mask_v, other=0).to(tl.float32)
@@ -342,6 +347,23 @@ def _glm5_next_safe_decode_kernel(
         result = tl.sum(state * q_value[:, None], axis=0)
         tl.store(output_ptr, result.to(output_ptr.dtype.element_ty), mask=mask_v)
 
+        if SAVE_INTERMEDIATE:
+            intermediate_state_index = tl.load(intermediate_state_indices + i_n)
+            if intermediate_state_index >= 0:
+                intermediate_state_ptr = (
+                    intermediate_states_buffer
+                    + intermediate_state_index * CACHE_STEPS * HV * K * V
+                    + step * HV * K * V
+                    + i_hv * K * V
+                    + offsets_k[:, None] * V
+                    + offsets_v[None, :]
+                )
+                tl.store(
+                    intermediate_state_ptr,
+                    state.to(intermediate_state_ptr.dtype.element_ty),
+                    mask=mask_state,
+                )
+
         q_ptr += H * K
         k_ptr += H * K
         v_ptr += HV * V
@@ -349,7 +371,7 @@ def _glm5_next_safe_decode_kernel(
         output_ptr += HV * V
         gate_ptr += HV * K
 
-    if USE_INITIAL_STATE:
+    if USE_INITIAL_STATE and UPDATE_STATE:
         state_index = tl.load(state_indices + i_n)
         if state_index >= 0:
             state_ptr = (
@@ -381,6 +403,9 @@ def _torch_safe_decode(
     query_start_loc: torch.Tensor,
     scale: float,
     use_qk_l2norm_in_kernel: bool,
+    intermediate_states_buffer: Optional[torch.Tensor],
+    intermediate_state_indices: Optional[torch.Tensor],
+    disable_state_update: bool,
 ) -> torch.Tensor:
     output = torch.empty_like(v, dtype=q.dtype)
     _, _, num_q_heads, head_k_dim = q.shape
@@ -432,7 +457,14 @@ def _torch_safe_decode(
                     (head_state * q_value.unsqueeze(-1)).sum(0).to(output.dtype)
                 )
 
-        if state_index >= 0:
+            if intermediate_states_buffer is not None:
+                intermediate_state_index = int(intermediate_state_indices[sequence_id])
+                if intermediate_state_index >= 0:
+                    intermediate_states_buffer[
+                        intermediate_state_index, token_id - bos
+                    ].copy_(state.to(intermediate_states_buffer.dtype))
+
+        if state_index >= 0 and not disable_state_update:
             state_source[state_index].copy_(state.to(state_source.dtype))
     return output
 
@@ -452,6 +484,10 @@ def glm5_next_safe_decode(
     query_start_loc: torch.Tensor,
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = True,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: Optional[int] = None,
+    disable_state_update: bool = False,
 ) -> torch.Tensor:
     """GLM bounded-gate decode; both gate and beta inputs are raw logits.
 
@@ -476,6 +512,39 @@ def glm5_next_safe_decode(
     elif scale <= 0:
         raise ValueError("scale must be positive")
 
+    save_intermediate = intermediate_states_buffer is not None
+    if save_intermediate:
+        if intermediate_state_indices is None or cache_steps is None:
+            raise ValueError(
+                "GLM KDA intermediate verification states require indices and "
+                "cache_steps"
+            )
+        if intermediate_state_indices.numel() != num_sequences:
+            raise ValueError(
+                "GLM KDA intermediate state indices must match the verification "
+                "batch"
+            )
+        if tokens % num_sequences != 0 or tokens // num_sequences > cache_steps:
+            raise ValueError(
+                "GLM KDA verification tokens exceed the intermediate state cache"
+            )
+        if not intermediate_states_buffer.is_contiguous():
+            raise ValueError("GLM KDA intermediate state cache must be contiguous")
+        expected_state_shape = tuple(state_source.shape[1:])
+        if tuple(intermediate_states_buffer.shape[2:]) != expected_state_shape:
+            raise ValueError(
+                "GLM KDA intermediate state shape does not match the live state: "
+                f"{tuple(intermediate_states_buffer.shape[2:])} != "
+                f"{expected_state_shape}"
+            )
+        if intermediate_states_buffer.shape[1] < cache_steps:
+            raise ValueError("GLM KDA intermediate state cache is too short")
+    elif disable_state_update:
+        raise ValueError(
+            "GLM KDA cannot disable the live-state update without an intermediate "
+            "state buffer"
+        )
+
     if q.device.type == "cpu":
         return _torch_safe_decode(
             A_log=A_log,
@@ -491,6 +560,9 @@ def glm5_next_safe_decode(
             query_start_loc=query_start_loc,
             scale=scale,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            disable_state_update=disable_state_update,
         )
 
     q = q.contiguous()
@@ -516,6 +588,16 @@ def glm5_next_safe_decode(
         output=output,
         state_source=state_source,
         state_indices=state_indices,
+        intermediate_states_buffer=(
+            intermediate_states_buffer
+            if intermediate_states_buffer is not None
+            else state_source
+        ),
+        intermediate_state_indices=(
+            intermediate_state_indices
+            if intermediate_state_indices is not None
+            else state_indices
+        ),
         query_start_loc=query_start_loc,
         scale=scale,
         T=tokens,
@@ -530,6 +612,9 @@ def glm5_next_safe_decode(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=query_start_loc is not None,
         SPLIT_N_HV_GRID=split_grid,
+        CACHE_STEPS=cache_steps or 0,
+        SAVE_INTERMEDIATE=save_intermediate,
+        UPDATE_STATE=not disable_state_update,
         num_warps=num_warps,
         num_stages=num_stages,
     )

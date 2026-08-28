@@ -6,7 +6,9 @@ tensors before entering :class:`KDAAttnBackend`.  Keeping a dedicated backend
 prevents the bounded GLM gate from changing Kimi's kernel selection, TF32,
 autotune, or padding behavior.
 
-This backend intentionally contains no CP, MTP, or CUDA-graph specialization.
+Target verification specializes the checkpoint's supported top-k=1 MTP branch
+so recurrent state is committed only through the accepted candidate token.
+CP and CUDA-graph specialization remain outside this backend.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_npu
 
 if is_npu():
@@ -129,6 +132,37 @@ class Glm5NextKDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
+    @staticmethod
+    def _target_verify_conv(
+        projected_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor,
+        *,
+        batch_size: int,
+        draft_token_num: int,
+        cache_indices: torch.Tensor,
+        intermediate_conv_window: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        width = projected_states.shape[-1]
+        projected_states = projected_states.reshape(
+            batch_size, draft_token_num, width
+        ).transpose(1, 2)
+        projected_states = causal_conv1d_update(
+            projected_states,
+            conv_state.transpose(-1, -2),
+            conv_weights,
+            conv_bias,
+            activation="silu",
+            conv_state_indices=cache_indices,
+            intermediate_conv_window=intermediate_conv_window,
+            intermediate_state_indices=intermediate_state_indices,
+        )
+        return projected_states.transpose(1, 2).reshape(
+            batch_size * draft_token_num, width
+        )
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -159,51 +193,98 @@ class Glm5NextKDAAttnBackend(MambaAttnBackendBase):
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache.conv
         ssm_states = layer_cache.temporal
-        has_initial_state = forward_batch.extend_prefix_lens > 0
-
-        q = causal_conv1d_fn(
-            q_proj_states.transpose(0, 1),
-            q_conv_weights,
-            q_conv_bias,
-            activation="silu",
-            conv_states=q_conv_state.transpose(-1, -2),
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        k = causal_conv1d_fn(
-            k_proj_states.transpose(0, 1),
-            k_conv_weights,
-            k_conv_bias,
-            activation="silu",
-            conv_states=k_conv_state.transpose(-1, -2),
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
-        v = causal_conv1d_fn(
-            v_proj_states.transpose(0, 1),
-            v_conv_weights,
-            v_conv_bias,
-            activation="silu",
-            conv_states=v_conv_state.transpose(-1, -2),
-            has_initial_state=has_initial_state,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+        if is_target_verify:
+            if forward_batch.spec_info.topk != 1:
+                raise RuntimeError("GLM-5-Next KDA target verification requires topk=1")
+            if not isinstance(layer_cache, MambaPool.SpeculativeState):
+                raise RuntimeError(
+                    "GLM-5-Next KDA target verification requires speculative "
+                    "Mamba state buffers"
+                )
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            if mixed_qkv.shape[0] % draft_token_num != 0:
+                raise RuntimeError(
+                    "GLM-5-Next KDA verification rows must be request-major"
+                )
+            batch_size = mixed_qkv.shape[0] // draft_token_num
+            cache_indices = cache_indices[:batch_size]
+            intermediate_state_indices = torch.arange(
+                batch_size, dtype=torch.int32, device=cache_indices.device
+            )
+            conv_args = dict(
+                batch_size=batch_size,
+                draft_token_num=draft_token_num,
+                cache_indices=cache_indices,
+                intermediate_state_indices=intermediate_state_indices,
+            )
+            q = self._target_verify_conv(
+                q_proj_states,
+                q_conv_state,
+                q_conv_weights,
+                q_conv_bias,
+                intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+                **conv_args,
+            )
+            k = self._target_verify_conv(
+                k_proj_states,
+                k_conv_state,
+                k_conv_weights,
+                k_conv_bias,
+                intermediate_conv_window=layer_cache.intermediate_conv_window[1],
+                **conv_args,
+            )
+            v = self._target_verify_conv(
+                v_proj_states,
+                v_conv_state,
+                v_conv_weights,
+                v_conv_bias,
+                intermediate_conv_window=layer_cache.intermediate_conv_window[2],
+                **conv_args,
+            )
+        else:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+            q = causal_conv1d_fn(
+                q_proj_states.transpose(0, 1),
+                q_conv_weights,
+                q_conv_bias,
+                activation="silu",
+                conv_states=q_conv_state.transpose(-1, -2),
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            k = causal_conv1d_fn(
+                k_proj_states.transpose(0, 1),
+                k_conv_weights,
+                k_conv_bias,
+                activation="silu",
+                conv_states=k_conv_state.transpose(-1, -2),
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
+            v = causal_conv1d_fn(
+                v_proj_states.transpose(0, 1),
+                v_conv_weights,
+                v_conv_bias,
+                activation="silu",
+                conv_states=v_conv_state.transpose(-1, -2),
+                has_initial_state=has_initial_state,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)
 
         q = rearrange(q, "n (h d) -> 1 n h d", d=layer.head_q_dim)
         k = rearrange(k, "n (h d) -> 1 n h d", d=layer.head_k_dim)
         v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
-        output = self.kernel.extend(
+        kernel_args = dict(
             q=q,
             k=k,
             v=v,
-            g=a,
-            beta=b,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=self._lower_bound(layer),
@@ -211,4 +292,15 @@ class Glm5NextKDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
         )
+        if is_target_verify:
+            output = self.kernel.target_verify(
+                raw_gate=a,
+                raw_beta=b,
+                intermediate_states_buffer=layer_cache.intermediate_ssm,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=draft_token_num,
+                **kernel_args,
+            )
+        else:
+            output = self.kernel.extend(g=a, beta=b, **kernel_args)
         return restore_glm5_next_kda_padding(output, physical_num_tokens)
