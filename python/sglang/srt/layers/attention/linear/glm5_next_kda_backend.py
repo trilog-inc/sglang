@@ -149,6 +149,12 @@ class Glm5NextKDAAttnBackend(MambaAttnBackendBase):
         projected_states = projected_states.reshape(
             batch_size, draft_token_num, width
         ).transpose(1, 2)
+        # MambaPool stores the KDA conv state as (win, dim) while the conv
+        # kernels consume it as (dim, win).  The intermediate window cache must
+        # be presented in the same (dim, win) orientation as ``conv_state`` or
+        # SAVE_INTERMEDIATE writes walk out of bounds by ``win``-stride feats.
+        if intermediate_conv_window is not None:
+            intermediate_conv_window = intermediate_conv_window.transpose(-1, -2)
         projected_states = causal_conv1d_update(
             projected_states,
             conv_state.transpose(-1, -2),

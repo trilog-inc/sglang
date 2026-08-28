@@ -748,6 +748,20 @@ class TestGlm5NextKDAIsolation(unittest.TestCase):
         self.assertIn("mamba_caches.conv,", hybrid_source)
         self.assertIn("mamba_caches.intermediate_conv_window,", hybrid_source)
 
+    def test_target_verify_conv_orients_intermediate_window_like_conv_state(self):
+        # MambaPool stores the KDA conv state as (win, dim) while the causal
+        # conv kernels consume it as (dim, win).  SAVE_INTERMEDIATE strides the
+        # feature axis before the window axis, so an untransposed (win, dim)
+        # intermediate cache walks out of bounds by ``win``-stride features.
+        # This is the illegal-memory-access regression seen on the first
+        # GLM-5-Next target verify (KimiLinearStateShape.conv is (win, dim)).
+        source = BACKEND_PATH.read_text(encoding="utf-8")
+        self.assertIn("intermediate_conv_window.transpose(-1, -2)", source)
+        self.assertIn(
+            "causal_conv1d_update(",
+            source,
+        )
+
     def test_glm_kernel_requires_explicit_lower_bound(self):
         tree = ast.parse(KERNEL_PATH.read_text(encoding="utf-8"))
         kernel = next(
