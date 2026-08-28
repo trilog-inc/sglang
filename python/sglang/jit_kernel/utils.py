@@ -177,8 +177,17 @@ def load_jit(
     if not env_existed:
         os.environ[env_key] = _get_cuda_arch_list()
     try:
+        module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+        # Heterogeneous servers run the same JIT module on different SM
+        # generations (e.g. an SM120 target beside an SM89 draft GPU).  The
+        # tvm_ffi disk cache is keyed by module name, so a stale single-arch
+        # binary must not shadow the multi-arch rebuild.
+        if not env_existed and ";" in os.environ.get(env_key, ""):
+            module_name += "_arch_" + os.environ[env_key].replace(".", "_").replace(
+                ";", "_"
+            )
         return load_inline(
-            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
+            module_name,
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
@@ -203,7 +212,19 @@ def is_arch_support_pdl() -> bool:
 
 @cache_once
 def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}"
+    """Get the CUDA architecture string(s) for TVM_FFI_CUDA_ARCH_LIST.
+
+    Heterogeneous servers (e.g. an SM120 target beside an SM89 draft GPU) may
+    execute the same JIT module on several devices, so compile every visible
+    architecture instead of only ``torch.cuda.current_device()``.
+    """
+    capabilities = []
+    for index in range(torch.cuda.device_count()):
+        capability = torch.cuda.get_device_capability(index)
+        if capability not in capabilities:
+            capabilities.append(capability)
+    if not capabilities:
+        capabilities = [
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+        ]
+    return ";".join(f"{major}.{minor}" for major, minor in capabilities)
