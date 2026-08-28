@@ -323,7 +323,10 @@ def glm5_next_triton_paged_mqa_logits(
         raise ValueError("KPool lengths must have one entry per query")
     seq_lens = seq_lens.view(-1)
     if page_table.shape[0] != q.shape[0]:
-        raise ValueError("KPool page table must have one row per query")
+        raise ValueError(
+            "KPool page table must have one row per query: "
+            f"page_table {tuple(page_table.shape)} vs q {tuple(q.shape)}"
+        )
     if weights.device != q.device or seq_lens.device != q.device:
         raise ValueError("KPool scorer metadata must share the query device")
     if page_table.device != q.device or cache.device != q.device:

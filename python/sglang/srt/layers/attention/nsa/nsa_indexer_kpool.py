@@ -711,6 +711,11 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
+            # The padded decode batch trims the query and weight rows above but
+            # leaves the page table and lengths at the padded count, which the
+            # scorer rejects (one row per query).  Trim them to the same size.
+            block_tables = block_tables[:n_real]
+            seqlens_32 = seqlens_32[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache.shape) == 2
         block_kv = 64
