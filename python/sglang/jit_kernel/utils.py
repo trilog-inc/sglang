@@ -22,7 +22,12 @@ def cache_once(fn: F) -> F:
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        key = (args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
+        # JIT kernels are CUDA-architecture-specific.  A heterogeneous process
+        # (e.g. an SM120 target beside an SM89 draft GPU) runs the same kernel
+        # on different devices, so the current device is part of the cache key
+        # and each device compiles its own module.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        key = (device, args, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
         if key not in result_map:
             result_map[key] = fn(*args, **kwargs)
         return result_map[key]
@@ -178,14 +183,12 @@ def load_jit(
         os.environ[env_key] = _get_cuda_arch_list()
     try:
         module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
-        # Heterogeneous servers run the same JIT module on different SM
-        # generations (e.g. an SM120 target beside an SM89 draft GPU).  The
-        # tvm_ffi disk cache is keyed by module name, so a stale single-arch
-        # binary must not shadow the multi-arch rebuild.
-        if not env_existed and ";" in os.environ.get(env_key, ""):
-            module_name += "_arch_" + os.environ[env_key].replace(".", "_").replace(
-                ";", "_"
-            )
+        # JIT binaries are single-arch.  In a heterogeneous process the same
+        # kernel is compiled once per device, so the arch must stay part of the
+        # module name or tvm_ffi's cache would return a stale cubin compiled
+        # for another device.
+        if not env_existed:
+            module_name += "_arch_" + os.environ[env_key].replace(".", "_")
         return load_inline(
             module_name,
             cpp_sources=cpp_sources,
@@ -212,19 +215,11 @@ def is_arch_support_pdl() -> bool:
 
 @cache_once
 def _get_cuda_arch_list() -> str:
-    """Get the CUDA architecture string(s) for TVM_FFI_CUDA_ARCH_LIST.
+    """Get the CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST.
 
-    Heterogeneous servers (e.g. an SM120 target beside an SM89 draft GPU) may
-    execute the same JIT module on several devices, so compile every visible
-    architecture instead of only ``torch.cuda.current_device()``.
+    ``cache_once`` keys by the current device, so heterogeneous processes
+    compile each JIT kernel for the architecture it actually runs on.
     """
-    capabilities = []
-    for index in range(torch.cuda.device_count()):
-        capability = torch.cuda.get_device_capability(index)
-        if capability not in capabilities:
-            capabilities.append(capability)
-    if not capabilities:
-        capabilities = [
-            torch.cuda.get_device_capability(torch.cuda.current_device())
-        ]
-    return ";".join(f"{major}.{minor}" for major, minor in capabilities)
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"{major}.{minor}"
