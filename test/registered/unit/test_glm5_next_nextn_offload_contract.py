@@ -185,6 +185,31 @@ class TestGlm5NextKPoolDraftRows(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fewer rows than the scorer"):
             self.align(_FakeRows(2), _FakeRows(2), _FakeRows(1), _FakeRows(2))
 
+    def test_speculative_snapshot_mirrors_kernel_page_column_clamp(self):
+        tree = ast.parse(KPOOL_INDEXER_PATH.read_text(encoding="utf-8"))
+        indexer = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "IndexerKPool"
+        )
+        method = next(
+            node
+            for node in indexer.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_begin_speculative_kpool_transaction"
+        )
+        source = ast.unparse(method)
+        clamp = "torch.clamp(page_columns, min=0, max=block_tables.shape[1] - 1)"
+        lookup = "block_tables[rows, page_columns.to(torch.long)]"
+        self.assertIn(clamp, source)
+        self.assertIn(lookup, source)
+        self.assertLess(source.index(clamp), source.index(lookup))
+
+    def test_page_one_fallback_is_converted_to_real_pages(self):
+        source = KPOOL_INDEXER_PATH.read_text(encoding="utf-8")
+        self.assertIn("page_table_1[:, ::page_size]", source)
+        self.assertIn('rounding_mode="floor"', source)
+
 
 class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
     def test_remote_spec_copy_includes_dynamic_position_tensor(self):

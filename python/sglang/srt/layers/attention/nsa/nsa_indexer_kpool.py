@@ -1177,7 +1177,21 @@ class IndexerKPool(MultiPlatformOp):
             # page-1 table is the same as the real table when page_size == 1.
             block_tables = metadata.get_page_table_64()
             if block_tables is None:
-                block_tables = metadata.get_page_table_1()
+                page_table_1 = metadata.get_page_table_1()
+                if page_table_1 is None:
+                    raise ValueError(
+                        "target-verification KPool requires a page table"
+                    )
+                page_size = pool.page_size
+                block_tables = (
+                    page_table_1
+                    if page_size == 1
+                    else torch.div(
+                        page_table_1[:, ::page_size],
+                        page_size,
+                        rounding_mode="floor",
+                    ).to(torch.int32)
+                )
             seq_lens = metadata.get_seqlens_expanded()
             if seq_lens is None:
                 seq_lens = positions + 1
@@ -1198,6 +1212,18 @@ class IndexerKPool(MultiPlatformOp):
             return transaction
         else:
             block_tables = metadata.get_page_table_64()
+            if block_tables is None:
+                raise ValueError("draft KPool requires a page-64 table")
+            if block_tables.ndim != 2 or block_tables.shape[1] == 0:
+                raise ValueError(
+                    "draft KPool requires a non-empty rank-2 page table, got "
+                    f"{tuple(block_tables.shape)}"
+                )
+            if block_tables.shape[0] < key.shape[0]:
+                raise ValueError(
+                    "draft KPool page table has fewer rows than the key batch: "
+                    f"page_table={block_tables.shape[0]}, key={key.shape[0]}"
+                )
             positions_i64 = positions[: key.shape[0]].to(torch.int64)
             pool_ids = torch.div(
                 positions_i64, self.index_kpool, rounding_mode="floor"
@@ -1207,6 +1233,12 @@ class IndexerKPool(MultiPlatformOp):
                     pool_ids, pool.slots_per_page, rounding_mode="floor"
                 )
                 * self.index_kpool
+            )
+            # Mirror the update kernels' BLOCK_TABLE_COLS clamp.  Multimodal
+            # positions may be wider than the logical token table, and the
+            # snapshot must protect the exact page that the kernel will use.
+            page_columns = torch.clamp(
+                page_columns, min=0, max=block_tables.shape[1] - 1
             )
             rows = torch.arange(
                 key.shape[0], dtype=torch.long, device=block_tables.device
