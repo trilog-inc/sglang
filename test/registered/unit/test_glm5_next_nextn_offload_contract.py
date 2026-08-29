@@ -324,6 +324,7 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         self.assertIn(
             "sequence-dependent KPool plans are not graph-safe", worker_source
         )
+        self.assertIn("per-cycle fallback can limit throughput", worker_source)
 
         for path in (EAGLE_DRAFT_GRAPH_PATH, EAGLE_DRAFT_EXTEND_GRAPH_PATH):
             source = path.read_text(encoding="utf-8")

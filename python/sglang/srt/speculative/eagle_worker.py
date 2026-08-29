@@ -698,16 +698,18 @@ class EAGLEWorker(TpModelWorker):
 
         # GLM-5-Next KPool draft-extend metadata contains a ragged,
         # sequence-length-dependent write plan. Generic CUDA graph capture
-        # cannot construct or replay that plan yet. Keep this infrequent stage
+        # cannot construct or replay that plan yet. Keep the per-cycle stage
         # eager instead of paying for a known-failing capture and logging a
-        # misleading startup traceback. Draft decode remains graphed.
+        # misleading startup traceback. Draft decode remains graphed, but the
+        # eager extend remains a known throughput limit.
         eager_glm5_next_draft_extend = (
             self._remote_draft and target_only_graph_disable
         )
         if eager_glm5_next_draft_extend and self.draft_extend_attn_backend:
             logger.info(
                 "GLM-5-Next heterogeneous MTP draft extend stays eager on "
-                "cuda:%d; sequence-dependent KPool plans are not graph-safe.",
+                "cuda:%d; sequence-dependent KPool plans are not graph-safe "
+                "and this per-cycle fallback can limit throughput.",
                 self.draft_gpu_id,
             )
 
