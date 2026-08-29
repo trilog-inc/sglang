@@ -26,6 +26,11 @@ KPOOL_INDEXER_PATH = (
     ROOT / "python/sglang/srt/layers/attention/nsa/nsa_indexer_kpool.py"
 )
 KPOOL_MEMORY_PATH = ROOT / "python/sglang/srt/mem_cache/glm5_next_memory_pool.py"
+FP8_KERNEL_PATH = ROOT / "python/sglang/srt/layers/quantization/fp8_kernel.py"
+MOE_CONFIG_PATH = (
+    ROOT
+    / "python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_config.py"
+)
 
 
 def _compile_nextn_helper(name):
@@ -315,6 +320,10 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         worker_source = EAGLE_WORKER_PATH.read_text(encoding="utf-8")
         self.assertIn("target_only_graph_disable", worker_source)
         self.assertIn("_glm5_next_mtp_forced_eager_target", worker_source)
+        self.assertIn("eager_glm5_next_draft_extend", worker_source)
+        self.assertIn(
+            "sequence-dependent KPool plans are not graph-safe", worker_source
+        )
 
         for path in (EAGLE_DRAFT_GRAPH_PATH, EAGLE_DRAFT_EXTEND_GRAPH_PATH):
             source = path.read_text(encoding="utf-8")
@@ -322,6 +331,17 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
             self.assertIn("if self.eagle_worker._remote_draft", source)
             self.assertIn("self._get_graph_memory_pool()", source)
             self.assertIn("self._set_graph_memory_pool(graph.pool())", source)
+
+    def test_kernel_config_caches_are_scoped_to_the_active_gpu(self):
+        fp8_source = FP8_KERNEL_PATH.read_text(encoding="utf-8")
+        self.assertIn("_get_w8a8_block_fp8_configs", fp8_source)
+        self.assertIn("current_device()", fp8_source)
+        self.assertIn("device_id: int", fp8_source)
+
+        moe_source = MOE_CONFIG_PATH.read_text(encoding="utf-8")
+        self.assertIn("_get_moe_configs", moe_source)
+        self.assertIn("torch.get_device_module().current_device()", moe_source)
+        self.assertIn("get_device_name(device_id)", moe_source)
 
     def test_remote_draft_graph_uses_step_local_forward_context(self):
         source = EAGLE_WORKER_PATH.read_text(encoding="utf-8")

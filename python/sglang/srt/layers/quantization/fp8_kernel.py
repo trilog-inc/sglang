@@ -1013,7 +1013,6 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@functools.lru_cache
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
 ) -> Optional[Dict[int, Any]]:
@@ -1031,9 +1030,20 @@ def get_w8a8_block_fp8_configs(
     if torch._dynamo.is_compiling():
         return None
 
+    # Configs are architecture-specific. A heterogeneous target/draft process
+    # can execute this function on more than one CUDA device, so include the
+    # active device in the cache key instead of freezing GPU 0's config.
+    device_id = torch.get_device_module().current_device()
+    return _get_w8a8_block_fp8_configs(N, K, block_n, block_k, device_id)
+
+
+@functools.lru_cache
+def _get_w8a8_block_fp8_configs(
+    N: int, K: int, block_n: int, block_k: int, device_id: int
+) -> Optional[Dict[int, Any]]:
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = get_device_name().replace(" ", "_")
+    device_name = get_device_name(device_id).replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(

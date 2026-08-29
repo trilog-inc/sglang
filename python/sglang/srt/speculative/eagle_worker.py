@@ -696,8 +696,27 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+        # GLM-5-Next KPool draft-extend metadata contains a ragged,
+        # sequence-length-dependent write plan. Generic CUDA graph capture
+        # cannot construct or replay that plan yet. Keep this infrequent stage
+        # eager instead of paying for a known-failing capture and logging a
+        # misleading startup traceback. Draft decode remains graphed.
+        eager_glm5_next_draft_extend = (
+            self._remote_draft and target_only_graph_disable
+        )
+        if eager_glm5_next_draft_extend and self.draft_extend_attn_backend:
+            logger.info(
+                "GLM-5-Next heterogeneous MTP draft extend stays eager on "
+                "cuda:%d; sequence-dependent KPool plans are not graph-safe.",
+                self.draft_gpu_id,
+            )
+
         # Capture extend
-        if self.draft_extend_attn_backend and not _is_npu:
+        if (
+            self.draft_extend_attn_backend
+            and not _is_npu
+            and not eager_glm5_next_draft_extend
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, graph_gpu_id)
             logger.info(

@@ -23,8 +23,9 @@ def get_config_file_name(
     block_shape: Optional[int] = None,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    device_name: Optional[str] = None,
 ) -> str:
-    device_name = get_device_name().replace(" ", "_")
+    device_name = (device_name or get_device_name()).replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
@@ -34,7 +35,6 @@ def get_config_file_name(
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
 
 
-@functools.lru_cache
 def get_moe_configs(
     E: int,
     N: int,
@@ -57,6 +57,32 @@ def get_moe_configs(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
         return None
+
+    # MoE tuning is device-specific. Keep separate cache entries for the SM120
+    # target and SM89 draft when they coexist in one scheduler process.
+    return _get_moe_configs(
+        E,
+        N,
+        dtype,
+        block_n,
+        block_k,
+        per_channel_quant,
+        down_moe,
+        torch.get_device_module().current_device(),
+    )
+
+
+@functools.lru_cache
+def _get_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: Optional[int],
+    block_k: Optional[int],
+    per_channel_quant: bool,
+    down_moe: bool,
+    device_id: int,
+) -> Optional[Dict[int, Any]]:
     # Supported Triton versions, should be sorted from the newest to the oldest
     supported_triton_versions = ["3.4.0", "3.3.1", "3.2.0", "3.1.0"]
 
@@ -69,6 +95,7 @@ def get_moe_configs(
         [block_n, block_k],
         per_channel_quant,
         down_moe=down_moe,
+        device_name=get_device_name(device_id),
     )
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
