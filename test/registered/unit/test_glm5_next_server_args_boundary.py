@@ -305,10 +305,9 @@ class TestGlm5NextSessionABOptions(unittest.TestCase):
                 self.validate(args)
 
                 self.assertEqual(args.speculative_algorithm, algorithm)
-                self.assertFalse(args.disable_cuda_graph)
-                self.assertEqual(args.cuda_graph_bs, [1, 2, 4])
-                self.assertEqual(args.cuda_graph_max_bs, 4)
-                self.assertTrue(args.disable_cuda_graph_padding)
+                self.assertTrue(args.disable_cuda_graph)
+                self.assertFalse(hasattr(args, "cuda_graph_bs"))
+                self.assertTrue(args._glm5_next_mtp_forced_eager_target)
                 self.assertTrue(args._glm5_next_session_ab_active)
 
     def test_tp1_tp2_tp4_and_tp8_are_accepted(self):

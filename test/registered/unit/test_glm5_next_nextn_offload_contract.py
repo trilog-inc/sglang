@@ -26,9 +26,6 @@ KPOOL_INDEXER_PATH = (
     ROOT / "python/sglang/srt/layers/attention/nsa/nsa_indexer_kpool.py"
 )
 KPOOL_MEMORY_PATH = ROOT / "python/sglang/srt/mem_cache/glm5_next_memory_pool.py"
-CUDA_GRAPH_RUNNER_PATH = (
-    ROOT / "python/sglang/srt/model_executor/cuda_graph_runner.py"
-)
 
 
 def _compile_nextn_helper(name):
@@ -315,6 +312,10 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
             self.assertIn(required, source)
 
     def test_remote_draft_graphs_use_a_device_local_memory_pool(self):
+        worker_source = EAGLE_WORKER_PATH.read_text(encoding="utf-8")
+        self.assertIn("target_only_graph_disable", worker_source)
+        self.assertIn("_glm5_next_mtp_forced_eager_target", worker_source)
+
         for path in (EAGLE_DRAFT_GRAPH_PATH, EAGLE_DRAFT_EXTEND_GRAPH_PATH):
             source = path.read_text(encoding="utf-8")
             self.assertIn("_draft_graph_memory_pool", source)
@@ -433,21 +434,15 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         self.assertIn("model_runner.glm5_next_linear_config is not None", source)
         self.assertIn("self._mamba_verify_update(", source)
 
-    def test_target_verify_kpool_transaction_is_bound_to_each_graph(self):
+    def test_target_verify_stays_eager_while_remote_draft_graphs_are_eligible(self):
         source = (ROOT / "python/sglang/srt/server_args.py").read_text()
-        self.assertIn("Keeping CUDA graphs enabled for GLM-5-Next MTP", source)
+        self.assertIn("Disabling target CUDA graphs for GLM-5-Next MTP", source)
+        self.assertIn("_glm5_next_mtp_forced_eager_target", source)
+        self.assertIn("self.disable_cuda_graph = True", source)
 
         pool_source = KPOOL_MEMORY_PATH.read_text(encoding="utf-8")
-        self.assertIn("take_speculative_kpool_graph_state", pool_source)
-        self.assertIn("activate_speculative_kpool_graph_state", pool_source)
-        self.assertIn("staged.graph_static", pool_source)
         self.assertIn("transaction.capture_current()", pool_source)
         self.assertIn("staged.final_state.restore()", pool_source)
-
-        graph_source = CUDA_GRAPH_RUNNER_PATH.read_text(encoding="utf-8")
-        self.assertIn("_glm5_next_kpool_graph_states", graph_source)
-        self.assertIn("take_kpool_graph_state()", graph_source)
-        self.assertIn("activate_speculative_kpool_graph_state", graph_source)
 
 
 if __name__ == "__main__":

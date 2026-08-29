@@ -647,13 +647,19 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        target_only_graph_disable = getattr(
+            self.server_args, "_glm5_next_mtp_forced_eager_target", False
+        )
+        if self.server_args.disable_cuda_graph and not (
+            self._remote_draft and target_only_graph_disable
+        ):
             return
 
         if self._remote_draft:
             logger.info(
                 "Capturing heterogeneous MTP CUDA graphs on cuda:%d with a "
-                "device-local graph memory pool; target graphs remain on cuda:%d.",
+                "device-local graph memory pool; target verification stays "
+                "eager on cuda:%d.",
                 self.draft_gpu_id,
                 self.target_gpu_id,
             )

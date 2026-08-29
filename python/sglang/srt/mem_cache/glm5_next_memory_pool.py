@@ -91,7 +91,6 @@ class _KPoolSpeculativeLayer:
     batch_size: int
     tokens_per_request: int
     round_scale: bool
-    graph_static: bool = False
     final_state: Optional[_KPoolStateSnapshot] = None
 
 
@@ -450,9 +449,6 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         staged_layers = self._speculative_kpool_layers
         self._speculative_kpool_layers = {}
         for layer_id, staged in staged_layers.items():
-            if staged.graph_static and len(counts) < staged.batch_size:
-                # CUDA graph padding rows are inert and must not be committed.
-                counts = counts + [0] * (staged.batch_size - len(counts))
             if len(counts) != staged.batch_size:
                 raise ValueError(
                     "accepted KPool counts must match the staged batch size; "
@@ -515,24 +511,6 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
                 f"missing staged KPool layer {layer_id} before final snapshot"
             )
         staged.final_state = transaction.capture_current()
-
-    def take_speculative_kpool_graph_state(
-        self,
-    ) -> dict[int, _KPoolSpeculativeLayer]:
-        """Detach the static transaction tensors produced by graph capture."""
-
-        state = self._speculative_kpool_layers
-        self._speculative_kpool_layers = {}
-        for staged in state.values():
-            staged.graph_static = True
-        return state
-
-    def activate_speculative_kpool_graph_state(
-        self, state: dict[int, _KPoolSpeculativeLayer]
-    ) -> None:
-        """Select the transaction tensors owned by the graph being replayed."""
-
-        self._speculative_kpool_layers = dict(state)
 
     def discard_speculative_kpool(self) -> None:
         """Drop uncommitted verification rows during request/error cleanup."""
@@ -813,16 +791,6 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
             layer_id=self._transfer_full_attention_id(layer_id),
             transaction=transaction,
         )
-
-    def take_speculative_kpool_graph_state(
-        self,
-    ) -> dict[int, _KPoolSpeculativeLayer]:
-        return self.full_kv_pool.take_speculative_kpool_graph_state()
-
-    def activate_speculative_kpool_graph_state(
-        self, state: dict[int, _KPoolSpeculativeLayer]
-    ) -> None:
-        self.full_kv_pool.activate_speculative_kpool_graph_state(state)
 
     def discard_speculative_kpool(self) -> None:
         self.full_kv_pool.discard_speculative_kpool()

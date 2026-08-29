@@ -1171,10 +1171,6 @@ class IndexerKPool(MultiPlatformOp):
                 layer_id=layer_id,
                 req_pool_indices=forward_batch.req_pool_indices[:batch_size],
                 packed_write_locs=packed_write_locs,
-                # Capture needs a fixed output shape. Duplicate snapshot rows
-                # contain identical pre-write values, so replay restoration
-                # remains exact without torch.unique.
-                deduplicate_indices=not torch.cuda.is_current_stream_capturing(),
             )
             # Metadata fields can be absent in the eager target-verify batch.
             # ``seq_lens`` for the tentative rows equals position + 1 and the

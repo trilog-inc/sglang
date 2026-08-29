@@ -675,7 +675,6 @@ class CudaGraphRunner:
         logger.info(log_message)
 
     def capture(self) -> None:
-        self._glm5_next_kpool_graph_states = {}
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
@@ -740,15 +739,6 @@ class CudaGraphRunner:
                         key = bs if stream_idx is None else f"{stream_idx}_{bs}"
                         self.graphs[key] = graph
                         self.output_buffers[key] = output_buffers
-                        take_kpool_graph_state = getattr(
-                            self.model_runner.token_to_kv_pool,
-                            "take_speculative_kpool_graph_state",
-                            None,
-                        )
-                        if take_kpool_graph_state is not None:
-                            state = take_kpool_graph_state()
-                            if state:
-                                self._glm5_next_kpool_graph_states[key] = state
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -1111,11 +1101,6 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        kpool_graph_state = self._glm5_next_kpool_graph_states.get(graph_key)
-        if kpool_graph_state is not None:
-            self.model_runner.token_to_kv_pool.activate_speculative_kpool_graph_state(
-                kpool_graph_state
-            )
         self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]

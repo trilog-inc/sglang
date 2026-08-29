@@ -1434,12 +1434,16 @@ class ServerArgs:
                 f"{self.speculative_algorithm!r}."
             )
         if self.speculative_algorithm is not None and not self.disable_cuda_graph:
-            # KPool graph transaction buffers are captured for an exact batch
-            # shape. Avoid mapping padding rows onto live request/tail rows.
-            self.disable_cuda_graph_padding = True
+            # Target verification requires a sequence-length-dependent KPool
+            # extend plan. It is not present during generic target graph
+            # capture. Preserve the reason for this forced disable so a remote
+            # checkpoint-native draft can still capture independent graphs.
+            self._glm5_next_mtp_forced_eager_target = True
+            self.disable_cuda_graph = True
             logger.warning(
-                "Keeping CUDA graphs enabled for GLM-5-Next MTP: KPool "
-                "rollback/commit tensors are bound to each exact-batch verify graph."
+                "Disabling target CUDA graphs for GLM-5-Next MTP: "
+                "transactional KPool verification requires its eager extend "
+                "plan; heterogeneous draft graphs remain eligible."
             )
         if self.enable_nsa_prefill_context_parallel:
             raise ValueError(
