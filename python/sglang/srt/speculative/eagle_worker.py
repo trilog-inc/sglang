@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
@@ -33,6 +34,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -132,6 +137,30 @@ class EAGLEWorker(TpModelWorker):
         self._remote_req_owner: dict[int, int] = {}
         self._remote_req_synced_len: dict[int, int] = {}
         self._remote_req_owner_serial = 0
+        self._remote_transfer_buffers: dict[tuple, torch.Tensor] = {}
+        self._draft_graph_memory_pool = None
+        self._mtp_profile_enabled = (
+            self._remote_draft and envs.SGLANG_GLM5_MTP_PROFILE.get()
+        )
+        self._mtp_profile_interval = max(
+            1, envs.SGLANG_GLM5_MTP_PROFILE_INTERVAL.get()
+        )
+        self._mtp_profile_cycles = 0
+        self._mtp_profile_requests = 0
+        self._mtp_profile_accepted = 0
+        self._mtp_profile_stage_seconds = {
+            "draft": 0.0,
+            "verify": 0.0,
+            "draft_extend": 0.0,
+        }
+        self._mtp_profile_graph_runs = {
+            "draft_hit": 0,
+            "draft_miss": 0,
+            "verify_hit": 0,
+            "verify_miss": 0,
+            "extend_hit": 0,
+            "extend_miss": 0,
+        }
         if self._remote_draft:
             capability = torch.cuda.get_device_capability(self.draft_gpu_id)
             if capability != (8, 9):
@@ -154,6 +183,14 @@ class EAGLEWorker(TpModelWorker):
                 logger.warning(
                     "CUDA peer access is unavailable between target and draft; "
                     "PyTorch will use its host-staged copy path."
+                )
+            if self._mtp_profile_enabled:
+                logger.warning(
+                    "SGLANG_GLM5_MTP_PROFILE is enabled: stage timing "
+                    "synchronizes cuda:%d and cuda:%d and will reduce measured "
+                    "throughput. Disable it for final benchmarks.",
+                    self.target_gpu_id,
+                    self.draft_gpu_id,
                 )
         self.target_worker = target_worker
         self.page_size = server_args.page_size
@@ -328,6 +365,90 @@ class EAGLEWorker(TpModelWorker):
             else nullcontext()
         )
 
+    def _mtp_profile_start(self) -> Optional[float]:
+        if not self._mtp_profile_enabled:
+            return None
+        for gpu_id in (self.target_gpu_id, self.draft_gpu_id):
+            with torch.cuda.device(gpu_id):
+                torch.cuda.synchronize(gpu_id)
+        return time.perf_counter()
+
+    def _mtp_profile_end(self, stage: str, started: Optional[float]) -> None:
+        if started is None:
+            return
+        for gpu_id in (self.target_gpu_id, self.draft_gpu_id):
+            with torch.cuda.device(gpu_id):
+                torch.cuda.synchronize(gpu_id)
+        self._mtp_profile_stage_seconds[stage] += time.perf_counter() - started
+
+    def _mtp_profile_graph_run(self, stage: str, hit: bool) -> None:
+        if self._mtp_profile_enabled:
+            self._mtp_profile_graph_runs[f"{stage}_{'hit' if hit else 'miss'}"] += 1
+
+    def _mtp_profile_finish(self, accept_lengths: List[int]) -> None:
+        if not self._mtp_profile_enabled:
+            return
+        self._mtp_profile_cycles += 1
+        self._mtp_profile_requests += len(accept_lengths)
+        self._mtp_profile_accepted += sum(accept_lengths)
+        if self._mtp_profile_cycles < self._mtp_profile_interval:
+            return
+
+        cycles = self._mtp_profile_cycles
+        requests = max(self._mtp_profile_requests, 1)
+        accepted_per_request = self._mtp_profile_accepted / requests
+        draft_candidates = max(self.speculative_num_steps, 1)
+        acceptance_ratio = min(1.0, accepted_per_request / draft_candidates)
+        draft_runs = (
+            self._mtp_profile_graph_runs["draft_hit"]
+            + self._mtp_profile_graph_runs["draft_miss"]
+        )
+        extend_runs = (
+            self._mtp_profile_graph_runs["extend_hit"]
+            + self._mtp_profile_graph_runs["extend_miss"]
+        )
+        verify_runs = (
+            self._mtp_profile_graph_runs["verify_hit"]
+            + self._mtp_profile_graph_runs["verify_miss"]
+        )
+        logger.info(
+            "GLM-5-Next heterogeneous MTP profile: cycles=%d, "
+            "accepted_draft_tokens/request=%.2f, draft_accept_ratio=%.1f%%, "
+            "stage_ms={draft:%.2f, verify:%.2f, draft_extend:%.2f}, "
+            "graph_hit={draft:%.1f%%, verify:%.1f%%, draft_extend:%.1f%%}",
+            cycles,
+            accepted_per_request,
+            acceptance_ratio * 100,
+            self._mtp_profile_stage_seconds["draft"] * 1000 / cycles,
+            self._mtp_profile_stage_seconds["verify"] * 1000 / cycles,
+            self._mtp_profile_stage_seconds["draft_extend"] * 1000 / cycles,
+            100 * self._mtp_profile_graph_runs["draft_hit"] / max(draft_runs, 1),
+            100 * self._mtp_profile_graph_runs["verify_hit"] / max(verify_runs, 1),
+            100
+            * self._mtp_profile_graph_runs["extend_hit"]
+            / max(extend_runs, 1),
+        )
+        if acceptance_ratio < 0.40 and self.speculative_num_steps > 1:
+            logger.warning(
+                "GLM-5-Next MTP acceptance is too low for depth %d; benchmark "
+                "--speculative-num-steps 1 --speculative-num-draft-tokens 2.",
+                self.speculative_num_steps,
+            )
+        elif acceptance_ratio < 0.65 and self.speculative_num_steps > 2:
+            logger.warning(
+                "GLM-5-Next MTP acceptance is marginal at depth %d; benchmark "
+                "--speculative-num-steps 2 --speculative-num-draft-tokens 3.",
+                self.speculative_num_steps,
+            )
+
+        self._mtp_profile_cycles = 0
+        self._mtp_profile_requests = 0
+        self._mtp_profile_accepted = 0
+        for stage in self._mtp_profile_stage_seconds:
+            self._mtp_profile_stage_seconds[stage] = 0.0
+        for key in self._mtp_profile_graph_runs:
+            self._mtp_profile_graph_runs[key] = 0
+
     def _preserve_heterogeneous_flashinfer_arches(self) -> None:
         """Keep lazy FlashInfer builds valid for both GPUs in this process."""
 
@@ -356,8 +477,25 @@ class EAGLEWorker(TpModelWorker):
             draft_head.copy_(head, non_blocking=True)
             torch.cuda.current_stream(self.draft_gpu_id).synchronize()
 
+    def _copy_remote_tensor(
+        self, namespace: str, name: str, value: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        """Copy a hot-path tensor through a reusable destination allocation."""
+
+        if value.device == device:
+            return value
+        key = (namespace, name, str(device), value.dtype, tuple(value.shape))
+        copied = self._remote_transfer_buffers.get(key)
+        if copied is None:
+            copied = torch.empty_like(value, device=device)
+            self._remote_transfer_buffers[key] = copied
+        copied.copy_(value, non_blocking=True)
+        return copied
+
     @staticmethod
-    def _copy_spec_to_device(spec_info, device):
+    def _copy_spec_to_device(
+        spec_info, device, copy_tensor=None, namespace: str = "spec"
+    ):
         if spec_info is None:
             return None
         copied = copy.copy(spec_info)
@@ -369,11 +507,11 @@ class EAGLEWorker(TpModelWorker):
         # target/draft boundary as well.
         for name, value in vars(copied).items():
             if isinstance(value, torch.Tensor) and not name.endswith("_cpu"):
-                setattr(
-                    copied,
-                    name,
-                    value.to(device=device, non_blocking=True),
-                )
+                if copy_tensor is None:
+                    value = value.to(device=device, non_blocking=True)
+                else:
+                    value = copy_tensor(namespace, name, value, device)
+                setattr(copied, name, value)
         return copied
 
     def _model_worker_batch_to_draft(self, model_worker_batch):
@@ -386,10 +524,15 @@ class EAGLEWorker(TpModelWorker):
                 setattr(
                     copied,
                     field.name,
-                    value.to(device=self.draft_device, non_blocking=True),
+                    self._copy_remote_tensor(
+                        "batch", field.name, value, self.draft_device
+                    ),
                 )
         copied.spec_info = self._copy_spec_to_device(
-            model_worker_batch.spec_info, self.draft_device
+            model_worker_batch.spec_info,
+            self.draft_device,
+            self._copy_remote_tensor,
+            "batch_spec",
         )
         return copied
 
@@ -465,7 +608,9 @@ class EAGLEWorker(TpModelWorker):
                 name,
                 None
                 if value is None
-                else value.to(device=self.target_device, non_blocking=True),
+                else self._copy_remote_tensor(
+                    "draft_capture", name, value, self.target_device
+                ),
             )
 
     def _handoff_draft_to_target(self) -> None:
@@ -506,30 +651,41 @@ class EAGLEWorker(TpModelWorker):
             return
 
         if self._remote_draft:
-            # The existing graph runners assume target and draft buffers share
-            # one CUDA device.  Keep target graphs enabled while running the
-            # comparatively small MTP model eagerly on the 4090.
             logger.info(
-                "Draft CUDA graphs are disabled for heterogeneous MTP; "
-                "target-model CUDA graphs remain enabled."
+                "Capturing heterogeneous MTP CUDA graphs on cuda:%d with a "
+                "device-local graph memory pool; target graphs remain on cuda:%d.",
+                self.draft_gpu_id,
+                self.target_gpu_id,
             )
-            return
 
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
         }
+        graph_gpu_id = (
+            self.draft_gpu_id if self._remote_draft else self.target_gpu_id
+        )
         # Capture draft
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            before_mem = get_available_gpu_memory(self.device, graph_gpu_id)
             logger.info(
                 f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner = Device2DraftCudaGraphRunner[
-                self.target_worker.device
-            ](self)
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            try:
+                self.cuda_graph_runner = Device2DraftCudaGraphRunner[
+                    self.target_worker.device
+                ](self)
+            except Exception:
+                if not self._remote_draft:
+                    raise
+                logger.exception(
+                    "Heterogeneous MTP draft graph capture failed; falling "
+                    "back to eager draft decoding on cuda:%d.",
+                    self.draft_gpu_id,
+                )
+                self.cuda_graph_runner = None
+            after_mem = get_available_gpu_memory(self.device, graph_gpu_id)
             logger.info(
                 f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
@@ -537,14 +693,24 @@ class EAGLEWorker(TpModelWorker):
         # Capture extend
         if self.draft_extend_attn_backend and not _is_npu:
             tic = time.perf_counter()
-            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            before_mem = get_available_gpu_memory(self.device, graph_gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                self
-            )
-            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            try:
+                self.cuda_graph_runner_for_draft_extend = (
+                    EAGLEDraftExtendCudaGraphRunner(self)
+                )
+            except Exception:
+                if not self._remote_draft:
+                    raise
+                logger.exception(
+                    "Heterogeneous MTP draft-extend graph capture failed; "
+                    "falling back to eager draft extend on cuda:%d.",
+                    self.draft_gpu_id,
+                )
+                self.cuda_graph_runner_for_draft_extend = None
+            after_mem = get_available_gpu_memory(self.device, graph_gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
@@ -586,14 +752,20 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
+            profile_started = self._mtp_profile_start()
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
                 spec_info = self.draft(batch)
+            self._mtp_profile_end("draft", profile_started)
+            profile_started = self._mtp_profile_start()
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            self._mtp_profile_graph_run("verify", bool(can_run_cuda_graph))
+            self._mtp_profile_end("verify", profile_started)
 
+            profile_started = self._mtp_profile_start()
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
@@ -605,6 +777,8 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+            self._mtp_profile_end("draft_extend", profile_started)
+            self._mtp_profile_finish(verify_output.accept_length_per_req_cpu)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -840,6 +1014,7 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner
                 and self.cuda_graph_runner.can_run(forward_batch)
             )
+            self._mtp_profile_graph_run("draft", bool(can_cuda_graph))
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens = (
                     self.cuda_graph_runner.replay(forward_batch)
@@ -901,7 +1076,10 @@ class EAGLEWorker(TpModelWorker):
 
             if self._remote_draft:
                 verify_input = self._copy_spec_to_device(
-                    verify_input, self.target_device
+                    verify_input,
+                    self.target_device,
+                    self._copy_remote_tensor,
+                    "verify_input",
                 )
                 self._handoff_draft_to_target()
             return verify_input
@@ -972,9 +1150,15 @@ class EAGLEWorker(TpModelWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # During CUDA graph capture the generic runner publishes the
+            # model's default backend. Each MTP step has its own frozen decode
+            # backend, so override the context for the exact KPool lookup.
+            with forward_context(
+                ForwardContext(attn_backend=forward_batch.attn_backend)
+            ):
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -1294,6 +1478,7 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend
                 and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
             )
+            self._mtp_profile_graph_run("extend", bool(can_cuda_graph))
             if can_cuda_graph:
                 logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch

@@ -84,6 +84,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        self.capture_attn_backend = eagle_worker.draft_extend_attn_backend
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
@@ -245,6 +246,19 @@ class EAGLEDraftExtendCudaGraphRunner:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
         return is_bs_supported
+
+    def _get_graph_memory_pool(self):
+        if self.eagle_worker._remote_draft:
+            return getattr(self.eagle_worker, "_draft_graph_memory_pool", None)
+        return get_global_graph_memory_pool()
+
+    def _set_graph_memory_pool(self, pool) -> None:
+        if self.eagle_worker._remote_draft:
+            # Share only with the draft decode graphs on the same CUDA device;
+            # the process-global pool belongs to the target GPU.
+            self.eagle_worker._draft_graph_memory_pool = pool
+        else:
+            set_global_graph_memory_pool(pool)
 
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
@@ -409,10 +423,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         self._capture_init(run_once)
 
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+            graph, self._get_graph_memory_pool(), stream, run_once
         )
 
-        set_global_graph_memory_pool(graph.pool())
+        self._set_graph_memory_pool(graph.pool())
         return graph, out
 
     def replay(self, forward_batch: ForwardBatch):

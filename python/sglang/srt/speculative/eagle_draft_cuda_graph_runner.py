@@ -195,6 +195,20 @@ class EAGLEDraftCudaGraphRunner:
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
 
+    def _get_graph_memory_pool(self):
+        if self.eagle_worker._remote_draft:
+            return getattr(self.eagle_worker, "_draft_graph_memory_pool", None)
+        return get_global_graph_memory_pool()
+
+    def _set_graph_memory_pool(self, pool) -> None:
+        if self.eagle_worker._remote_draft:
+            # CUDA graph pools cannot be shared across devices. The target
+            # runner owns the process-global pool on cuda:0; keep the draft
+            # decode/extend pool local to cuda:1 instead.
+            self.eagle_worker._draft_graph_memory_pool = pool
+        else:
+            set_global_graph_memory_pool(pool)
+
     def _capture_init(self, run_once_fn):
         for _ in range(2):
             torch.cuda.synchronize()
@@ -342,10 +356,10 @@ class EAGLEDraftCudaGraphRunner:
         self._capture_init(run_once)
 
         out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+            graph, self._get_graph_memory_pool(), stream, run_once
         )
 
-        set_global_graph_memory_pool(graph.pool())
+        self._set_graph_memory_pool(graph.pool())
         return graph, out
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):

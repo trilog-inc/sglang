@@ -59,6 +59,22 @@ class _KPoolStateSnapshot:
                 0, self.request_indices, self.tail_score_values
             )
 
+    def capture_current(self) -> _KPoolStateSnapshot:
+        """Capture the current values at this snapshot's fixed rows."""
+
+        return _KPoolStateSnapshot(
+            index_buffer=self.index_buffer,
+            page_indices=self.page_indices,
+            page_values=self.index_buffer.index_select(0, self.page_indices).clone(),
+            tail_k=self.tail_k,
+            tail_score=self.tail_score,
+            request_indices=self.request_indices,
+            tail_k_values=self.tail_k.index_select(0, self.request_indices).clone(),
+            tail_score_values=self.tail_score
+            .index_select(0, self.request_indices)
+            .clone(),
+        )
+
 
 @dataclass
 class _KPoolSpeculativeLayer:
@@ -75,14 +91,17 @@ class _KPoolSpeculativeLayer:
     batch_size: int
     tokens_per_request: int
     round_scale: bool
+    graph_static: bool = False
+    final_state: Optional[_KPoolStateSnapshot] = None
 
 
 def _normalize_req_pool_indices(
     req_pool_indices: int | Iterable[int] | torch.Tensor,
     *,
     device: torch.device,
+    deduplicate: bool = True,
 ) -> torch.Tensor:
-    """Return unique, one-dimensional request rows on ``device``."""
+    """Return one-dimensional request rows on ``device``."""
 
     if isinstance(req_pool_indices, int):
         rows = torch.tensor([req_pool_indices], dtype=torch.long, device=device)
@@ -92,7 +111,7 @@ def _normalize_req_pool_indices(
         rows = torch.tensor(
             list(req_pool_indices), dtype=torch.long, device=device
         ).reshape(-1)
-    return torch.unique(rows)
+    return torch.unique(rows) if deduplicate else rows
 
 
 class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
@@ -334,20 +353,23 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         layer_id: int,
         req_pool_indices: torch.Tensor,
         packed_write_locs: torch.Tensor,
+        deduplicate_indices: bool = True,
     ) -> _KPoolStateSnapshot:
         """Snapshot only pages/tails a speculative KPool call can mutate."""
 
         local_idx = self._local_layer_index(layer_id)
         index_buffer = self.get_index_k_with_scale_buffer(layer_id)
-        page_indices = torch.unique(
-            torch.div(
-                packed_write_locs.to(device=index_buffer.device, dtype=torch.long),
-                self.slots_per_page,
-                rounding_mode="floor",
-            )
+        page_indices = torch.div(
+            packed_write_locs.to(device=index_buffer.device, dtype=torch.long),
+            self.slots_per_page,
+            rounding_mode="floor",
         )
+        if deduplicate_indices:
+            page_indices = torch.unique(page_indices)
         request_indices = _normalize_req_pool_indices(
-            req_pool_indices, device=self._compress_tail_k[local_idx].device
+            req_pool_indices,
+            device=self._compress_tail_k[local_idx].device,
+            deduplicate=deduplicate_indices,
         )
         return _KPoolStateSnapshot(
             index_buffer=index_buffer,
@@ -428,6 +450,9 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
         staged_layers = self._speculative_kpool_layers
         self._speculative_kpool_layers = {}
         for layer_id, staged in staged_layers.items():
+            if staged.graph_static and len(counts) < staged.batch_size:
+                # CUDA graph padding rows are inert and must not be committed.
+                counts = counts + [0] * (staged.batch_size - len(counts))
             if len(counts) != staged.batch_size:
                 raise ValueError(
                     "accepted KPool counts must match the staged batch size; "
@@ -444,6 +469,14 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
 
             if hasattr(self, "invalidate_index_buffer_for_layer"):
                 self.invalidate_index_buffer_for_layer(layer_id)
+
+            if staged.final_state is not None and all(
+                count == staged.tokens_per_request for count in counts
+            ):
+                # The verify pass already computed this exact full-width state.
+                # Restoring it avoids replaying every KPool update kernel.
+                staged.final_state.restore()
+                continue
 
             for step in range(staged.tokens_per_request):
                 active_requests = [
@@ -471,6 +504,35 @@ class Glm5NextNSATokenToKVPool(NSATokenToKVPool):
                     out_cache_loc=staged.out_cache_loc.index_select(0, rows),
                     round_scale=staged.round_scale,
                 )
+
+    def capture_speculative_kpool_final_state(
+        self, *, layer_id: int, transaction: _KPoolStateSnapshot
+    ) -> None:
+        local_idx = self._local_layer_index(layer_id)
+        staged = self._speculative_kpool_layers.get(local_idx)
+        if staged is None:
+            raise RuntimeError(
+                f"missing staged KPool layer {layer_id} before final snapshot"
+            )
+        staged.final_state = transaction.capture_current()
+
+    def take_speculative_kpool_graph_state(
+        self,
+    ) -> dict[int, _KPoolSpeculativeLayer]:
+        """Detach the static transaction tensors produced by graph capture."""
+
+        state = self._speculative_kpool_layers
+        self._speculative_kpool_layers = {}
+        for staged in state.values():
+            staged.graph_static = True
+        return state
+
+    def activate_speculative_kpool_graph_state(
+        self, state: dict[int, _KPoolSpeculativeLayer]
+    ) -> None:
+        """Select the transaction tensors owned by the graph being replayed."""
+
+        self._speculative_kpool_layers = dict(state)
 
     def discard_speculative_kpool(self) -> None:
         """Drop uncommitted verification rows during request/error cleanup."""
@@ -743,6 +805,24 @@ class Glm5NextHybridKVPool(HybridLinearKVPool):
         self, accepted_token_counts: Iterable[int]
     ) -> None:
         self.full_kv_pool.commit_speculative_kpool(accepted_token_counts)
+
+    def capture_speculative_kpool_final_state(
+        self, *, layer_id: int, transaction: _KPoolStateSnapshot
+    ) -> None:
+        self.full_kv_pool.capture_speculative_kpool_final_state(
+            layer_id=self._transfer_full_attention_id(layer_id),
+            transaction=transaction,
+        )
+
+    def take_speculative_kpool_graph_state(
+        self,
+    ) -> dict[int, _KPoolSpeculativeLayer]:
+        return self.full_kv_pool.take_speculative_kpool_graph_state()
+
+    def activate_speculative_kpool_graph_state(
+        self, state: dict[int, _KPoolSpeculativeLayer]
+    ) -> None:
+        self.full_kv_pool.activate_speculative_kpool_graph_state(state)
 
     def discard_speculative_kpool(self) -> None:
         self.full_kv_pool.discard_speculative_kpool()

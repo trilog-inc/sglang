@@ -15,8 +15,19 @@ ATTENTION_REGISTRY_PATH = (
     ROOT / "python/sglang/srt/layers/attention/attention_registry.py"
 )
 EAGLE_WORKER_PATH = ROOT / "python/sglang/srt/speculative/eagle_worker.py"
+EAGLE_DRAFT_GRAPH_PATH = (
+    ROOT / "python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py"
+)
+EAGLE_DRAFT_EXTEND_GRAPH_PATH = (
+    ROOT
+    / "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py"
+)
 KPOOL_INDEXER_PATH = (
     ROOT / "python/sglang/srt/layers/attention/nsa/nsa_indexer_kpool.py"
+)
+KPOOL_MEMORY_PATH = ROOT / "python/sglang/srt/mem_cache/glm5_next_memory_pool.py"
+CUDA_GRAPH_RUNNER_PATH = (
+    ROOT / "python/sglang/srt/model_executor/cuda_graph_runner.py"
 )
 
 
@@ -297,10 +308,34 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
             "_handoff_draft_to_target",
             "remote MTP request mapping is smaller than the target",
             "FLASHINFER_CUDA_ARCH_LIST",
-            "Draft CUDA graphs are disabled for heterogeneous MTP",
+            "Capturing heterogeneous MTP CUDA graphs",
+            "_remote_transfer_buffers",
             "prepare_kpool_request",
         ):
             self.assertIn(required, source)
+
+    def test_remote_draft_graphs_use_a_device_local_memory_pool(self):
+        for path in (EAGLE_DRAFT_GRAPH_PATH, EAGLE_DRAFT_EXTEND_GRAPH_PATH):
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("_draft_graph_memory_pool", source)
+            self.assertIn("if self.eagle_worker._remote_draft", source)
+            self.assertIn("self._get_graph_memory_pool()", source)
+            self.assertIn("self._set_graph_memory_pool(graph.pool())", source)
+
+    def test_remote_draft_graph_uses_step_local_forward_context(self):
+        source = EAGLE_WORKER_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "ForwardContext(attn_backend=forward_batch.attn_backend)", source
+        )
+        extend_source = EAGLE_DRAFT_EXTEND_GRAPH_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "self.capture_attn_backend = eagle_worker.draft_extend_attn_backend",
+            extend_source,
+        )
+
+    def test_draft_kpool_snapshot_has_static_graph_shapes(self):
+        source = KPOOL_INDEXER_PATH.read_text(encoding="utf-8")
+        self.assertIn("deduplicate_indices=False", source)
 
     def test_draft_runner_does_not_allocate_target_kda_states(self):
         source = (ROOT / "python/sglang/srt/model_executor/model_runner.py").read_text()
@@ -398,10 +433,21 @@ class TestGlm5NextNextNSourceBoundary(unittest.TestCase):
         self.assertIn("model_runner.glm5_next_linear_config is not None", source)
         self.assertIn("self._mamba_verify_update(", source)
 
-    def test_target_verify_kpool_transaction_remains_eager(self):
+    def test_target_verify_kpool_transaction_is_bound_to_each_graph(self):
         source = (ROOT / "python/sglang/srt/server_args.py").read_text()
-        self.assertIn("KPool target verification currently", source)
-        self.assertIn("self.disable_cuda_graph = True", source)
+        self.assertIn("Keeping CUDA graphs enabled for GLM-5-Next MTP", source)
+
+        pool_source = KPOOL_MEMORY_PATH.read_text(encoding="utf-8")
+        self.assertIn("take_speculative_kpool_graph_state", pool_source)
+        self.assertIn("activate_speculative_kpool_graph_state", pool_source)
+        self.assertIn("staged.graph_static", pool_source)
+        self.assertIn("transaction.capture_current()", pool_source)
+        self.assertIn("staged.final_state.restore()", pool_source)
+
+        graph_source = CUDA_GRAPH_RUNNER_PATH.read_text(encoding="utf-8")
+        self.assertIn("_glm5_next_kpool_graph_states", graph_source)
+        self.assertIn("take_kpool_graph_state()", graph_source)
+        self.assertIn("activate_speculative_kpool_graph_state", graph_source)
 
 
 if __name__ == "__main__":

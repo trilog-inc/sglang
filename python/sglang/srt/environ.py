@@ -422,6 +422,10 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # Heterogeneous GLM-5-Next MTP diagnostics. Profiling synchronizes both
+    # CUDA devices at stage boundaries and must remain opt-in.
+    SGLANG_GLM5_MTP_PROFILE = EnvBool(False)
+    SGLANG_GLM5_MTP_PROFILE_INTERVAL = EnvInt(50)
 
     # VLM
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
