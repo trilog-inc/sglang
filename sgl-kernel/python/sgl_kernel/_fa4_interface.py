@@ -1,7 +1,7 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/5d4c9537a1e0f1adcc3e4c3e11ae46fe94a18b11/flash_attn/cute/interface.py
 
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-# [2025-10-14] Version in Cute-DSL, for Hopper and Blackwell. You'd need to install nvidia-cutlass-dsl==4.2.1.
+# [2025-10-14] Version in CuTe DSL for Hopper and Blackwell.
 
 
 import copy
@@ -19,7 +19,24 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.runtime import from_dlpack
+
+# Newer CUTLASS DSL releases accept string literals for rounding modes and no
+# longer expose the enum used by the vendored FlashAttention-CuTe sources.
+if not hasattr(nvvm, "RoundingModeKind"):
+
+    class _RoundingModeKindCompat:
+        NONE = "none"
+        RN = "rn"
+        RM = "rm"
+        RP = "rp"
+        RZ = "rz"
+        RNA = "rna"
+        RS = "rs"
+
+    nvvm.RoundingModeKind = _RoundingModeKindCompat
+
 from flash_attn_origin.cute import utils
 from flash_attn_origin.cute.block_sparsity import (
     BlockSparseTensorsTorch,
