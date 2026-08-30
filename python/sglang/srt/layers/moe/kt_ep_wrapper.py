@@ -4903,6 +4903,24 @@ def update_kt_wrapper_masks(
     wrapper.gpu_experts_mask.copy_(gpu_experts_mask_cpu)
 
 
+def _validate_kt_nvfp4_static_resident_config(
+    gpu_method: FusedMoEMethodBase, kt_config: KTConfig
+) -> None:
+    if type(gpu_method).__name__ != "ModelOptNvFp4FusedMoEMethod":
+        return
+
+    if (kt_config.gpu_prefill_token_threshold or 0) > 0:
+        raise ValueError(
+            "KT NVFP4 currently supports static GPU-resident experts only; "
+            "disable --kt-gpu-prefill-token-threshold."
+        )
+    if kt_config.kt_enable_dynamic_expert_update:
+        raise ValueError(
+            "KT NVFP4 currently supports static GPU-resident experts only; "
+            "disable --kt-enable-dynamic-expert-update."
+        )
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
@@ -4942,6 +4960,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             raise ImportError(
                 "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
+        _validate_kt_nvfp4_static_resident_config(gpu_method, kt_config)
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
@@ -5761,7 +5780,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Main stream waits for cpu_stream to complete before merging results
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+            output.add_(cpu_output)
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU

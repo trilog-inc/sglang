@@ -2778,6 +2778,16 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if (
+            self.quantization == "modelopt_fp4"
+            and self.moe_runner_backend == "auto"
+            and is_sm120_supported()
+        ):
+            self.moe_runner_backend = "flashinfer_cutlass"
+            logger.info(
+                "Use flashinfer_cutlass as the NVFP4 MoE runner backend on SM120."
+            )
+
         if self.quantization == "mxfp8":
             if is_hip():
                 if self.moe_runner_backend == "auto":

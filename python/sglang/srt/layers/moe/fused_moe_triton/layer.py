@@ -614,6 +614,11 @@ class FusedMoE(torch.nn.Module):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
+                expert_id = self._map_local_expert_id_to_kt_gpu_expert_id(
+                    param, expert_id
+                )
+                if expert_id == -1:
+                    return
 
             self._weight_loader_impl(
                 param=param,
@@ -660,25 +665,11 @@ class FusedMoE(torch.nn.Module):
             if expert_id < 0 or expert_id >= self.num_local_experts:
                 return
 
-        kt_method = None
-        if is_wrapped_method(self.quant_method, "kt_ep"):
-            kt_method = self.quant_method
-        elif hasattr(self, "scheme") and is_wrapped_method(self.scheme, "kt_ep"):
-            # Some code paths store KT wrapper on self.scheme instead of self.quant_method.
-            kt_method = self.scheme
-
-        if kt_method is not None and kt_method.num_gpu_experts != -1:
-            # Check if this expert is on GPU using the mask
-            if expert_id < 0 or expert_id >= len(kt_method.gpu_experts_mask):
+            expert_id = self._map_local_expert_id_to_kt_gpu_expert_id(
+                param, expert_id
+            )
+            if expert_id == -1:
                 return
-            if not kt_method.gpu_experts_mask[expert_id]:
-                return  # CPU expert, skip loading to GPU weights
-
-            # Remap logical expert_id to GPU weight index
-            mapped_expert_id = int(kt_method.logical_to_gpu_index[expert_id].item())
-            if mapped_expert_id < 0:
-                return
-            expert_id = mapped_expert_id
 
         self._weight_loader_impl(
             param=param,
@@ -687,6 +678,33 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
         )
+
+    def _map_local_expert_id_to_kt_gpu_expert_id(
+        self, param: torch.nn.Parameter, expert_id: int
+    ) -> int:
+        """Map a local logical expert to KT's compact resident-weight index."""
+        if getattr(param, "_sglang_require_global_experts", False):
+            return expert_id
+
+        kt_method = None
+        if is_wrapped_method(self.quant_method, "kt_ep"):
+            kt_method = self.quant_method
+        elif hasattr(self, "scheme") and is_wrapped_method(self.scheme, "kt_ep"):
+            # Some code paths store KT wrapper on self.scheme instead of self.quant_method.
+            kt_method = self.scheme
+
+        if kt_method is not None and kt_method.num_gpu_experts != -1:
+            if expert_id < 0 or expert_id >= len(kt_method.gpu_experts_mask):
+                return -1
+            if not kt_method.gpu_experts_mask[expert_id]:
+                return -1
+
+            mapped_expert_id = int(kt_method.logical_to_gpu_index[expert_id].item())
+            if mapped_expert_id < 0:
+                return -1
+            return mapped_expert_id
+
+        return expert_id
 
     def _weight_loader_impl(
         self,

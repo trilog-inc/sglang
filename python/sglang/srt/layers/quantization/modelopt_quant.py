@@ -1379,12 +1379,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
+        storage_num_experts = int(num_experts)
+        if not 0 <= storage_num_experts <= layer.num_local_experts:
+            raise ValueError(
+                "NVFP4 MoE storage expert count must be between 0 and "
+                f"{layer.num_local_experts}, got {storage_num_experts}."
+            )
+
+        # KT stores only GPU-resident experts in packed weight tensors. Input
+        # scales remain global below because their checkpoint values are used
+        # to derive a common activation scale across all logical experts.
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                storage_num_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
@@ -1399,7 +1409,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                storage_num_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
@@ -1413,7 +1423,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                storage_num_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -1431,7 +1441,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                storage_num_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -1453,9 +1463,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
+            (storage_num_experts, 2)
             if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
+            else (storage_num_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
@@ -1464,7 +1474,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(storage_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -1491,7 +1501,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
-        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        Only supports pre-quantized checkpoints with packed FP4 weights and scales.
         """
 
         # GEMM 1 scale processing
@@ -1670,7 +1680,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.cutlass_moe_params = CutlassMoEParams(
                 CutlassMoEType.BlockscaledFP4,
                 device,
-                num_experts=layer.num_experts,  # global num experts
+                num_experts=layer.w13_weight.shape[0],
                 intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
