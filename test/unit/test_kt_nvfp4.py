@@ -69,6 +69,7 @@ def _make_loader_layer():
     layer.num_local_experts = 8
     layer.num_fused_shared_experts = 0
     layer.moe_ep_rank = 0
+    layer.layer_id = 0
     layer.quant_method = SimpleNamespace(
         _quant_wrapper_id="kt_ep",
         num_gpu_experts=3,
