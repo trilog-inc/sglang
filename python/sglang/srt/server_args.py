@@ -335,6 +335,7 @@ NSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
+    "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
     "aiter",
@@ -1617,16 +1618,30 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_nsa_backends(
+        self, kv_cache_dtype: str, major: int, model_arch: Optional[str] = None
+    ) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
         if kv_cache_dtype == "fp8_e4m3":
-            # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_auto"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_kv"
+            if major == 12 and model_arch in (
+                "GlmMoeDsaForCausalLM",
+                "GlmMoeDsaForCausalLMNextN",
+            ):
+                # FlashMLA metadata and TRTLLM-GEN kernels reject SM120.
+                # FlashInfer 0.6.17+ provides a packed sparse MLA kernel for
+                # GLM DSA using the scaled FP8 KV layout.
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashinfer_sparse_mla"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashinfer_sparse_mla"
+            else:
+                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "flashmla_auto"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
@@ -1819,7 +1834,9 @@ class ServerArgs:
                         self._configure_glm5_next_session_ab_nsa(capability)
                     else:
                         self._set_default_nsa_kv_cache_dtype(major)
-                        self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                        self._set_default_nsa_backends(
+                            self.kv_cache_dtype, major, model_arch
+                        )
 
                 if self.enable_nsa_prefill_context_parallel:
                     assert (

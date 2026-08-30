@@ -43,6 +43,54 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestNSABackendDefaults(unittest.TestCase):
+    def test_sm120_fp8_uses_flashinfer_sparse_mla(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_nsa_backends(
+            "fp8_e4m3", 12, "GlmMoeDsaForCausalLM"
+        )
+
+        self.assertEqual(
+            server_args.nsa_prefill_backend, "flashinfer_sparse_mla"
+        )
+        self.assertEqual(server_args.nsa_decode_backend, "flashinfer_sparse_mla")
+
+    def test_sm100_fp8_keeps_flashmla_defaults(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_nsa_backends(
+            "fp8_e4m3", 10, "GlmMoeDsaForCausalLM"
+        )
+
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_auto")
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_kv")
+
+    def test_sm120_preserves_explicit_backends(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            nsa_prefill_backend="flashmla_sparse",
+            nsa_decode_backend="fa3",
+        )
+
+        server_args._set_default_nsa_backends(
+            "fp8_e4m3", 12, "GlmMoeDsaForCausalLM"
+        )
+
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.nsa_decode_backend, "fa3")
+
+    def test_sm120_non_glm_keeps_flashmla_defaults(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        server_args._set_default_nsa_backends(
+            "fp8_e4m3", 12, "DeepseekV3ForCausalLM"
+        )
+
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_auto")
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_kv")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

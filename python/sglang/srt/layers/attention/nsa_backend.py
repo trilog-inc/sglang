@@ -10,6 +10,10 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.nsa.flashinfer_sparse_mla import (
+    flashinfer_sparse_mla_forward,
+    validate_flashinfer_sparse_mla_backend,
+)
 from sglang.srt.layers.attention.nsa.glm5_next_sparse_attention import (
     glm5_next_sparse_mla_reference,
 )
@@ -291,7 +295,12 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashinfer_sparse_mla",
+    "fa3",
+    "tilelang",
+    "trtllm",
 ]
 
 
@@ -385,6 +394,15 @@ class NativeSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        model_arch = hf_config.architectures[0]
+        uses_flashinfer_sparse_mla = validate_flashinfer_sparse_mla_backend(
+            model_arch=model_arch,
+            device_sm_major=self.device_sm_major,
+            kv_cache_dtype=self.kv_cache_dtype,
+            prefill_impl=self.nsa_prefill_impl,
+            decode_impl=self.nsa_decode_impl,
+            is_hip=_is_hip,
+        )
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         uses_glm5_native_backend = (
@@ -396,7 +414,10 @@ class NativeSparseAttnBackend(
         ):
             global global_workspace_buffer
             if global_workspace_buffer is None:
-                global_workspace_buffer = torch.empty(
+                workspace_factory = (
+                    torch.zeros if uses_flashinfer_sparse_mla else torch.empty
+                )
+                global_workspace_buffer = workspace_factory(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
@@ -1673,6 +1694,16 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif nsa_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.nsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+            )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -1791,6 +1822,16 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+            )
+        elif self.nsa_decode_impl == "flashinfer_sparse_mla":
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            return self._forward_flashinfer_sparse_mla(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=metadata.nsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
             )
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -1976,6 +2017,30 @@ class NativeSparseAttnBackend(
             is_fp8_kvcache=True,
         )
         return o
+
+    def _forward_flashinfer_sparse_mla(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        seq_lens: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Run FlashInfer's packed sparse MLA kernel on SM120/SM121."""
+        assert self.workspace_buffer is not None
+        return flashinfer_sparse_mla_forward(
+            q=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            seq_lens=seq_lens,
+            workspace_buffer=self.workspace_buffer,
+            page_size=self.real_page_size,
+            kv_cache_dim=self.kv_cache_dim,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            sm_scale=sm_scale,
+        )
 
     def _forward_standard_mha(
         self,
