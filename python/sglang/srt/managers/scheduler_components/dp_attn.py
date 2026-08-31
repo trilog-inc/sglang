@@ -274,13 +274,14 @@ def prepare_mlp_sync_batch_raw(
         and is_deepseek_v4(model_runner.model_config.hf_config)
     ):
         from sglang.srt.layers.attention.dsv4.visible_window import (
-            has_fully_contained_image_span,
+            has_visible_window_span,
         )
 
-        dsv4_needs_visible_window = has_fully_contained_image_span(
+        dsv4_needs_visible_window = has_visible_window_span(
             local_batch.multimodal_inputs,
             local_batch.prefix_lens,
             local_batch.extend_lens,
+            getattr(model_runner.model_config, "sliding_window_size", None) or 128,
         )
     can_run_prefill_cuda_graph = (
         local_batch is None
