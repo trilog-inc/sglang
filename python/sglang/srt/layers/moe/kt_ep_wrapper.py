@@ -228,7 +228,7 @@ def _kt_supports_swiglu_parameters(method: Optional[str], is_glm5_next: bool) ->
     """Keep block-FP8 clamp propagation isolated to the exact GLM runtime."""
 
     normalized = (method or "").upper()
-    return normalized in ("MXFP4", "MXFP8") or (
+    return normalized in ("MXFP4", "NVFP4", "MXFP8") or (
         normalized == "FP8" and is_glm5_next
     )
 
@@ -4906,8 +4906,18 @@ def update_kt_wrapper_masks(
 def _validate_kt_nvfp4_static_resident_config(
     gpu_method: FusedMoEMethodBase, kt_config: KTConfig
 ) -> None:
-    if type(gpu_method).__name__ != "ModelOptNvFp4FusedMoEMethod":
+    is_modelopt_nvfp4 = type(gpu_method).__name__ == "ModelOptNvFp4FusedMoEMethod"
+    kt_method = (kt_config.method or "").upper()
+    if kt_method == "NVFP4" and not is_modelopt_nvfp4:
+        raise ValueError(
+            "--kt-method NVFP4 requires a serialized ModelOpt NVFP4 checkpoint."
+        )
+    if not is_modelopt_nvfp4:
         return
+    if kt_method != "NVFP4":
+        raise ValueError(
+            "Serialized ModelOpt NVFP4 expert offload requires --kt-method NVFP4."
+        )
 
     if (kt_config.gpu_prefill_token_threshold or 0) > 0:
         raise ValueError(
@@ -5123,7 +5133,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_swiglu_limit = float(
                 _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
             )
-            # MXFP4/MXFP8 retain their existing clamp behavior.  Block-FP8
+            # MXFP4/NVFP4/MXFP8 retain their existing clamp behavior. Block-FP8
             # carries the parameters only for the exact GLM boundary; this
             # prevents the new low-level FP8 capability from changing legacy
             # models that also select KT method=FP8.

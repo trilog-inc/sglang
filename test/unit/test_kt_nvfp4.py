@@ -184,6 +184,7 @@ def test_kt_nvfp4_rejects_non_static_resident_modes(
 ):
     nvfp4_method = type("ModelOptNvFp4FusedMoEMethod", (), {})()
     config = SimpleNamespace(
+        method="NVFP4",
         gpu_prefill_token_threshold=gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=dynamic_update,
     )
@@ -191,4 +192,27 @@ def test_kt_nvfp4_rejects_non_static_resident_modes(
     with pytest.raises(ValueError, match=option):
         kt_ep_wrapper._validate_kt_nvfp4_static_resident_config(
             nvfp4_method, config
+        )
+
+
+@pytest.mark.parametrize(
+    ("gpu_method_name", "kt_method", "message"),
+    [
+        ("ModelOptNvFp4FusedMoEMethod", "FP8", "requires --kt-method NVFP4"),
+        ("SomeOtherFusedMoEMethod", "NVFP4", "requires a serialized ModelOpt"),
+    ],
+)
+def test_kt_nvfp4_requires_matching_gpu_and_cpu_formats(
+    gpu_method_name, kt_method, message
+):
+    gpu_method = type(gpu_method_name, (), {})()
+    config = SimpleNamespace(
+        method=kt_method,
+        gpu_prefill_token_threshold=0,
+        kt_enable_dynamic_expert_update=False,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        kt_ep_wrapper._validate_kt_nvfp4_static_resident_config(
+            gpu_method, config
         )

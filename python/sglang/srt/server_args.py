@@ -1488,11 +1488,11 @@ class ServerArgs:
 
         if self.kt_weight_path is not None:
             kt_method = (self.kt_method or "").upper()
-            if kt_method != "FP8":
+            if kt_method not in ("FP8", "NVFP4"):
                 raise ValueError(
                     "GLM-5-Next Session AB KT expert offload requires "
-                    "--kt-method FP8 so the block-E4M3 checkpoint layout is "
-                    "preserved and swiglu_limit reaches the "
+                    "--kt-method FP8 or NVFP4 so the checkpoint quantization "
+                    "layout is preserved and swiglu_limit reaches the "
                     f"CPU expert kernel; got {self.kt_method!r}."
                 )
 
