@@ -93,6 +93,15 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 _VERIFY_FUSED_METADATA_COPY = envs.SGLANG_VERIFY_FUSED_METADATA_COPY.get()
 
 
+def _deep_gemm_paged_mqa_context_lens(
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize DeepGEMM paged-MQA context lengths to [batch, next_n]."""
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+    return context_lens.contiguous()
+
+
 @dataclass(frozen=True)
 class NSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -771,7 +780,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1140,7 +1151,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1323,7 +1336,9 @@ class NativeSparseAttnBackend(
                     else metadata.cache_seqlens_int32
                 )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     metadata.paged_mqa_schedule_metadata = new_schedule
