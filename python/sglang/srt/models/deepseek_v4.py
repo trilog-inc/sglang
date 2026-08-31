@@ -2400,8 +2400,16 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Multimodal prefill embeds tokens outside and calls this with
+        # input_ids=None; the hash-MoE routing and the dp gather below still
+        # need the real (padded) ids, which forward_batch always carries.
+        if input_ids is None:
+            input_ids = forward_batch.input_ids
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -2639,7 +2647,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        # input_ids is None for multimodal prefill (tokens are embedded by
+        # the VL wrapper); CP metadata prep needs the length, so skip it then.
+        if self.dsa_enable_prefill_cp and input_ids is not None:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -2791,7 +2801,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        # Suffix-exact match: a substring replace would also rewrite the
+        # vision model's ".gate.bias_vl" into ".gate.e_score_correction_bias_vl".
+        if name.endswith(".gate.bias"):
+            name = name.removesuffix(".gate.bias") + ".gate.e_score_correction_bias"
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
@@ -3225,7 +3238,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
 
-EntryClass = [DeepseekV4ForCausalLM]
+# NOTE: EntryClass registration moved to deepseek_v4_vl.py, whose vision-capable
+# wrapper is also named DeepseekV4ForCausalLM (the HF arch string is identical
+# for text-only and vision checkpoints). Text-only checkpoints delegate to this
+# class unchanged. Do not re-add an EntryClass here — the model registry rejects
+# duplicate class names.
+# EntryClass = [DeepseekV4ForCausalLM]  # see deepseek_v4_vl.py
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

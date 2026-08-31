@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -267,12 +267,28 @@ def prepare_mlp_sync_batch_raw(
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
     )
+    dsv4_needs_visible_window = False
+    if (
+        local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and is_deepseek_v4(model_runner.model_config.hf_config)
+    ):
+        from sglang.srt.layers.attention.dsv4.visible_window import (
+            has_fully_contained_image_span,
+        )
+
+        dsv4_needs_visible_window = has_fully_contained_image_span(
+            local_batch.multimodal_inputs,
+            local_batch.prefix_lens,
+            local_batch.extend_lens,
+        )
     can_run_prefill_cuda_graph = (
         local_batch is None
         or local_batch.forward_mode.is_idle()
         # Breakable Cuda Graph Backend Check.
         or (
             local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and not dsv4_needs_visible_window
             and (
                 prefill_graph_runner is None
                 or prefill_graph_runner.can_replay_locally(

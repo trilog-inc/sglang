@@ -2255,6 +2255,158 @@ def select_experts(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
+def per_token_biased_topk(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    per_token_correction_bias: torch.Tensor,
+    topk_config: TopKConfig,
+    *,
+    layer_id: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+) -> StandardTopKOutput:
+    """select_experts variant whose selection bias varies per token.
+
+    DeepSeek-V4-Vision routes text tokens with ``e_score_correction_bias``
+    but image tokens with ``bias_vl``; the fused kernels accept a 1D bias
+    only, so batches containing image tokens take this eager torch path with
+    the per-token bias folded into ``scores_for_choice``. Selection mirrors
+    :func:`biased_topk_impl` (weights are gathered from the raw scores, so
+    the bias affects selection only) and the tail reuses the exact
+    post-processing of :func:`select_experts`.
+    """
+    assert hidden_states.shape[0] == router_logits.shape[0], "Number of tokens mismatch"
+
+    top_k = topk_config.top_k
+    num_fused_shared_experts = topk_config.num_fused_shared_experts
+    renormalize = topk_config.renormalize
+    scoring_func = topk_config.scoring_func
+    routed_scaling_factor = topk_config.routed_scaling_factor
+    apply_routed_scaling_factor_on_output = (
+        topk_config.apply_routed_scaling_factor_on_output
+    )
+
+    (
+        router_logits,
+        per_token_correction_bias,
+    ) = expert_location_dispatch.transform_select_experts_inputs(
+        router_logits=router_logits,
+        correction_bias=per_token_correction_bias,
+        info=expert_location_dispatch_info,
+    )
+
+    if scoring_func == "sigmoid":
+        scores = router_logits.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(router_logits).sqrt()
+    else:
+        scores = router_logits.softmax(dim=-1)
+
+    num_token = scores.shape[0]
+    num_experts = scores.shape[1]
+
+    # Same effective arguments select_experts hands to biased_topk_*.
+    num_fused_shared_experts_for_gate = (
+        0
+        if has_per_rank_fused_shared_slots(num_fused_shared_experts)
+        else num_fused_shared_experts
+    )
+    topk = (top_k - num_fused_shared_experts) if _use_aiter else top_k
+
+    scores_for_choice = scores.view(num_token, -1) + per_token_correction_bias
+    _, topk_ids = torch.topk(
+        scores_for_choice,
+        k=topk,
+        dim=-1,
+        sorted=(True if num_fused_shared_experts_for_gate > 0 else False),
+    )
+    topk_weights = scores.gather(1, topk_ids)
+
+    if num_fused_shared_experts_for_gate:
+        topk_ids[:, -1] = torch.randint(
+            low=num_experts,
+            high=num_experts + num_fused_shared_experts_for_gate,
+            size=(topk_ids.size(0),),
+            dtype=topk_ids.dtype,
+            device=topk_ids.device,
+        )
+        if routed_scaling_factor is not None:
+            topk_weights[:, -1] = (
+                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+            )
+
+    if renormalize:
+        # fp32 like the reference gate (see biased_topk_impl)
+        topk_weights_sum = (
+            topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
+            if num_fused_shared_experts_for_gate == 0
+            else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
+        )
+        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
+        if apply_routed_scaling_factor_on_output:
+            topk_weights *= routed_scaling_factor
+
+    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        topk_config=topk_config,
+        router_logits=router_logits,
+        layer_id=layer_id,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+    )
+
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=recorder_topk_ids
+    )
+    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+
+def precomputed_topk_postprocess_is_noop(
+    topk_config: TopKConfig,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+) -> bool:
+    """Whether :func:`build_precomputed_topk_output` can stand in for
+    :func:`select_experts`' post-processing.
+
+    A router that produces (weights, ids) itself -- e.g. K3's fused gate+top-k
+    kernel -- skips select_experts entirely, so it must not skip the work
+    select_experts does *after* the top-k: the EPLB logical->physical remap, the
+    padded-region mask, and the shared-expert append.  This returns True only
+    when all of those reduce to no-ops, leaving just the capture hook and the
+    distribution recorder (which the builder below still runs).
+    """
+    return (
+        _is_cuda
+        and topk_config.num_fused_shared_experts == 0
+        and num_token_non_padded is None
+        and expert_location_dispatch_info is None
+        and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
+
+
+def build_precomputed_topk_output(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_config: TopKConfig,
+    layer_id: int,
+) -> StandardTopKOutput:
+    """Wrap a router's own (weights, ids) as a STANDARD top-k output, running the
+    capture hook and the expert-distribution recorder that select_experts would.
+
+    Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
+    """
+    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    # router_logits is only read by the BYPASSED formats and by the
+    # shared-expert append (excluded above); STANDARD consumers take ids/weights.
+    return StandardTopKOutput(topk_weights, topk_ids, None)
+
+
 # NOTE: the AOT sgl_kernel::moe_fused_gate and sgl_kernel::kimi_k2_moe_fused_gate
 # ops (and their torch.compile fake impls) were retired here — both CUDA gate
 # paths now route through the unified Triton router (kernels/ops/moe/moe_fused_gate.py),

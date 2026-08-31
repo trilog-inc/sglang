@@ -57,10 +57,14 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
+from sglang.srt.layers.attention.dsv4.visible_window import (
+    compute_visible_window_overrides,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_platform, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -192,6 +196,12 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     c4_sparse_topk: int
+    # Per-token SWA visible-window overrides (image spans, prefill only).
+    # None on pure-text batches: the kernels then use the causal window.
+    # Already baked into swa_page_indices/swa_topk_lengths; kept for the
+    # sparse-prefill combine path, which re-derives SWA indices per layer.
+    swa_win_starts: Optional[torch.Tensor] = None
+    swa_win_lens: Optional[torch.Tensor] = None
     # SWA KV-store write target (out_cache_loc translated to SWA space), computed
     # once per iteration in make_core_attn_metadata and read by the store path.
     swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -257,6 +267,9 @@ class DSV4AttnMetadata:
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
+                # Prefill-only optional overrides; not part of any graph.
+                "swa_win_starts",
+                "swa_win_lens",
             ],
         )
 
@@ -284,6 +297,10 @@ class DSV4AttnMetadata:
             "c1_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
+            # Image-span batches never replay prefill graphs (forced eager),
+            # so these stay None on every captured/replayed metadata.
+            "swa_win_starts",
+            "swa_win_lens",
         ]
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
@@ -601,6 +618,7 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        self._visible_window_unified_warned = False
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -751,13 +769,16 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
+        padded_num_tokens = out_cache_loc.shape[0]
+        cp_v2_active = forward_batch is not None and is_cp_v2_active(forward_batch)
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens_cpu,
             req_pool_indices=req_pool_indices,
-            padded_num_tokens=out_cache_loc.shape[0],
+            padded_num_tokens=padded_num_tokens,
             seq_lens_tensor=seq_lens,
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
@@ -771,6 +792,12 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
             dspark_block_size=dspark_block_size,
+            swa_window_overrides=self._compute_swa_visible_window_overrides(
+                forward_batch=forward_batch,
+                cp_v2_active=cp_v2_active,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+                padded_num_tokens=padded_num_tokens,
+            ),
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(
@@ -1387,6 +1414,76 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
+        # first layer. DFLASH/DSPARK have no later prefill draft-extend reader;
+        # CP-v2 shards the query layout that this global snapshot assumes.
+        metadata = self.forward_metadata
+        if isinstance(metadata, DSV4Metadata):
+            metadata.prefill_shared_reads_snapshotted = False
+        snapshot_shared_prefill_reads = (
+            envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and self.model_runner.spec_algorithm.is_dflash_family()
+            and not is_cp_v2_active(forward_batch)
+        )
+        if not snapshot_shared_prefill_reads:
+            return
+
+        assert isinstance(metadata, DSV4Metadata)
+        use_sparse_prefill = not get_platform().is_sm120 and (
+            num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+            or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+        )
+        if use_sparse_prefill:
+            metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
+                forward_batch, num_qo_tokens=num_qo_tokens
+            )
+        # Marked for dense prefill too: that path reads only core_attn_metadata,
+        # which init_forward_metadata already snapshotted.
+        metadata.prefill_shared_reads_snapshotted = True
+
+    def _build_sparse_prefill_chunk_cache(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> SparsePrefillChunkCache:
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        assert seq_lens_cpu is not None
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        assert extend_seq_lens_cpu is not None
+        seq_lens_cpu_list = seq_lens_cpu.tolist()
+        total_swa = sum(
+            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+            for seq_len, extend_len in zip(
+                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+            )
+        )
+        # ``swa_window_size`` on the pool is its storage page size, not the
+        # model's SWA window, so pass both explicitly.
+        core_attn_metadata = getattr(self.forward_metadata, "core_attn_metadata", None)
+        swa_win_starts = swa_win_lens = None
+        if (
+            core_attn_metadata is not None
+            and core_attn_metadata.swa_win_starts is not None
+        ):
+            swa_win_starts = core_attn_metadata.swa_win_starts[:num_qo_tokens]
+            swa_win_lens = core_attn_metadata.swa_win_lens[:num_qo_tokens]
+        return SparsePrefillChunkCache.build(
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_to_token=self.req_to_token,
+            full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
+            swa_window_size=SWA_WINDOW,
+            swa_page_size=self.token_to_kv_pool.swa_window_size,
+            num_qo_tokens=num_qo_tokens,
+            max_seq_len=max(seq_lens_cpu_list),
+            total_swa=total_swa,
+            swa_win_starts=swa_win_starts,
+            swa_win_lens=swa_win_lens,
+        )
+
     def _build_forward_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1488,6 +1585,7 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                forward_batch=forward_batch,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -1872,6 +1970,16 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            core_attn_metadata = getattr(
+                self.forward_metadata, "core_attn_metadata", None
+            )
+            swa_win_starts = swa_win_lens = None
+            if (
+                core_attn_metadata is not None
+                and core_attn_metadata.swa_win_starts is not None
+            ):
+                swa_win_starts = core_attn_metadata.swa_win_starts[: q_flat.shape[0]]
+                swa_win_lens = core_attn_metadata.swa_win_lens[: q_flat.shape[0]]
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1884,6 +1992,8 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
+                swa_win_starts=swa_win_starts,
+                swa_win_lens=swa_win_lens,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -2015,6 +2125,61 @@ class DeepseekV4AttnBackend(
         req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
         return seq_lens_casual, req_pool_indices_repeated
 
+    def _compute_swa_visible_window_overrides(
+        self,
+        *,
+        forward_batch: Optional[ForwardBatch],
+        cp_v2_active: bool,
+        use_prefill_cuda_graph: bool,
+        padded_num_tokens: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Per-token SWA visible-window (start, len) overrides for image spans.
+
+        Returns None (causal windows everywhere) unless this extend chunk
+        fully contains at least one image sentinel span. Spans cut by the
+        chunk boundary degrade to the causal window (with a one-time warning
+        from ``compute_visible_window_overrides``).
+        """
+        if (
+            forward_batch is None
+            or cp_v2_active
+            or use_prefill_cuda_graph
+            or not forward_batch.contains_image_inputs()
+            # The gpu_only ForwardBatch path leaves the *_cpu mirrors unset;
+            # without host-side lens we cannot resolve span containment, so
+            # degrade to causal windows.
+            or forward_batch.extend_prefix_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return None
+        # unified_kv keeps SWA KV in a true sliding_window-sized ring, so
+        # positions outside [pos-127, pos] have no storage there; degrade
+        # image spans to the causal window on that (HIP-oriented) layout.
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            if not self._visible_window_unified_warned:
+                logger.warning(
+                    "DSV4 visible-window attention for image spans is not "
+                    "supported with unified_kv (SWA ring holds only "
+                    "sliding_window slots); falling back to causal windows."
+                )
+                self._visible_window_unified_warned = True
+            return None
+        overrides = compute_visible_window_overrides(
+            mm_inputs=forward_batch.mm_inputs,
+            extend_prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens_cpu,
+            swa_window=SWA_WINDOW,
+            padded_num_tokens=padded_num_tokens,
+        )
+        if overrides is None:
+            return None
+        win_starts, win_lens = overrides
+        return self._move_to_device(win_starts), self._move_to_device(win_lens)
+
     def make_core_attn_metadata(
         self,
         req_to_token: torch.Tensor,
@@ -2025,8 +2190,13 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        swa_window_overrides: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
+
+        win_starts = win_lens = None
+        if swa_window_overrides is not None:
+            win_starts, win_lens = swa_window_overrides
 
         prep = BuildPageTablePositions.execute(
             req_to_token=req_to_token,
@@ -2035,6 +2205,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max_seq_len,
             page_size=self.page_size,
             swa_window=SWA_WINDOW,
+            swa_topk_lengths_override=win_lens,
         )
         seq_lens_casual = prep.seq_lens_casual
 
@@ -2063,6 +2234,8 @@ class DeepseekV4AttnBackend(
                 seq_lens_casual=seq_lens_casual,
                 swa_window=SWA_WINDOW,
                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+                win_starts=win_starts,
+                win_lens=win_lens,
             )
             swa_topk_lengths = prep.swa_topk_lengths
 
@@ -2079,6 +2252,9 @@ class DeepseekV4AttnBackend(
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
         )
+        if win_starts is not None:
+            core_attn_metadata.swa_win_starts = win_starts
+            core_attn_metadata.swa_win_lens = win_lens
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()

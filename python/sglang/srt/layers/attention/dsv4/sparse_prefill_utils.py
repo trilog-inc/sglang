@@ -98,6 +98,9 @@ def combine_topk_swa_indices(
     topk: int,
     out_indices: Optional[torch.Tensor] = None,
     out_lens: Optional[torch.Tensor] = None,
+    swa_win_starts: Optional[torch.Tensor] = None,
+    swa_win_lens: Optional[torch.Tensor] = None,
+    swa_win_max_len: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine topk + SWA indices into a single ``flash_mla_sparse_fwd`` row.
 
@@ -118,7 +121,8 @@ def combine_topk_swa_indices(
             value) for SWA-only layers since topk=0 disables this branch.
         swa_base: (num_reqs,) int32. Flat workspace offset where request
             r's SWA region begins.
-        window_size: SWA window size.
+        window_size: SWA window size (the causal window; also the width when
+            no visible-window overrides are given).
         compress_ratio: must be ``>= 1`` even when topk==0.
         topk: configured topk; pass 0 for SWA-only layers.
         out_indices: optional preallocated ``(num_tokens, combined_topk)``
@@ -128,6 +132,14 @@ def combine_topk_swa_indices(
             valid-prefix length must hold across reuses).
         out_lens: optional preallocated ``(num_tokens,)`` int32 buffer; the
             kernel fully overwrites it, so any dtype-correct buffer works.
+        swa_win_starts: optional (num_tokens,) int32 per-query window start
+            (absolute seq position) for the visible window of image spans.
+            Must be paired with ``swa_win_lens``; None keeps the causal
+            window ``[pos - swa_len + 1, pos]``.
+        swa_win_lens: optional (num_tokens,) int32 per-query window length.
+        swa_win_max_len: optional precomputed ``int(swa_win_lens.max())`` to
+            avoid a device sync per call; combined width and the kernel's SWA
+            arange are sized to ``max(window_size, swa_win_max_len)``.
 
     Returns:
         combined_indices: (num_tokens, padded_topk_swa) int32, padded to a
@@ -145,9 +157,19 @@ def combine_topk_swa_indices(
         topk_indices.shape[-1] >= topk
     ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
 
+    has_swa_win = swa_win_lens is not None
+    eff_window = window_size
+    if has_swa_win:
+        assert swa_win_starts is not None
+        assert swa_win_starts.dtype == torch.int32
+        assert swa_win_lens.dtype == torch.int32
+        if swa_win_max_len is None:
+            swa_win_max_len = int(swa_win_lens.max().item())
+        eff_window = max(window_size, swa_win_max_len)
+
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
-    combined_topk = combined_topk_width(topk, window_size)
+    combined_topk = combined_topk_width(topk, eff_window)
     if out_indices is None:
         combined_indices = torch.full(
             (num_tokens, combined_topk),
@@ -180,10 +202,14 @@ def combine_topk_swa_indices(
         gather_lens,
         compressed_base,
         swa_base,
+        swa_win_starts if has_swa_win else combined_lens,
+        swa_win_lens if has_swa_win else combined_lens,
         top_k=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
+        SWA_BLOCK=triton.next_power_of_2(eff_window),
         PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        HAS_SWA_WIN=has_swa_win,
     )
     return combined_indices, combined_lens
 
@@ -195,6 +221,7 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    total_swa: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -238,7 +265,8 @@ def build_swa_token_ids(
     swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
     swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
-    total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
+    if total_swa is None:
+        total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
 
     swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
     if total_swa == 0:
@@ -292,6 +320,15 @@ class SparsePrefillChunkCache:
     swa_gather_lens: torch.Tensor  # (num_reqs,) int32
     swa_offsets: torch.Tensor  # (num_reqs+1,) int32
 
+    # Optional per-query visible-window overrides (DSV4-VL image spans). The
+    # existing union gather [seq_len - extend - (W-1), seq_len) already covers
+    # every visible window, since a visible window [win_start, span_end) of a
+    # fully-contained span satisfies win_start >= span_start - (W-1) >=
+    # seq_len - extend - (W-1) and span_end <= seq_len.
+    swa_win_starts: Optional[torch.Tensor] = None  # (num_qo_tokens,) int32
+    swa_win_lens: Optional[torch.Tensor] = None  # (num_qo_tokens,) int32
+    swa_win_max_len: Optional[int] = None
+
     # c0 pre-computed combine output (entire input set is chunk-invariant).
     c0_combined_indices: torch.Tensor = field(default=None)
     c0_combined_lens: torch.Tensor = field(default=None)
@@ -322,6 +359,9 @@ class SparsePrefillChunkCache:
         swa_page_size: int,
         num_qo_tokens: int,
         max_seq_len: int,
+        total_swa: Optional[int] = None,
+        swa_win_starts: Optional[torch.Tensor] = None,
+        swa_win_lens: Optional[torch.Tensor] = None,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
@@ -337,8 +377,15 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                total_swa=total_swa,
             )
         )
+
+        swa_win_max_len = None
+        if swa_win_lens is not None:
+            assert swa_win_starts is not None
+            # Computed once per chunk; reused by every layer's combine.
+            swa_win_max_len = int(swa_win_lens.max().item())
 
         cache = cls(
             num_reqs=num_reqs,
@@ -352,6 +399,9 @@ class SparsePrefillChunkCache:
             swa_first_pos=swa_first_pos,
             swa_gather_lens=swa_gather_lens,
             swa_offsets=swa_offsets,
+            swa_win_starts=swa_win_starts,
+            swa_win_lens=swa_win_lens,
+            swa_win_max_len=swa_win_max_len,
         )
 
         # Pre-compute the c0 combine output: TOPK=0, compressed_base=0,
@@ -369,6 +419,9 @@ class SparsePrefillChunkCache:
             window_size=swa_window_size,
             compress_ratio=1,
             topk=0,
+            swa_win_starts=swa_win_starts,
+            swa_win_lens=swa_win_lens,
+            swa_win_max_len=swa_win_max_len,
         )
         return cache
 
@@ -423,6 +476,9 @@ class SparsePrefillChunkCache:
             window_size=self.swa_window_size,
             compress_ratio=128,
             topk=c128_max,
+            swa_win_starts=self.swa_win_starts,
+            swa_win_lens=self.swa_win_lens,
+            swa_win_max_len=self.swa_win_max_len,
         )
 
         self.c128_flat_token_ids = flat_c128_ids
@@ -474,6 +530,14 @@ class SparsePrefillChunkCache:
         self.c4_compressed_base = compressed_base
         self.c4_swa_base = swa_base
 
+    @property
+    def eff_swa_window_size(self) -> int:
+        """SWA width the combine output must hold: the causal window, or the
+        max visible-window length when image-span overrides are present."""
+        if self.swa_win_max_len is None:
+            return self.swa_window_size
+        return max(self.swa_window_size, self.swa_win_max_len)
+
     def combine_c4_layer(
         self,
         c4_sparse_raw_indices: torch.Tensor,
@@ -490,7 +554,10 @@ class SparsePrefillChunkCache:
         if self.c4_combined_indices is None:
             device = self.seq_lens.device
             self.c4_combined_indices = torch.full(
-                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
+                (
+                    self.num_qo_tokens,
+                    combined_topk_width(topk, self.eff_swa_window_size),
+                ),
                 -1,
                 dtype=torch.int32,
                 device=device,
@@ -510,4 +577,7 @@ class SparsePrefillChunkCache:
             topk=topk,
             out_indices=self.c4_combined_indices,
             out_lens=self.c4_combined_lens,
+            swa_win_starts=self.swa_win_starts,
+            swa_win_lens=self.swa_win_lens,
+            swa_win_max_len=self.swa_win_max_len,
         )

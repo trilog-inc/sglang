@@ -70,6 +70,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils.common import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -951,27 +952,45 @@ class OpenAIServingChat(OpenAIServingBase):
             # dsv4/dsv32 encoding path
             messages = copy.deepcopy(messages)
 
-            # dsv4/dsv32 are text-only and consume string content; flatten
-            # OpenAI parts-list content here so the encoder sees a plain string.
-            for i, msg in enumerate(messages):
-                if isinstance(msg.get("content"), list):
-                    messages[i] = process_content_for_template_format(
-                        msg, "string", [], [], [], []
-                    )
-
-            for msg in messages:
-                if msg.get("content") is None:
-                    msg["content"] = ""
-                processed_msg = process_content_for_template_format(
-                    msg,
-                    template_content_format,
-                    image_data,
-                    video_data,
-                    audio_data,
-                    modalities,
-                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+            # DeepSeek-V4-Vision: keep image content blocks for the encoder —
+            # it replaces them with <｜deepseek_image｜> placeholders and
+            # returns the image records in prompt order (see below).
+            dsv4_with_images = self.chat_encoding_spec == "dsv4" and any(
+                isinstance(m.get("content"), list)
+                and any(
+                    isinstance(c, dict)
+                    and c.get("type") in ("image", "image_url", "input_image")
+                    for c in m["content"]
                 )
-                msg.update(processed_msg)
+                for m in messages
+            )
+
+            if not dsv4_with_images:
+                # dsv4/dsv32 are text-only and consume string content; flatten
+                # OpenAI parts-list content here so the encoder sees a plain string.
+                for i, msg in enumerate(messages):
+                    if isinstance(msg.get("content"), list):
+                        messages[i] = process_content_for_template_format(
+                            msg, "string", [], [], [], []
+                        )
+
+                for msg in messages:
+                    if msg.get("content") is None:
+                        msg["content"] = ""
+                    processed_msg = process_content_for_template_format(
+                        msg,
+                        template_content_format,
+                        image_data,
+                        video_data,
+                        audio_data,
+                        modalities,
+                        use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+                    )
+                    msg.update(processed_msg)
+            else:
+                for msg in messages:
+                    if msg.get("content") is None:
+                        msg["content"] = ""
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
@@ -995,17 +1014,37 @@ class OpenAIServingChat(OpenAIServingBase):
                     if env_val:
                         effort_source = env_val
                 v4_reasoning_effort = (
-                    effort_source if effort_source in ("max", "high") else None
+                    effort_source
+                    if effort_source in encoding_dsv4.REASONING_EFFORT_PROMPTS
+                    else None
                 )
                 if request.task is not None:
                     encoding_dsv4.attach_task_to_last_user_message(
                         messages, request.task
                     )
-                real_input = encoding_dsv4.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=v4_reasoning_effort,
-                )
+                if dsv4_with_images:
+                    real_input, media_data = encoding_dsv4.encode_messages(
+                        messages,
+                        thinking_mode=thinking_mode,
+                        reasoning_effort=v4_reasoning_effort,
+                        return_multi_modal_data=True,
+                    )
+                    for record in media_data["images"]:
+                        url = record.get("url") or record.get("data")
+                        if url:
+                            image_data.append(ImageData(url=url))
+                else:
+                    real_input = encoding_dsv4.encode_messages(
+                        messages,
+                        thinking_mode=thinking_mode,
+                        reasoning_effort=v4_reasoning_effort,
+                    )
+                if is_multimodal:
+                    # Multimodal dsv4: hand the rendered text (with
+                    # <｜deepseek_image｜> placeholders) to the MM processor,
+                    # which re-tokenizes it — the standard VLM flow expects a
+                    # text prompt, and an empty one is rejected downstream.
+                    prompt = real_input
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
