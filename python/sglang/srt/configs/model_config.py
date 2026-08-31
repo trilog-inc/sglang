@@ -808,7 +808,10 @@ class ModelConfig:
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
             # Identify modelopt quantization
-            if "quant_method" not in quant_cfg:
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
                 parsed_cfg = self._parse_modelopt_quant_config(
                     {"quantization": quant_cfg}
                 )
@@ -917,9 +920,9 @@ class ModelConfig:
         if quant_algo == "MIXED_PRECISION":
             return {"quant_method": "w4afp8"}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
-            return {"quant_method": "modelopt_fp4"}
+            return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
         elif quant_algo and "FP8" in quant_algo:
-            return {"quant_method": "modelopt_fp8"}
+            return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
         else:
             return None
 

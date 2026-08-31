@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.srt import server_args as server_args_module
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -170,6 +171,22 @@ def test_sm120_modelopt_fp4_auto_selects_flashinfer_cutlass(monkeypatch):
     args._handle_moe_kernel_config()
 
     assert args.moe_runner_backend == "flashinfer_cutlass"
+
+
+def test_generic_modelopt_nvfp4_config_auto_selects_fp4():
+    config = object.__new__(ModelConfig)
+    config.hf_config = SimpleNamespace(
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "group_size": 16,
+        }
+    )
+
+    parsed = config._parse_quant_hf_config()
+
+    assert parsed["quant_method"] == "modelopt_fp4"
+    assert parsed["quant_algo"] == "NVFP4"
 
 
 @pytest.mark.parametrize(
