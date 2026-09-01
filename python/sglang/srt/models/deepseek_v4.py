@@ -2442,6 +2442,23 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
+        # Hoist the image-token mask + host flag for bias_vl routing from the
+        # gathered ids, i.e. the exact token rows the MoE gate receives under
+        # dp-attention.
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+        if not torch.cuda.is_current_stream_capturing():
+            image_mask = input_ids_global >= MM_PAD_SHIFT_VALUE
+            if image_mask.any():
+                forward_batch.dsv4_image_mask = image_mask
+                forward_batch.dsv4_has_image_tokens = True
+            else:
+                forward_batch.dsv4_image_mask = None
+                forward_batch.dsv4_has_image_tokens = False
+        else:
+            forward_batch.dsv4_image_mask = None
+            forward_batch.dsv4_has_image_tokens = False
+
         if dsa_use_prefill_cp(forward_batch):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
