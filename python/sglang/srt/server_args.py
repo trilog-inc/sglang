@@ -736,6 +736,7 @@ class ServerArgs:
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
+    kt_expert_frequency_file: Optional[str] = None
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
 
@@ -976,6 +977,7 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
+        self._handle_moe_expert_placement()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
@@ -2977,6 +2979,45 @@ class ServerArgs:
 
         if self.enable_eplb:
             assert self.ep_size > 1
+
+    def _handle_moe_expert_placement(self):
+        """Validate static KT placement without changing SGLang expert ids."""
+        strategy = self.kt_expert_placement_strategy.lower()
+        allowed = ("uniform", "front-loading", "random", "frequency")
+        if strategy not in allowed:
+            raise ValueError(
+                "--kt-expert-placement-strategy must be one of: "
+                + ", ".join(allowed)
+            )
+        self.kt_expert_placement_strategy = strategy
+
+        if self.kt_weight_path is None:
+            if self.kt_expert_frequency_file is not None:
+                raise ValueError(
+                    "--kt-expert-frequency-file requires --kt-weight-path."
+                )
+            return
+
+        if self.enable_eplb or self.init_expert_location != "trivial":
+            raise ValueError(
+                "KT compact GPU/CPU expert placement requires logical expert ids "
+                "and is incompatible with EPLB or a nontrivial "
+                "--init-expert-location. Set --init-expert-location trivial and "
+                "use --kt-expert-frequency-file for frequency placement."
+            )
+
+        if strategy == "frequency":
+            if not self.kt_expert_frequency_file:
+                raise ValueError(
+                    "--kt-expert-placement-strategy frequency requires "
+                    "--kt-expert-frequency-file pointing to an "
+                    "ExpertDistributionRecorder .pt file."
+                )
+        elif self.kt_expert_frequency_file is not None:
+            raise ValueError(
+                "--kt-expert-frequency-file is only used with "
+                "--kt-expert-placement-strategy frequency."
+            )
 
     def _handle_elastic_ep(self):
         if self.elastic_ep_backend is not None:
@@ -5287,10 +5328,18 @@ class ServerArgs:
             default=ServerArgs.kt_expert_placement_strategy,
             choices=["frequency", "front-loading", "uniform", "random"],
             help="[ktransformers parameter] GPU expert placement strategy. "
-                 "frequency: Select top-k by activation frequency (default). "
+                 "frequency: Select top-k from --kt-expert-frequency-file. "
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",
+        )
+        parser.add_argument(
+            "--kt-expert-frequency-file",
+            type=str,
+            default=ServerArgs.kt_expert_frequency_file,
+            help="[ktransformers parameter] ExpertDistributionRecorder .pt file "
+                 "containing logical_count values for frequency-based static "
+                 "GPU placement. This does not enable EPLB or remap expert ids.",
         )
         parser.add_argument(
             "--kt-lora-path",

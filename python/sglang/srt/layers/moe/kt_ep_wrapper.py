@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 try:
-    from kt_kernel import KTMoEWrapper, generate_gpu_experts_masks
+    from kt_kernel import KTMoEWrapper
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
@@ -4322,6 +4322,38 @@ def generate_random_masks(
     return masks
 
 
+def _load_activation_frequency(
+    path: str, num_layers: int, num_experts: int
+) -> torch.Tensor:
+    """Load and validate an ExpertDistributionRecorder frequency profile."""
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(loaded, dict):
+        if "logical_count" not in loaded:
+            raise ValueError(
+                f"KT frequency profile {path!r} does not contain "
+                f"'logical_count'; keys={sorted(loaded)}"
+            )
+        loaded = loaded["logical_count"]
+    if not isinstance(loaded, torch.Tensor):
+        raise ValueError(
+            f"KT frequency data in {path!r} must be a tensor, "
+            f"got {type(loaded).__name__}"
+        )
+    if loaded.dim() == 3:
+        loaded = loaded.sum(dim=0)
+    if tuple(loaded.shape) != (num_layers, num_experts):
+        raise ValueError(
+            f"KT frequency tensor must have shape {(num_layers, num_experts)}, "
+            f"got {tuple(loaded.shape)}"
+        )
+    loaded = loaded.to(dtype=torch.float64, device="cpu")
+    if not torch.isfinite(loaded).all():
+        raise ValueError(f"KT frequency tensor in {path!r} contains non-finite values")
+    if (loaded < 0).any():
+        raise ValueError(f"KT frequency tensor in {path!r} contains negative counts")
+    return loaded
+
+
 def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]:
     """Initialize GPU experts masks from activation frequency data.
 
@@ -4383,10 +4415,15 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         moe_layer_freq = 1
 
     # Count actual MoE layers
-    num_moe_layers = sum(
-        1 for i in range(num_layers)
+    moe_layers = [
+        i
+        for i in range(num_layers)
         if i >= first_k_dense_replace and i % moe_layer_freq == 0
-    )
+    ]
+    num_moe_layers = len(moe_layers)
+    if num_moe_layers == 0:
+        logger.warning("No MoE layers found while creating KT GPU expert masks.")
+        return None
     total_experts = num_moe_layers * num_experts
     logger.debug(
         "[kt-mask] num_layers=%d num_experts=%d first_k_dense_replace=%s (type=%s) "
@@ -4404,6 +4441,8 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Determine num_gpu_experts (total across all layers)
     if server_args.kt_gpu_experts_ratio is not None:
         # Use ratio to calculate total GPU experts
+        if not 0.0 <= server_args.kt_gpu_experts_ratio <= 1.0:
+            raise ValueError("--kt-gpu-experts-ratio must be in [0, 1]")
         num_gpu_experts = int(total_experts * server_args.kt_gpu_experts_ratio)
         if server_args.kt_num_gpu_experts is not None:
             logger.warning(
@@ -4430,69 +4469,58 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         logger.warning("Either kt_num_gpu_experts or kt_gpu_experts_ratio is required but not set.")
         return None
 
+    if not 0 <= num_gpu_experts <= total_experts:
+        raise ValueError(
+            f"KT GPU expert count must be in [0, {total_experts}], "
+            f"got {num_gpu_experts}"
+        )
+
     # Get GPU expert placement strategy
     strategy = server_args.kt_expert_placement_strategy
 
     # Generate masks based on strategy
     tp_rank = get_tensor_model_parallel_rank()
+    activation_freq = None
 
     if strategy == "frequency":
-        # Load activation frequency from init_expert_location if it's a .pt file
-        init_loc = server_args.init_expert_location
-        has_activation_freq = init_loc and init_loc.endswith(".pt")
-
-        if has_activation_freq:
-            logger.info("Loading activation frequency from %s", init_loc)
-            loaded_data = torch.load(init_loc, map_location="cpu", weights_only=True)
-            # Handle both dict format (from ExpertDistributionRecorder) and raw tensor
-            if isinstance(loaded_data, dict):
-                if "logical_count" in loaded_data:
-                    activation_counts = loaded_data["logical_count"]
-                else:
-                    raise ValueError(
-                        f"Loaded dict does not contain 'logical_count' key. "
-                        f"Available keys: {list(loaded_data.keys())}"
-                    )
-            else:
-                activation_counts = loaded_data
-            # Expected shape: [buffer_size, num_layers, num_experts]
-            if activation_counts.dim() != 3:
-                raise ValueError(
-                    f"Expected activation counts tensor with 3 dims [buffer_size, num_layers, num_experts], "
-                    f"got {activation_counts.dim()} dims with shape {activation_counts.shape}"
-                )
-            _, file_num_layers, file_num_experts = activation_counts.shape
-            if file_num_layers != num_layers:
-                raise ValueError(
-                    f"Activation counts num_layers ({file_num_layers}) doesn't match "
-                    f"model num_layers ({num_layers})"
-                )
-            if file_num_experts != num_experts:
-                raise ValueError(
-                    f"Activation counts num_experts ({file_num_experts}) doesn't match "
-                    f"model num_experts ({num_experts})"
-                )
-            # Sum across buffer_size (dim0) to get total activation counts per expert
-            activation_freq = activation_counts.sum(dim=0).float()  # [num_layers, num_experts]
-            logger.info("Using frequency-based strategy with activation frequency data")
-        else:
-            # No activation frequency file, use zeros (uniform distribution)
-            logger.warning(
-                "Using frequency-based strategy WITHOUT activation frequency data "
-                "(uniform distribution fallback)"
+        freq_path = server_args.kt_expert_frequency_file
+        if not freq_path:
+            raise ValueError(
+                "--kt-expert-placement-strategy frequency requires "
+                "--kt-expert-frequency-file pointing to an "
+                "ExpertDistributionRecorder .pt file."
             )
-            activation_freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
-            # For layers that are actually MoE layers, set uniform distribution
-            for layer_idx in range(num_layers):
-                if layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0:
-                    activation_freq[layer_idx, :] = 1.0
+        logger.info("Loading KT activation frequency from %s", freq_path)
+        activation_freq = _load_activation_frequency(
+            str(freq_path), num_layers=num_layers, num_experts=num_experts
+        )
+        empty_layers = [
+            layer_idx
+            for layer_idx in moe_layers
+            if float(activation_freq[layer_idx].sum()) <= 0
+        ]
+        if empty_layers:
+            raise ValueError(
+                "KT frequency profile has no recorded routes for MoE layers "
+                f"{empty_layers}. Recapture a complete target-model profile."
+            )
 
         # Generate masks on rank 0
         if tp_rank == 0:
-            masks = generate_gpu_experts_masks(activation_freq, num_gpu_experts)
-            # For non-MoE layers, set all experts to GPU
+            masks = torch.zeros(
+                num_layers, num_experts, dtype=torch.bool, device="cpu"
+            )
+            base_per_layer, remainder = divmod(num_gpu_experts, num_moe_layers)
+            for offset, layer_idx in enumerate(moe_layers):
+                target = base_per_layer + (offset < remainder)
+                if target:
+                    # Stable ties favor lower logical ids deterministically.
+                    expert_ids = torch.argsort(
+                        activation_freq[layer_idx], descending=True, stable=True
+                    )[:target]
+                    masks[layer_idx, expert_ids] = True
             for layer_idx in range(num_layers):
-                if layer_idx < first_k_dense_replace or layer_idx % moe_layer_freq != 0:
+                if layer_idx not in moe_layers:
                     masks[layer_idx, :] = True
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
@@ -4566,6 +4594,19 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             "total GPU experts in MoE layers = %d",
             strategy, num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
         )
+        if strategy == "frequency":
+            moe_scores = activation_freq[moe_layers]
+            moe_masks = masks[moe_layers]
+            routed = moe_scores.sum()
+            selected_routes = moe_scores[moe_masks].sum()
+            logger.info(
+                "KT frequency profile: file=%s selected_routes=%.0f/%.0f "
+                "coverage=%.2f%%",
+                server_args.kt_expert_frequency_file,
+                float(selected_routes),
+                float(routed),
+                100.0 * float(selected_routes / routed),
+            )
 
     return _KT_GPU_EXPERTS_MASKS
 
@@ -4590,6 +4631,13 @@ def create_kt_config_from_server_args(
 
     if server_args.kt_weight_path is None:
         return None
+
+    if server_args.init_expert_location != "trivial":
+        raise ValueError(
+            "KT compact GPU expert weights require --init-expert-location trivial. "
+            "Use --kt-expert-frequency-file to load recorder counts without "
+            "remapping logical expert ids."
+        )
 
     # Get GPU experts masks (initializes if needed)
     masks = _init_kt_gpu_experts_masks(server_args)
