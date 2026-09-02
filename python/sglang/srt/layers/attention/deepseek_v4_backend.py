@@ -64,7 +64,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_platform, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
@@ -1433,7 +1433,7 @@ class DeepseekV4AttnBackend(
             return
 
         assert isinstance(metadata, DSV4Metadata)
-        use_sparse_prefill = not get_platform().is_sm120 and (
+        use_sparse_prefill = not self._is_sm120 and (
             num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
             or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
         )
