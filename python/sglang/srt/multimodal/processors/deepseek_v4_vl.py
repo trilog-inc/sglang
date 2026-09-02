@@ -249,7 +249,12 @@ class DeepseekV4VLImageProcessor(BaseMultimodalProcessor):
         mm_items: List[MultimodalDataItem] = []
         for i, part in enumerate(text_parts):
             if part:
-                input_ids.extend(self._tokenizer.encode(part))
+                # The DSV4 encoder writes its BOS token into the rendered
+                # prompt. Tokenizing each placeholder-delimited segment with
+                # tokenizer-added specials would inject extra BOS/EOS tokens.
+                input_ids.extend(
+                    self._tokenizer.encode(part, add_special_tokens=False)
+                )
             if i >= len(images):
                 continue
             patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = self._load_image(images[i])

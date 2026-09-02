@@ -745,13 +745,17 @@ def parse_tagged_text(text: str) -> Union[str, List[Dict[str, Any]]]:
 
 def _is_image_block(block: Dict[str, Any]) -> bool:
     """Return whether a content block is an OpenAI/Anthropic/internal image."""
-    return isinstance(block, dict) and block.get("type") in ("image", "image_url")
+    return isinstance(block, dict) and block.get("type") in (
+        "image",
+        "image_url",
+        "input_image",
+    )
 
 
 def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a supported image block into an internal image record."""
     record: Dict[str, Any] = {"type": "image"}
-    if block.get("type") == "image_url":
+    if block.get("type") in ("image_url", "input_image"):
         image_url = block.get("image_url")
         if isinstance(image_url, str):
             record["url"] = image_url

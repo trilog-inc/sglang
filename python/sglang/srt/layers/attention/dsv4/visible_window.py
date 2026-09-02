@@ -93,8 +93,10 @@ def _iter_visible_window_spans(
             for span_start, span_end_incl in item.offsets:
                 if span_start >= prefix and span_end_incl < extend_end:
                     yield req_idx, int(span_start), int(span_end_incl) + 1
-                elif span_start < prefix <= span_end_incl and span_start >= prefix - (
-                    swa_window - 1
+                elif (
+                    span_start < prefix <= span_end_incl
+                    and span_end_incl < extend_end
+                    and span_start >= prefix - (swa_window - 1)
                 ):
                     yield req_idx, int(span_start), int(span_end_incl) + 1
                 elif span_start < extend_end and span_end_incl >= prefix:

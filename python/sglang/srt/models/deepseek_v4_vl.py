@@ -14,16 +14,14 @@ each image placeholder expands into a sentinel block of learned vectors
 (image_start / image_pad / image_newline / image_end) with ViT+aligner
 embeddings scattered into the IMAGE slots in N-layout order (via `perm`).
 
-MoE gate ``bias_vl`` routing (phase 2, done): ``*.gate.bias_vl`` weights
+MoE gate ``bias_vl`` routing: ``*.gate.bias_vl`` weights
 flow through the text model's load_weights onto ``MoEGate.bias_vl``. Hash
 layers select image tokens by ``(scores + bias_vl).topk`` instead of the
 tid2eid table; non-hash layers fall back to an eager per-token-bias top-k
 whenever a batch contains image tokens (see DeepseekV2MoE._forward_topk).
 
-NOT YET IMPLEMENTED (phase 2, required for correct outputs):
-- bidirectional / visible-window attention inside image spans during prefill
-  (reference: get_image_visible + get_window_topk_idxs_visible); needs
-  image-span-aware topk construction in layers/attention/deepseek_v4_backend.py.
+Image spans use the model's bidirectional visible-window attention during
+prefill (see layers/attention/dsv4/visible_window.py).
 """
 
 import logging
@@ -169,20 +167,24 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        llm_weights = []
         loaded_vision_names = set()
-        for name, loaded_weight in weights:
-            if name.startswith(("vision.", "aligner.")):
-                param = params_dict[name]
-                default_weight_loader(param, loaded_weight)
-                loaded_vision_names.add(name)
-            elif name in self._SENTINEL_NAMES:
-                param = params_dict[name]
-                default_weight_loader(param, loaded_weight)
-                loaded_vision_names.add(name)
-            else:
-                llm_weights.append((name, loaded_weight))
-        self.language_model.load_weights(llm_weights)
+
+        def iter_llm_weights():
+            # Keep checkpoint loading streaming. Materializing the language
+            # model tensors here can retain the entire checkpoint in host RAM.
+            for name, loaded_weight in weights:
+                if name.startswith(("vision.", "aligner.")):
+                    param = params_dict[name]
+                    default_weight_loader(param, loaded_weight)
+                    loaded_vision_names.add(name)
+                elif name in self._SENTINEL_NAMES:
+                    param = params_dict[name]
+                    default_weight_loader(param, loaded_weight)
+                    loaded_vision_names.add(name)
+                else:
+                    yield name, loaded_weight
+
+        self.language_model.load_weights(iter_llm_weights())
         if self.is_multimodal:
             # The vision params are created with torch.empty; a checkpoint
             # missing them would silently serve garbage, so audit loudly.
@@ -222,9 +224,10 @@ class DeepseekV4ForCausalLM(nn.Module):
     # __getattr__, so these must exist on the wrapper class itself.
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
-        return _DeepseekV4TextLM.shared_experts_fusion_disable_reason(
-            hf_config, quant_config
+        method = getattr(
+            _DeepseekV4TextLM, "shared_experts_fusion_disable_reason", None
         )
+        return method(hf_config, quant_config) if method is not None else None
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
