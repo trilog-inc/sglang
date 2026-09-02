@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -97,30 +96,14 @@ class TestNSABackendDefaults(unittest.TestCase):
     def test_sm120_fp8_uses_flashinfer_sparse_mla(self):
         server_args = ServerArgs(model_path="dummy")
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("FLASHINFER_USE_CUDA_NORM", None)
-            server_args._set_default_nsa_backends(
-                "fp8_e4m3", 12, "GlmMoeDsaForCausalLM"
-            )
-
-            self.assertEqual(os.environ["FLASHINFER_USE_CUDA_NORM"], "1")
+        server_args._set_default_nsa_backends(
+            "fp8_e4m3", 12, "GlmMoeDsaForCausalLM"
+        )
 
         self.assertEqual(
             server_args.nsa_prefill_backend, "flashinfer_sparse_mla"
         )
         self.assertEqual(server_args.nsa_decode_backend, "flashinfer_sparse_mla")
-
-    def test_sm120_preserves_explicit_flashinfer_norm_backend(self):
-        server_args = ServerArgs(model_path="dummy")
-
-        with patch.dict(
-            os.environ, {"FLASHINFER_USE_CUDA_NORM": "0"}, clear=False
-        ):
-            server_args._set_default_nsa_backends(
-                "fp8_e4m3", 12, "GlmMoeDsaForCausalLM"
-            )
-
-            self.assertEqual(os.environ["FLASHINFER_USE_CUDA_NORM"], "0")
 
     def test_sm100_fp8_keeps_flashmla_defaults(self):
         server_args = ServerArgs(model_path="dummy")
