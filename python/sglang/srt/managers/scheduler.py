@@ -4417,7 +4417,11 @@ class Scheduler(
                     # finish reason attached so the client gets a structured
                     # 400 (BadRequestError) instead of a bare abort.
                     self.ipc_channels.send_to_tokenizer.send_output(
-                        _make_abort_req(req, req.to_finish.to_json()), req
+                        AbortReq(
+                            rid=req.rid,
+                            finished_reason=req.to_finish.to_json(),
+                        ),
+                        req,
                     )
                     continue
                 if req.output_ids:
