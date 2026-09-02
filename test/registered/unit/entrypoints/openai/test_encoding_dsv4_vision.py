@@ -32,6 +32,29 @@ encoding_dsv4 = _load_encoding_module()
 
 
 class TestDsv4VisionEncoding(unittest.TestCase):
+    def test_tool_arguments_accept_json_string_or_normalized_dict(self):
+        arguments = {"query": "weather", "limit": 3, "units": ["C", "F"]}
+
+        from_json = encoding_dsv4.encode_arguments_to_dsml(
+            {"arguments": '{"query":"weather","limit":3,"units":["C","F"]}'}
+        )
+        from_dict = encoding_dsv4.encode_arguments_to_dsml(
+            {"arguments": arguments}
+        )
+
+        self.assertEqual(from_json, from_dict)
+        self.assertIn('name="query" string="true">weather<', from_dict)
+        self.assertIn('name="limit" string="false">3<', from_dict)
+        self.assertIn('name="units" string="false">["C", "F"]<', from_dict)
+
+    def test_tool_arguments_reject_invalid_json(self):
+        with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+            encoding_dsv4.encode_arguments_to_dsml({"arguments": "{bad json"})
+
+    def test_tool_arguments_require_an_object(self):
+        with self.assertRaisesRegex(ValueError, "JSON object/dict"):
+            encoding_dsv4.encode_arguments_to_dsml({"arguments": "[1, 2, 3]"})
+
     def test_text_only_api_still_returns_a_string(self):
         prompt = encoding_dsv4.encode_messages(
             [{"role": "user", "content": "hello"}], thinking_mode="chat"
