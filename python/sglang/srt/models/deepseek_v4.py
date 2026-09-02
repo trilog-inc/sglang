@@ -2287,7 +2287,8 @@ class DeepseekV4Model(nn.Module):
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
         TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
+        non-CP and non-multimodal paths, which are the only cases the DSV4 op
+        strategy implements without losing required metadata.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
@@ -2300,6 +2301,10 @@ class DeepseekV4Model(nn.Module):
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
             and not dsa_use_prefill_cp(forward_batch)
+            # TBO child batches drop mm metadata (the split sets mm_inputs=None),
+            # which would silently degrade image-span visible-window attention
+            # to causal. Fall back to the normal path for mm batches.
+            and not forward_batch.contains_mm_inputs()
             and self.pp_group.world_size == 1
         )
 
