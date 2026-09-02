@@ -54,7 +54,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "quack-kernels==0.2.4",
+  "quack-kernels==0.5.0",
   "requests",
   "scipy",
   "sentencepiece",
