@@ -1626,6 +1626,19 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
+        if major == 12 and model_arch in (
+            "GlmMoeDsaForCausalLM",
+            "GlmMoeDsaForCausalLMNextN",
+        ):
+            # FlashInfer's CuTe DSL architecture probe can accept SM120 even
+            # when its compiler cannot lower LayerNorm to sm_120a.
+            if "FLASHINFER_USE_CUDA_NORM" not in os.environ:
+                os.environ["FLASHINFER_USE_CUDA_NORM"] = "1"
+                logger.warning(
+                    "Using FlashInfer CUDA norm kernels for GLM DSA on SM120; "
+                    "the CuTe DSL norm compiler may reject sm_120a."
+                )
+
         if kv_cache_dtype == "fp8_e4m3":
             if major == 12 and model_arch in (
                 "GlmMoeDsaForCausalLM",
