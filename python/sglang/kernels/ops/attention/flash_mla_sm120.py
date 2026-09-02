@@ -208,6 +208,23 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+_triton_dual_prefill_fallback_logged = False
+
+
+def _flashinfer_supports_dsv4_dual_prefill(
+    *, num_heads: int, main_topk: int, extra_page_block_size: int
+) -> bool:
+    """Return whether FlashInfer instantiates this DSV4 dual-prefill shape.
+
+    FlashInfer's single-cache SM120 prefill supports wider main selections,
+    but its dual-cache dispatcher fixes the main cache at top-k 128. The
+    secondary cache may use the C4 (64-token) or C128 (2-token) page layout.
+    """
+    return (
+        num_heads in (8, 16, 32, 64, 128)
+        and main_topk == 128
+        and extra_page_block_size in (2, 64)
+    )
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
@@ -499,9 +516,61 @@ def _flash_mla_flashinfer(
         else extra_indices
     )
 
+    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    extra_pbs = (
+        extra_k_cache.shape[1]
+        if extra_k_cache is not None and extra_k_cache.ndim >= 3
+        else 0
+    )
+
+    # FlashInfer's DSV4 dual-cache prefill kernel accepts main top-k 128 only.
+    # Vision widens the SWA selection (typically to 448, bucketed to 512), so
+    # padding alone cannot make the complete 512+512 tuple dispatchable. Use
+    # the existing Triton implementation for unsupported prefill shapes; it
+    # handles both cache page layouts and performs the LSE merge + sink once.
+    if (
+        B > _FI_DECODE_MAX_TOKENS
+        and extra_k_cache is not None
+        and extra_idx is not None
+        and not _flashinfer_supports_dsv4_dual_prefill(
+            num_heads=H,
+            main_topk=idx.shape[-1],
+            extra_page_block_size=extra_pbs,
+        )
+    ):
+        global _triton_dual_prefill_fallback_logged
+        if not _triton_dual_prefill_fallback_logged:
+            logger.info(
+                "SM120 sparse-MLA prefill: unsupported FlashInfer dual-cache "
+                "shape H=%d topk=%d extra_topk=%d pbs=%d extra_pbs=%d; "
+                "using Triton fallback.",
+                H,
+                idx.shape[-1],
+                extra_idx.shape[-1],
+                src_pbs,
+                extra_pbs,
+            )
+            _triton_dual_prefill_fallback_logged = True
+
+        from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
+            flash_mla_sparse_decode_triton,
+        )
+
+        return flash_mla_sparse_decode_triton(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
-    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     kv_64 = (
         _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
         if src_pbs != _PBS_DST

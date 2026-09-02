@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _ROPE_DIM,
     _SCALE_STRIDE,
     _TILE_SIZE,
+    _flashinfer_supports_dsv4_dual_prefill,
     _gather_and_dequant,
     _sm120_sparse_decode_fwd,
     flash_mla_with_kvcache_sm120,
@@ -682,6 +683,86 @@ class TestEntryPointDispatch(CustomTestCase):
             out_triton.to(torch.float32),
             atol=5e-2,
             rtol=5e-2,
+        )
+
+    def test_flashinfer_wide_dual_cache_prefill_falls_back_to_triton(self):
+        """Vision's unsupported 512+512 prefill uses the Triton fallback."""
+        try:
+            from flashinfer.mla._sparse_mla_sm120 import (  # noqa: F401
+                _sparse_mla_sm120_paged_attention,
+            )
+        except (AttributeError, ImportError, ModuleNotFoundError):
+            self.skipTest("FlashInfer SM120 sparse MLA not available")
+
+        # More than 64 query tokens selects FlashInfer's prefill dispatcher.
+        batch_size, num_heads, topk = 65, 64, 512
+        num_pages, page_size = 8, 64
+        k_cache = _build_stable_kvcache(
+            num_pages, page_size, device=self.device, seed=17
+        )
+        extra_k_cache = _build_stable_kvcache(
+            num_pages, page_size, device=self.device, seed=19
+        )
+        q, indices = _build_q_indices(
+            batch_size,
+            num_heads,
+            topk,
+            num_pages,
+            page_size,
+            device=self.device,
+            seed=23,
+        )
+        extra_indices = torch.flip(indices, dims=(-1,)).contiguous()
+        topk_length = torch.full(
+            (batch_size,), topk, dtype=torch.int32, device=self.device
+        )
+        attn_sink = torch.full(
+            (num_heads,), -4.0, dtype=torch.float32, device=self.device
+        )
+        kwargs = dict(
+            q=q,
+            k_cache=k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            head_dim_v=_D,
+            softmax_scale=_D**-0.5,
+            extra_k_cache=extra_k_cache,
+            extra_indices_in_kvcache=extra_indices,
+            extra_topk_length=topk_length,
+        )
+
+        with mock.patch.object(fmod, "_sm120_default_backend", "triton"):
+            out_triton, _ = flash_mla_with_kvcache_sm120(**kwargs)
+        with mock.patch.object(fmod, "_sm120_default_backend", "flashinfer"):
+            out_fi, _ = flash_mla_with_kvcache_sm120(**kwargs)
+
+        torch.testing.assert_close(
+            out_fi.to(torch.float32),
+            out_triton.to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+
+class TestFlashInferDualPrefillCapability(unittest.TestCase):
+    def test_native_dual_prefill_envelope(self):
+        self.assertTrue(
+            _flashinfer_supports_dsv4_dual_prefill(
+                num_heads=64, main_topk=128, extra_page_block_size=64
+            )
+        )
+        self.assertTrue(
+            _flashinfer_supports_dsv4_dual_prefill(
+                num_heads=64, main_topk=128, extra_page_block_size=2
+            )
+        )
+
+    def test_vision_wide_main_cache_requires_fallback(self):
+        self.assertFalse(
+            _flashinfer_supports_dsv4_dual_prefill(
+                num_heads=64, main_topk=512, extra_page_block_size=64
+            )
         )
 
 
