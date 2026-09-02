@@ -55,11 +55,12 @@ class TestDsv4VisibleWindow(unittest.TestCase):
         self.assertIsNotNone(result)
         starts, lengths = result
         self.assertEqual(len(starts), 17)
-        # Absolute position 10 is the first image token. Its visible window
-        # reaches three tokens before the span and through the span end.
-        self.assertEqual((starts[2], lengths[2]), (7, 13))
+        # The item offset starts at a compress-pad token. Position 10 keeps
+        # its plain causal window; IMAGE_START is position 11 for this span.
+        self.assertEqual((starts[2], lengths[2]), (7, 4))
+        self.assertEqual((starts[3], lengths[3]), (8, 12))
         # The final image token retains the complete image span.
-        self.assertEqual((starts[11], lengths[11]), (10, 10))
+        self.assertEqual((starts[11], lengths[11]), (11, 9))
         self.assertEqual((starts[-2:], lengths[-2:]), ([0, 0], [1, 1]))
 
     def test_shallow_radix_hit_keeps_span_visible(self):
@@ -74,7 +75,7 @@ class TestDsv4VisibleWindow(unittest.TestCase):
         self.assertIsNotNone(result)
         starts, lengths = result
         self.assertEqual((starts[0], lengths[0]), (10, 10))
-        self.assertEqual((starts[-1], lengths[-1]), (10, 10))
+        self.assertEqual((starts[-1], lengths[-1]), (11, 9))
 
     def test_shallow_radix_hit_with_truncated_tail_degrades_safely(self):
         result = visible_window.compute_visible_window_overrides(
@@ -99,7 +100,7 @@ class TestDsv4VisibleWindow(unittest.TestCase):
         )
         self.assertFalse(
             visible_window.has_visible_window_span(
-                [mm_input], prefix_lens=[14], extend_lens=[6], swa_window=4
+                [mm_input], prefix_lens=[15], extend_lens=[5], swa_window=4
             )
         )
 
