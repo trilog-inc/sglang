@@ -44,6 +44,20 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+
+def _ensure_deepseek_sparse_attention_layer_type_compat() -> None:
+    """Allow the layer type emitted by Transformers' own DSA configs."""
+    import transformers.configuration_utils as hf_configuration_utils
+
+    layer_type = "deepseek_sparse_attention"
+    if layer_type not in hf_configuration_utils.ALLOWED_LAYER_TYPES:
+        hf_configuration_utils.ALLOWED_LAYER_TYPES += (layer_type,)
+
+
+# Some Transformers releases validate model configs as their modules import.
+# Register the DSA layer name before importing SGLang's config registry.
+_ensure_deepseek_sparse_attention_layer_type_compat()
+
 from sglang.srt.configs import (
     AfmoeConfig,
     BailingHybridConfig,
@@ -367,15 +381,6 @@ def _ensure_llama_flash_attention2_compat() -> None:
     if not hasattr(modeling_llama, "LlamaFlashAttention2"):
         if hasattr(modeling_llama, "LlamaAttention"):
             modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
-
-
-def _ensure_deepseek_sparse_attention_layer_type_compat() -> None:
-    """Allow the layer type emitted by Transformers' own DSA configs."""
-    import transformers.configuration_utils as hf_configuration_utils
-
-    layer_type = "deepseek_sparse_attention"
-    if layer_type not in hf_configuration_utils.ALLOWED_LAYER_TYPES:
-        hf_configuration_utils.ALLOWED_LAYER_TYPES += (layer_type,)
 
 
 @lru_cache_frozenset(maxsize=32)
