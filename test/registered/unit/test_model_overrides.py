@@ -873,6 +873,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch.object(overrides_module, "is_sm120_supported", return_value=False):
             self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 
+    def test_deepseek_v4_mxfp4_disables_shared_expert_fusion(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _moe_runner_fusion_disable,
+        )
+
+        def _view(arch):
+            hf_config = SimpleNamespace(architectures=[arch])
+            return ResolvedView(
+                SimpleNamespace(
+                    moe_runner_backend="flashinfer_mxfp4",
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf_config),
+                )
+            )
+
+        self.assertEqual(
+            _moe_runner_fusion_disable(_view("DeepseekV4ForCausalLM")),
+            {"disable_shared_experts_fusion": True},
+        )
+        self.assertEqual(
+            _moe_runner_fusion_disable(_view("LlamaForCausalLM")),
+            {},
+        )
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 
