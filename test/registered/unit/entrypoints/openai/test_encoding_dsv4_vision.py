@@ -95,7 +95,21 @@ class TestDsv4VisionEncoding(unittest.TestCase):
             ],
         )
 
-    def test_literal_placeholder_is_rejected(self):
+    def test_text_only_history_may_contain_a_literal_placeholder(self):
+        prompt = encoding_dsv4.encode_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": f"prior {encoding_dsv4.IMAGE_PLACEHOLDER}",
+                },
+                {"role": "user", "content": "continue without an image"},
+            ],
+            thinking_mode="chat",
+        )
+
+        self.assertIn(encoding_dsv4.IMAGE_PLACEHOLDER, prompt)
+
+    def test_multimodal_literal_placeholder_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "image special token"):
             encoding_dsv4.encode_messages(
                 [
@@ -105,6 +119,7 @@ class TestDsv4VisionEncoding(unittest.TestCase):
                     }
                 ],
                 thinking_mode="chat",
+                return_multi_modal_data=True,
             )
 
 

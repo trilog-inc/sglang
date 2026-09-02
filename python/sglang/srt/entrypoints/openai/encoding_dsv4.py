@@ -878,6 +878,21 @@ def encode_messages(
     Text-only calls preserve the original string-returning API. When
     return_multi_modal_data is true, the result is ``(prompt, media_data)``.
     """
+    if not return_multi_modal_data:
+        # Preserve the legacy text-only path exactly. In particular, do not
+        # apply multimodal placeholder validation to conversation history: a
+        # frontend may retain a model-emitted image token even when this
+        # request carries no image media. The strict placeholder/media checks
+        # below remain active for actual multimodal requests.
+        return _encode_messages_text(
+            messages,
+            thinking_mode=thinking_mode,
+            context=context,
+            drop_thinking=drop_thinking,
+            add_default_bos_token=add_default_bos_token,
+            reasoning_effort=reasoning_effort,
+        )
+
     context = context or []
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
@@ -889,9 +904,7 @@ def encode_messages(
         add_default_bos_token=add_default_bos_token,
         reasoning_effort=reasoning_effort,
     )
-    if return_multi_modal_data:
-        return prompt, {"images": images}
-    return prompt
+    return prompt, {"images": images}
 
 
 def load_cases(input_file: str) -> List[Dict[str, Any]]:
