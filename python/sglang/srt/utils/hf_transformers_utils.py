@@ -369,6 +369,15 @@ def _ensure_llama_flash_attention2_compat() -> None:
             modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
 
 
+def _ensure_deepseek_sparse_attention_layer_type_compat() -> None:
+    """Allow the layer type emitted by Transformers' own DSA configs."""
+    import transformers.configuration_utils as hf_configuration_utils
+
+    layer_type = "deepseek_sparse_attention"
+    if layer_type not in hf_configuration_utils.ALLOWED_LAYER_TYPES:
+        hf_configuration_utils.ALLOWED_LAYER_TYPES += (layer_type,)
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -424,6 +433,17 @@ def get_config(
                     model,
                     model_type="deepseek_v32",
                     architecture="DeepseekV3ForCausalLM",
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            elif (
+                "layer_types" in str(e)
+                and "deepseek_sparse_attention" in str(e)
+            ):
+                _ensure_deepseek_sparse_attention_layer_type_compat()
+                config = AutoConfig.from_pretrained(
+                    model,
                     trust_remote_code=trust_remote_code,
                     revision=revision,
                     **kwargs,
