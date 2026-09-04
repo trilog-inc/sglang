@@ -4648,10 +4648,10 @@ def mask_and_remap_expert_ids(
     Returns:
         Remapped topk_ids tensor with GPU indices for GPU experts, -1 for CPU experts
     """
-    is_gpu_expert = gpu_experts_mask[topk_ids]
-    # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
-    remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
-    return remapped_ids
+    # logical_to_gpu_index already contains -1 for every CPU expert, so it is
+    # both the mask and the compact resident-index lookup.  A single gather
+    # avoids reading topk_ids and two lookup tables in every MoE layer.
+    return logical_to_gpu_index[topk_ids]
 
 
 def select_top_experts_from_batch(
