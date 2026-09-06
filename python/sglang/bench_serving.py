@@ -99,6 +99,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    reasoning_text: str = ""
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -410,9 +411,9 @@ async def async_request_openai_chat_completions(
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
-                        output.generated_text = response_json["choices"][0]["message"][
-                            "content"
-                        ]
+                        message = response_json["choices"][0]["message"]
+                        output.generated_text = message.get("content") or ""
+                        output.reasoning_text = message.get("reasoning_content") or ""
                         output.success = True
                         output.latency = time.perf_counter() - st
                         output.ttft = (
@@ -435,11 +436,15 @@ async def async_request_openai_chat_completions(
                             else:
                                 data = json.loads(chunk)
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices") or []
+                                delta = (choices[0].get("delta") or {}) if choices else {}
+                                content = delta.get("content") or ""
+                                reasoning = delta.get("reasoning_content") or ""
+                                # Both channels consume completion tokens. Start timing
+                                # at the first reasoning or answer text in the stream.
+                                text = reasoning + content
 
-                                if content:
+                                if text:
                                     timestamp = time.perf_counter()
                                     # First token
                                     if ttft == 0.0:
@@ -448,13 +453,14 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
-                                        output.text_chunks.append(content)
+                                        output.text_chunks.append(text)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
 
                                     most_recent_timestamp = timestamp
                                     generated_text += content
+                                    output.reasoning_text += reasoning
 
                                 # Check for usage info in final chunk
                                 output_len = (data.get("usage") or {}).get(
@@ -894,6 +900,10 @@ def calculate_metrics(
             retokenized_output_len = len(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
+            if outputs[i].reasoning_text:
+                retokenized_output_len += len(
+                    tokenizer.encode(outputs[i].reasoning_text, add_special_tokens=False)
+                )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
                 total_input += input_requests[i].prompt_len
@@ -1521,6 +1531,7 @@ async def benchmark(
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
+        "reasoning_texts": [output.reasoning_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
 
