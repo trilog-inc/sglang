@@ -21,6 +21,10 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Collapse the CPU-experts CUDA stream onto the main stream. Useful
         when isolating regressions caused by the multi-stream submit path.
 
+    SGLANG_KT_HYBRID_DIRECT_CPU_INPUT=1
+        Let the CPU transfer and GPU MoE read the original hidden-state tensor
+        concurrently. This skips the per-layer device-to-device staging copy.
+
     SGLANG_KT_BYPASS_GPU_MOE=1
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
@@ -5040,6 +5044,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+        self._direct_cpu_input = (
+            os.environ.get("SGLANG_KT_HYBRID_DIRECT_CPU_INPUT") == "1"
+        )
 
     def create_weights(
         self,
@@ -5106,13 +5113,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             self._cpu_stream = torch.cuda.Stream(device=target_device)
             self._sync_done_event = torch.cuda.Event()
 
-            # Get or create shared staging buffer (shared across all MoE layers to save GPU memory)
-            self._shared_staging_buffer = get_or_create_shared_staging_buffer(
-                max_tokens=self._staging_buffer_max_size,
-                hidden_size=hidden_size,
-                dtype=params_dtype,
-                device=target_device,
-            )
+            # The direct path reads the immutable layer input from both streams.
+            if not self._direct_cpu_input:
+                self._shared_staging_buffer = get_or_create_shared_staging_buffer(
+                    max_tokens=self._staging_buffer_max_size,
+                    hidden_size=hidden_size,
+                    dtype=params_dtype,
+                    device=target_device,
+                )
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts are identified by gpu_experts_mask=False
@@ -5673,28 +5681,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
             return result
 
-        # Step 1: Copy hidden_states to staging buffer and submit CPU computation
-        # Staging buffer allows GPU computation to proceed without waiting for D2H copy
-        staging_buffer = None
+        # Step 1: Prepare the CPU input and submit CPU computation.
+        cpu_input = None
         if self.tp_rank == 0 and self._cpu_stream is not None:
-            # Use shared staging buffer (shared across all MoE layers to save GPU memory)
-            assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
-            staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
-
-            # Copy to staging buffer on main stream
-            staging_buffer.copy_(x, non_blocking=True)
+            if self._direct_cpu_input:
+                # CPU D2H and GPU MoE only read x. The merge below waits for
+                # the CPU stream, so x cannot be reused while either reader is active.
+                cpu_input = x
+            else:
+                assert self._shared_staging_buffer is not None, (
+                    "Shared staging buffer not initialized"
+                )
+                cpu_input = self._shared_staging_buffer.get_slice(x.shape[0])
+                cpu_input.copy_(x, non_blocking=True)
 
             # SGLANG_KT_HYBRID_NO_CPU_STREAM=1 collapses cpu_stream onto main stream.
             _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             if not _no_cpu_stream:
-                # Fork to cpu_stream (waits for staging copy to complete)
+                # Fork after the selected CPU input is ready on the main stream.
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
-                # Submit uses staging_buffer, so GPU can modify original x freely
                 self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
+                    layer, dispatch_output, cpu_input
                 )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
@@ -5777,9 +5787,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             from contextlib import nullcontext as _ctx_null
             _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
             with _stream_ctx:
-                # Use staging_buffer for sync to get correct buffer reference
+                # Recover the CPU buffer associated with the submitted input.
                 _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
-                cpu_output = self._sync_with_staged_input(staging_buffer)
+                cpu_output = self._sync_with_staged_input(cpu_input)
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
                 if not _no_cpu_stream:
