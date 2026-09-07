@@ -7,12 +7,12 @@ from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import _load_activation_frequency
 
 
-def _server_args(profile, hf_config, num_gpu_experts):
+def _server_args(profile, hf_config, num_gpu_experts, strategy="frequency"):
     return SimpleNamespace(
         get_hf_config=lambda: hf_config,
         kt_gpu_experts_ratio=None,
         kt_num_gpu_experts=num_gpu_experts,
-        kt_expert_placement_strategy="frequency",
+        kt_expert_placement_strategy=strategy,
         kt_expert_frequency_file=str(profile),
         init_expert_location="trivial",
     )
@@ -97,6 +97,42 @@ def test_frequency_ratio_preserves_total_budget_across_layers(tmp_path, monkeypa
 
     assert masks.sum().item() == 4
     assert masks.sum(dim=1).tolist() == [2, 1, 1]
+
+
+def test_global_frequency_placement_moves_budget_between_layers(tmp_path, monkeypatch):
+    scores = torch.tensor(
+        [
+            [800, 100, 50, 50],
+            [25, 25, 25, 25],
+            [700, 100, 100, 100],
+        ]
+    )
+    profile = tmp_path / "expert_distribution_recorder.pt"
+    torch.save({"logical_count": scores}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=3,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=4,
+    )
+
+    masks = _run_placement(
+        monkeypatch,
+        _server_args(
+            profile,
+            hf_config,
+            num_gpu_experts=2,
+            strategy="frequency-global",
+        ),
+    )
+
+    assert masks.tolist() == [
+        [True, False, False, False],
+        [True, True, True, True],
+        [True, False, False, False],
+    ]
+    assert masks.sum().item() == 6
 
 
 def test_frequency_placement_rejects_incomplete_profile(tmp_path, monkeypatch):

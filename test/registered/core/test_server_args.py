@@ -81,6 +81,14 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
                 kt_expert_placement_strategy="frequency",
             )
 
+    def test_global_frequency_strategy_requires_profile(self):
+        with self.assertRaisesRegex(ValueError, "requires --kt-expert-frequency-file"):
+            ServerArgs(
+                model_path="dummy",
+                kt_weight_path="/weights",
+                kt_expert_placement_strategy="frequency-global",
+            )
+
     def test_nontrivial_expert_location_is_rejected_with_kt(self):
         with self.assertRaisesRegex(ValueError, "logical expert ids"):
             ServerArgs(

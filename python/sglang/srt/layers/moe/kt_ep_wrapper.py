@@ -4486,7 +4486,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     tp_rank = get_tensor_model_parallel_rank()
     activation_freq = None
 
-    if strategy == "frequency":
+    if strategy in ("frequency", "frequency-global"):
         freq_path = server_args.kt_expert_frequency_file
         if not freq_path:
             raise ValueError(
@@ -4514,15 +4514,40 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             masks = torch.zeros(
                 num_layers, num_experts, dtype=torch.bool, device="cpu"
             )
-            base_per_layer, remainder = divmod(num_gpu_experts, num_moe_layers)
-            for offset, layer_idx in enumerate(moe_layers):
-                target = base_per_layer + (offset < remainder)
-                if target:
-                    # Stable ties favor lower logical ids deterministically.
-                    expert_ids = torch.argsort(
-                        activation_freq[layer_idx], descending=True, stable=True
-                    )[:target]
-                    masks[layer_idx, expert_ids] = True
+            if strategy == "frequency-global":
+                # Compare per-layer routing probabilities so a partially
+                # recorded layer cannot consume a disproportionate budget.
+                moe_scores = activation_freq[moe_layers]
+                normalized_scores = moe_scores / moe_scores.sum(
+                    dim=1, keepdim=True
+                )
+                selected = torch.argsort(
+                    normalized_scores.reshape(-1),
+                    descending=True,
+                    stable=True,
+                )[:num_gpu_experts]
+                moe_layer_offsets = torch.div(
+                    selected, num_experts, rounding_mode="floor"
+                )
+                expert_ids = selected.remainder(num_experts)
+                layer_ids = torch.tensor(moe_layers, dtype=torch.long)[
+                    moe_layer_offsets
+                ]
+                masks[layer_ids, expert_ids] = True
+            else:
+                base_per_layer, remainder = divmod(
+                    num_gpu_experts, num_moe_layers
+                )
+                for offset, layer_idx in enumerate(moe_layers):
+                    target = base_per_layer + (offset < remainder)
+                    if target:
+                        # Stable ties favor lower logical ids deterministically.
+                        expert_ids = torch.argsort(
+                            activation_freq[layer_idx],
+                            descending=True,
+                            stable=True,
+                        )[:target]
+                        masks[layer_idx, expert_ids] = True
             for layer_idx in range(num_layers):
                 if layer_idx not in moe_layers:
                     masks[layer_idx, :] = True
@@ -4598,7 +4623,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             "total GPU experts in MoE layers = %d",
             strategy, num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
         )
-        if strategy == "frequency":
+        if strategy in ("frequency", "frequency-global"):
             moe_scores = activation_freq[moe_layers]
             moe_masks = masks[moe_layers]
             routed = moe_scores.sum()
@@ -4611,6 +4636,37 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 float(routed),
                 100.0 * float(selected_routes / routed),
             )
+            if strategy == "frequency-global":
+                baseline_masks = torch.zeros_like(moe_masks)
+                base_per_layer, remainder = divmod(
+                    num_gpu_experts, num_moe_layers
+                )
+                for offset in range(num_moe_layers):
+                    target = base_per_layer + (offset < remainder)
+                    if target:
+                        expert_ids = torch.argsort(
+                            moe_scores[offset], descending=True, stable=True
+                        )[:target]
+                        baseline_masks[offset, expert_ids] = True
+                routing_probabilities = moe_scores / moe_scores.sum(
+                    dim=1, keepdim=True
+                )
+                baseline_coverage = 100.0 * float(
+                    routing_probabilities[baseline_masks].sum()
+                    / num_moe_layers
+                )
+                global_coverage = 100.0 * float(
+                    routing_probabilities[moe_masks].sum() / num_moe_layers
+                )
+                layer_counts = moe_masks.sum(dim=1)
+                logger.info(
+                    "KT global frequency allocation: experts/layer min=%d "
+                    "max=%d, mean equal-layer coverage=%.2f%%, delta=%+.2fpp",
+                    int(layer_counts.min()),
+                    int(layer_counts.max()),
+                    baseline_coverage,
+                    global_coverage - baseline_coverage,
+                )
 
     return _KT_GPU_EXPERTS_MASKS
 

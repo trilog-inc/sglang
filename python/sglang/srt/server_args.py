@@ -2983,7 +2983,13 @@ class ServerArgs:
     def _handle_moe_expert_placement(self):
         """Validate static KT placement without changing SGLang expert ids."""
         strategy = self.kt_expert_placement_strategy.lower()
-        allowed = ("uniform", "front-loading", "random", "frequency")
+        allowed = (
+            "uniform",
+            "front-loading",
+            "random",
+            "frequency",
+            "frequency-global",
+        )
         if strategy not in allowed:
             raise ValueError(
                 "--kt-expert-placement-strategy must be one of: "
@@ -3006,17 +3012,17 @@ class ServerArgs:
                 "use --kt-expert-frequency-file for frequency placement."
             )
 
-        if strategy == "frequency":
+        if strategy in ("frequency", "frequency-global"):
             if not self.kt_expert_frequency_file:
                 raise ValueError(
-                    "--kt-expert-placement-strategy frequency requires "
+                    f"--kt-expert-placement-strategy {strategy} requires "
                     "--kt-expert-frequency-file pointing to an "
                     "ExpertDistributionRecorder .pt file."
                 )
         elif self.kt_expert_frequency_file is not None:
             raise ValueError(
                 "--kt-expert-frequency-file is only used with "
-                "--kt-expert-placement-strategy frequency."
+                "--kt-expert-placement-strategy frequency or frequency-global."
             )
 
     def _handle_elastic_ep(self):
@@ -5326,9 +5332,17 @@ class ServerArgs:
             "--kt-expert-placement-strategy",
             type=str,
             default=ServerArgs.kt_expert_placement_strategy,
-            choices=["frequency", "front-loading", "uniform", "random"],
+            choices=[
+                "frequency",
+                "frequency-global",
+                "front-loading",
+                "uniform",
+                "random",
+            ],
             help="[ktransformers parameter] GPU expert placement strategy. "
-                 "frequency: Select top-k from --kt-expert-frequency-file. "
+                 "frequency: Select top-k per layer from --kt-expert-frequency-file. "
+                 "frequency-global: Optimize the same total GPU expert budget "
+                 "across all MoE layers. "
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",
