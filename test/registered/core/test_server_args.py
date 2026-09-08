@@ -77,40 +77,44 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
         self.assertFalse(args.enable_eplb)
 
     def test_frequency_strategy_requires_profile(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency",
+        )
         with self.assertRaisesRegex(ValueError, "requires --kt-expert-frequency-file"):
-            ServerArgs(
-                model_path="dummy",
-                kt_weight_path="/weights",
-                kt_expert_placement_strategy="frequency",
-            )
+            args._handle_moe_expert_placement()
 
     def test_global_frequency_strategy_requires_profile(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency-global",
+        )
         with self.assertRaisesRegex(ValueError, "requires --kt-expert-frequency-file"):
-            ServerArgs(
-                model_path="dummy",
-                kt_weight_path="/weights",
-                kt_expert_placement_strategy="frequency-global",
-            )
+            args._handle_moe_expert_placement()
 
     def test_frequency_token_filter_must_be_positive(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency-global",
+            kt_expert_frequency_file="/profiles/recording.pt",
+            kt_expert_frequency_max_tokens=0,
+        )
         with self.assertRaisesRegex(ValueError, "must be positive"):
-            ServerArgs(
-                model_path="dummy",
-                kt_weight_path="/weights",
-                kt_expert_placement_strategy="frequency-global",
-                kt_expert_frequency_file="/profiles/recording.pt",
-                kt_expert_frequency_max_tokens=0,
-            )
+            args._handle_moe_expert_placement()
 
     def test_nontrivial_expert_location_is_rejected_with_kt(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency",
+            kt_expert_frequency_file="/profiles/recording.pt",
+            init_expert_location="/profiles/recording.pt",
+        )
         with self.assertRaisesRegex(ValueError, "logical expert ids"):
-            ServerArgs(
-                model_path="dummy",
-                kt_weight_path="/weights",
-                kt_expert_placement_strategy="frequency",
-                kt_expert_frequency_file="/profiles/recording.pt",
-                init_expert_location="/profiles/recording.pt",
-            )
+            args._handle_moe_expert_placement()
 
 
 class TestNSABackendDefaults(unittest.TestCase):
