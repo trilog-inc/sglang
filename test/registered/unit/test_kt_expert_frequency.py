@@ -7,13 +7,20 @@ from sglang.srt.layers.moe import kt_ep_wrapper
 from sglang.srt.layers.moe.kt_ep_wrapper import _load_activation_frequency
 
 
-def _server_args(profile, hf_config, num_gpu_experts, strategy="frequency"):
+def _server_args(
+    profile,
+    hf_config,
+    num_gpu_experts,
+    strategy="frequency",
+    max_tokens=None,
+):
     return SimpleNamespace(
         get_hf_config=lambda: hf_config,
         kt_gpu_experts_ratio=None,
         kt_num_gpu_experts=num_gpu_experts,
         kt_expert_placement_strategy=strategy,
         kt_expert_frequency_file=str(profile),
+        kt_expert_frequency_max_tokens=max_tokens,
         init_expert_location="trivial",
     )
 
@@ -40,6 +47,46 @@ def test_load_activation_frequency_sums_recorder_buffer(tmp_path):
     torch.testing.assert_close(
         actual, torch.tensor([[10, 9, 0], [4, 2, 1]], dtype=torch.float64)
     )
+
+
+def test_load_activation_frequency_filters_prefill_samples(tmp_path):
+    samples = torch.tensor(
+        [
+            [[1, 1, 0], [0, 1, 1]],
+            [[4, 3, 1], [2, 2, 4]],
+            [[0, 1, 1], [1, 0, 1]],
+        ]
+    )
+    profile = tmp_path / "buffered_distribution.pt"
+    torch.save({"logical_count": samples}, profile)
+
+    actual = _load_activation_frequency(
+        str(profile),
+        2,
+        3,
+        max_tokens=1,
+        num_experts_per_tok=2,
+        moe_layers=[0, 1],
+    )
+
+    torch.testing.assert_close(
+        actual, torch.tensor([[1, 2, 1], [1, 1, 2]], dtype=torch.float64)
+    )
+
+
+def test_load_activation_frequency_filter_requires_buffered_profile(tmp_path):
+    profile = tmp_path / "aggregated_distribution.pt"
+    torch.save({"logical_count": torch.ones(2, 3)}, profile)
+
+    with pytest.raises(ValueError, match="three-dimensional logical_count"):
+        _load_activation_frequency(
+            str(profile),
+            2,
+            3,
+            max_tokens=1,
+            num_experts_per_tok=2,
+            moe_layers=[0, 1],
+        )
 
 
 def test_load_activation_frequency_rejects_negative_counts(tmp_path):

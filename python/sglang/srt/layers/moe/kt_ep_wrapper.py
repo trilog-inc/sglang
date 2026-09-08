@@ -4327,7 +4327,13 @@ def generate_random_masks(
 
 
 def _load_activation_frequency(
-    path: str, num_layers: int, num_experts: int
+    path: str,
+    num_layers: int,
+    num_experts: int,
+    *,
+    max_tokens: Optional[int] = None,
+    num_experts_per_tok: Optional[int] = None,
+    moe_layers: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Load and validate an ExpertDistributionRecorder frequency profile."""
     loaded = torch.load(path, map_location="cpu", weights_only=True)
@@ -4343,11 +4349,16 @@ def _load_activation_frequency(
             f"KT frequency data in {path!r} must be a tensor, "
             f"got {type(loaded).__name__}"
         )
+    expected_shape = (num_layers, num_experts)
     if loaded.dim() == 3:
-        loaded = loaded.sum(dim=0)
-    if tuple(loaded.shape) != (num_layers, num_experts):
+        if tuple(loaded.shape[1:]) != expected_shape:
+            raise ValueError(
+                "KT buffered frequency tensor must have trailing shape "
+                f"{expected_shape}, got {tuple(loaded.shape)}"
+            )
+    elif tuple(loaded.shape) != expected_shape:
         raise ValueError(
-            f"KT frequency tensor must have shape {(num_layers, num_experts)}, "
+            f"KT frequency tensor must have shape {expected_shape}, "
             f"got {tuple(loaded.shape)}"
         )
     loaded = loaded.to(dtype=torch.float64, device="cpu")
@@ -4355,6 +4366,53 @@ def _load_activation_frequency(
         raise ValueError(f"KT frequency tensor in {path!r} contains non-finite values")
     if (loaded < 0).any():
         raise ValueError(f"KT frequency tensor in {path!r} contains negative counts")
+
+    if max_tokens is not None:
+        if loaded.dim() != 3:
+            raise ValueError(
+                "--kt-expert-frequency-max-tokens requires a buffered "
+                "three-dimensional logical_count profile"
+            )
+        if num_experts_per_tok is None or num_experts_per_tok <= 0:
+            raise ValueError(
+                "Could not determine num_experts_per_tok for KT frequency "
+                "profile filtering"
+            )
+        selected_layers = list(range(num_layers)) if moe_layers is None else moe_layers
+        if not selected_layers:
+            raise ValueError("KT frequency profile filtering requires MoE layers")
+
+        routes_per_layer = loaded[:, selected_layers, :].sum(dim=2)
+        max_routes = max_tokens * num_experts_per_tok
+        complete_samples = (routes_per_layer > 0).all(dim=1)
+        decode_sized_samples = (routes_per_layer <= max_routes).all(dim=1)
+        keep_samples = complete_samples & decode_sized_samples
+        kept = int(keep_samples.sum())
+        if kept == 0:
+            observed_routes = routes_per_layer[routes_per_layer > 0]
+            observed = (
+                "none"
+                if observed_routes.numel() == 0
+                else f"{float(observed_routes.min()):g}..{float(observed_routes.max()):g}"
+            )
+            raise ValueError(
+                "KT frequency profile has no complete samples with at most "
+                f"{max_tokens} routed token(s) per MoE layer "
+                f"({max_routes} routes at top-k={num_experts_per_tok}); "
+                f"observed positive routes/layer={observed}"
+            )
+        logger.info(
+            "KT frequency profile token filter: kept %d/%d buffered samples "
+            "with at most %d token(s) per MoE layer (top-k=%d)",
+            kept,
+            loaded.shape[0],
+            max_tokens,
+            num_experts_per_tok,
+        )
+        loaded = loaded[keep_samples]
+
+    if loaded.dim() == 3:
+        loaded = loaded.sum(dim=0)
     return loaded
 
 
@@ -4495,8 +4553,19 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 "ExpertDistributionRecorder .pt file."
             )
         logger.info("Loading KT activation frequency from %s", freq_path)
+        max_tokens = getattr(server_args, "kt_expert_frequency_max_tokens", None)
+        num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", None)
+        if num_experts_per_tok is None:
+            num_experts_per_tok = getattr(
+                hf_config, "num_experts_per_token", None
+            )
         activation_freq = _load_activation_frequency(
-            str(freq_path), num_layers=num_layers, num_experts=num_experts
+            str(freq_path),
+            num_layers=num_layers,
+            num_experts=num_experts,
+            max_tokens=max_tokens,
+            num_experts_per_tok=num_experts_per_tok,
+            moe_layers=moe_layers,
         )
         empty_layers = [
             layer_idx

@@ -737,6 +737,7 @@ class ServerArgs:
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
     kt_expert_frequency_file: Optional[str] = None
+    kt_expert_frequency_max_tokens: Optional[int] = None
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
 
@@ -3002,6 +3003,10 @@ class ServerArgs:
                 raise ValueError(
                     "--kt-expert-frequency-file requires --kt-weight-path."
                 )
+            if self.kt_expert_frequency_max_tokens is not None:
+                raise ValueError(
+                    "--kt-expert-frequency-max-tokens requires --kt-weight-path."
+                )
             return
 
         if self.enable_eplb or self.init_expert_location != "trivial":
@@ -3019,9 +3024,21 @@ class ServerArgs:
                     "--kt-expert-frequency-file pointing to an "
                     "ExpertDistributionRecorder .pt file."
                 )
+            if (
+                self.kt_expert_frequency_max_tokens is not None
+                and self.kt_expert_frequency_max_tokens <= 0
+            ):
+                raise ValueError(
+                    "--kt-expert-frequency-max-tokens must be positive."
+                )
         elif self.kt_expert_frequency_file is not None:
             raise ValueError(
                 "--kt-expert-frequency-file is only used with "
+                "--kt-expert-placement-strategy frequency or frequency-global."
+            )
+        elif self.kt_expert_frequency_max_tokens is not None:
+            raise ValueError(
+                "--kt-expert-frequency-max-tokens is only used with "
                 "--kt-expert-placement-strategy frequency or frequency-global."
             )
 
@@ -5354,6 +5371,16 @@ class ServerArgs:
             help="[ktransformers parameter] ExpertDistributionRecorder .pt file "
                  "containing logical_count values for frequency-based static "
                  "GPU placement. This does not enable EPLB or remap expert ids.",
+        )
+        parser.add_argument(
+            "--kt-expert-frequency-max-tokens",
+            type=int,
+            default=ServerArgs.kt_expert_frequency_max_tokens,
+            help="[ktransformers parameter] Keep only buffered frequency-profile "
+                 "samples that route at most this many tokens per MoE layer. "
+                 "Use 1 to optimize static placement for batch-1 decode. The "
+                 "profile must contain three-dimensional buffered logical_count "
+                 "data.",
         )
         parser.add_argument(
             "--kt-lora-path",

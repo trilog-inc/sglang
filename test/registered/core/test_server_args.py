@@ -56,10 +56,13 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
                 "frequency",
                 "--kt-expert-frequency-file",
                 "/tmp/recording.pt",
+                "--kt-expert-frequency-max-tokens",
+                "1",
             ]
         )
 
         self.assertEqual(parsed.kt_expert_frequency_file, "/tmp/recording.pt")
+        self.assertEqual(parsed.kt_expert_frequency_max_tokens, 1)
         self.assertEqual(parsed.init_expert_location, "trivial")
 
     def test_frequency_profile_does_not_enable_expert_remapping(self):
@@ -87,6 +90,16 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
                 model_path="dummy",
                 kt_weight_path="/weights",
                 kt_expert_placement_strategy="frequency-global",
+            )
+
+    def test_frequency_token_filter_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            ServerArgs(
+                model_path="dummy",
+                kt_weight_path="/weights",
+                kt_expert_placement_strategy="frequency-global",
+                kt_expert_frequency_file="/profiles/recording.pt",
+                kt_expert_frequency_max_tokens=0,
             )
 
     def test_nontrivial_expert_location_is_rejected_with_kt(self):
