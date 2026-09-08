@@ -76,6 +76,28 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
         self.assertEqual(args.init_expert_location, "trivial")
         self.assertFalse(args.enable_eplb)
 
+    def test_latency_frequency_cli(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--kt-expert-placement-strategy",
+                "frequency-global-latency",
+                "--kt-expert-frequency-file",
+                "/tmp/recording.pt",
+                "--kt-expert-frequency-max-tokens",
+                "1",
+                "--kt-expert-frequency-cpu-costs",
+                "0",
+                "0.2",
+                "0.34",
+            ]
+        )
+
+        self.assertEqual(parsed.kt_expert_frequency_cpu_costs, [0, 0.2, 0.34])
+
     def test_frequency_strategy_requires_profile(self):
         args = ServerArgs(
             model_path="dummy",
@@ -103,6 +125,32 @@ class TestKtExpertPlacementArgs(unittest.TestCase):
             kt_expert_frequency_max_tokens=0,
         )
         with self.assertRaisesRegex(ValueError, "must be positive"):
+            args._handle_moe_expert_placement()
+
+    def test_latency_strategy_requires_decode_profile_and_costs(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency-global-latency",
+            kt_expert_frequency_file="/profiles/recording.pt",
+        )
+        with self.assertRaisesRegex(ValueError, "max-tokens 1"):
+            args._handle_moe_expert_placement()
+
+        args.kt_expert_frequency_max_tokens = 1
+        with self.assertRaisesRegex(ValueError, "frequency-cpu-costs"):
+            args._handle_moe_expert_placement()
+
+    def test_latency_strategy_rejects_invalid_cost_curve(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kt_weight_path="/weights",
+            kt_expert_placement_strategy="frequency-global-latency",
+            kt_expert_frequency_file="/profiles/recording.pt",
+            kt_expert_frequency_max_tokens=1,
+            kt_expert_frequency_cpu_costs=[0.0, 0.8, 0.7],
+        )
+        with self.assertRaisesRegex(ValueError, "nondecreasing"):
             args._handle_moe_expert_placement()
 
     def test_nontrivial_expert_location_is_rejected_with_kt(self):

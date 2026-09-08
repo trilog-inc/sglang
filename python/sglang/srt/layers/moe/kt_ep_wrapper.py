@@ -40,6 +40,7 @@ import bisect
 import copy
 import ctypes
 import gc
+import heapq
 import json
 import logging
 import os
@@ -4326,7 +4327,7 @@ def generate_random_masks(
     return masks
 
 
-def _load_activation_frequency(
+def _load_activation_frequency_profile(
     path: str,
     num_layers: int,
     num_experts: int,
@@ -4334,8 +4335,8 @@ def _load_activation_frequency(
     max_tokens: Optional[int] = None,
     num_experts_per_tok: Optional[int] = None,
     moe_layers: Optional[List[int]] = None,
-) -> torch.Tensor:
-    """Load and validate an ExpertDistributionRecorder frequency profile."""
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Load aggregate frequencies and optional buffered route samples."""
     loaded = torch.load(path, map_location="cpu", weights_only=True)
     if isinstance(loaded, dict):
         if "logical_count" not in loaded:
@@ -4412,8 +4413,140 @@ def _load_activation_frequency(
         loaded = loaded[keep_samples]
 
     if loaded.dim() == 3:
-        loaded = loaded.sum(dim=0)
-    return loaded
+        return loaded.sum(dim=0), loaded
+    return loaded, None
+
+
+def _load_activation_frequency(
+    path: str,
+    num_layers: int,
+    num_experts: int,
+    *,
+    max_tokens: Optional[int] = None,
+    num_experts_per_tok: Optional[int] = None,
+    moe_layers: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """Load and validate an ExpertDistributionRecorder frequency profile."""
+    frequencies, _ = _load_activation_frequency_profile(
+        path,
+        num_layers,
+        num_experts,
+        max_tokens=max_tokens,
+        num_experts_per_tok=num_experts_per_tok,
+        moe_layers=moe_layers,
+    )
+    return frequencies
+
+
+def _generate_global_frequency_moe_masks(
+    moe_scores: torch.Tensor, num_gpu_experts: int
+) -> torch.Tensor:
+    """Allocate a global budget using independently normalized layer counts."""
+    _, num_experts = moe_scores.shape
+    masks = torch.zeros_like(moe_scores, dtype=torch.bool, device="cpu")
+    normalized_scores = moe_scores / moe_scores.sum(dim=1, keepdim=True)
+    selected = torch.argsort(
+        normalized_scores.reshape(-1), descending=True, stable=True
+    )[:num_gpu_experts]
+    layer_offsets = torch.div(selected, num_experts, rounding_mode="floor")
+    masks[layer_offsets, selected.remainder(num_experts)] = True
+    return masks
+
+
+def _latency_profile_metrics(
+    route_samples: torch.Tensor,
+    moe_masks: torch.Tensor,
+    cpu_costs: torch.Tensor,
+) -> Tuple[float, torch.Tensor]:
+    """Return mean modeled CPU time per token and the CPU top-k histogram."""
+    cpu_routes = route_samples.sum(dim=2) - (
+        route_samples * moe_masks.unsqueeze(0)
+    ).sum(dim=2)
+    cpu_routes = cpu_routes.to(dtype=torch.long)
+    mean_cost = float(cpu_costs[cpu_routes].sum(dim=1).mean())
+    histogram = torch.bincount(
+        cpu_routes.reshape(-1), minlength=cpu_costs.numel()
+    )
+    return mean_cost, histogram
+
+
+def _generate_latency_aware_frequency_moe_masks(
+    route_samples: torch.Tensor,
+    num_gpu_experts: int,
+    cpu_costs: List[float],
+) -> torch.Tensor:
+    """Greedily minimize modeled CPU route latency using route co-occurrence."""
+    if route_samples.dim() != 3:
+        raise ValueError(
+            "KT latency-aware placement requires buffered three-dimensional "
+            "logical_count data"
+        )
+    if not torch.equal(route_samples, route_samples.round()):
+        raise ValueError("KT buffered logical_count values must be integer counts")
+
+    routes = route_samples.to(dtype=torch.long, device="cpu")
+    max_cpu_routes = int(routes.sum(dim=2).max())
+    if len(cpu_costs) <= max_cpu_routes:
+        raise ValueError(
+            "--kt-expert-frequency-cpu-costs must provide costs for CPU top-k "
+            f"0 through {max_cpu_routes}; got {len(cpu_costs)} values"
+        )
+
+    costs = torch.tensor(cpu_costs, dtype=torch.float64, device="cpu")
+    if (
+        not torch.isfinite(costs).all()
+        or (costs < 0).any()
+        or (costs[1:] < costs[:-1]).any()
+        or float(costs[0]) == float(costs[-1])
+    ):
+        raise ValueError(
+            "KT CPU costs must be finite, nonnegative, nondecreasing, and "
+            "nonconstant"
+        )
+    _, num_moe_layers, num_experts = routes.shape
+    masks = torch.zeros(
+        num_moe_layers, num_experts, dtype=torch.bool, device="cpu"
+    )
+    cpu_routes = routes.sum(dim=2)
+    budget = min(num_gpu_experts, num_moe_layers * num_experts)
+    started_at = time.perf_counter()
+    logger.info(
+        "Optimizing KT latency-aware placement: samples=%d layers=%d "
+        "experts=%d GPU budget=%d",
+        routes.shape[0],
+        num_moe_layers,
+        num_experts,
+        budget,
+    )
+
+    def best_candidate(layer_offset: int) -> Tuple[float, int, int]:
+        current_routes = cpu_routes[:, layer_offset]
+        candidate_routes = (
+            current_routes.unsqueeze(1) - routes[:, layer_offset, :]
+        ).clamp_min_(0)
+        gains = (
+            costs[current_routes].unsqueeze(1) - costs[candidate_routes]
+        ).sum(dim=0)
+        gains[masks[layer_offset]] = -torch.inf
+        expert_id = int(torch.argmax(gains))
+        return -float(gains[expert_id]), layer_offset, expert_id
+
+    candidates = [
+        best_candidate(layer_offset) for layer_offset in range(num_moe_layers)
+    ]
+    heapq.heapify(candidates)
+    for _ in range(budget):
+        _, layer_offset, expert_id = heapq.heappop(candidates)
+        masks[layer_offset, expert_id] = True
+        cpu_routes[:, layer_offset].sub_(routes[:, layer_offset, expert_id])
+        if not masks[layer_offset].all():
+            heapq.heappush(candidates, best_candidate(layer_offset))
+
+    logger.info(
+        "Optimized KT latency-aware placement in %.2f seconds",
+        time.perf_counter() - started_at,
+    )
+    return masks
 
 
 def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tensor]:
@@ -4543,12 +4676,18 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     # Generate masks based on strategy
     tp_rank = get_tensor_model_parallel_rank()
     activation_freq = None
+    route_samples = None
 
-    if strategy in ("frequency", "frequency-global"):
+    frequency_strategies = (
+        "frequency",
+        "frequency-global",
+        "frequency-global-latency",
+    )
+    if strategy in frequency_strategies:
         freq_path = server_args.kt_expert_frequency_file
         if not freq_path:
             raise ValueError(
-                "--kt-expert-placement-strategy frequency requires "
+                f"--kt-expert-placement-strategy {strategy} requires "
                 "--kt-expert-frequency-file pointing to an "
                 "ExpertDistributionRecorder .pt file."
             )
@@ -4559,7 +4698,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             num_experts_per_tok = getattr(
                 hf_config, "num_experts_per_token", None
             )
-        activation_freq = _load_activation_frequency(
+        activation_freq, route_samples = _load_activation_frequency_profile(
             str(freq_path),
             num_layers=num_layers,
             num_experts=num_experts,
@@ -4583,26 +4722,53 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             masks = torch.zeros(
                 num_layers, num_experts, dtype=torch.bool, device="cpu"
             )
-            if strategy == "frequency-global":
-                # Compare per-layer routing probabilities so a partially
-                # recorded layer cannot consume a disproportionate budget.
+            if strategy == "frequency-global-latency":
+                if route_samples is None:
+                    raise ValueError(
+                        "KT latency-aware placement requires buffered "
+                        "three-dimensional logical_count data"
+                    )
+                costs = getattr(
+                    server_args, "kt_expert_frequency_cpu_costs", None
+                )
+                if costs is None:
+                    raise ValueError(
+                        "KT latency-aware placement requires "
+                        "--kt-expert-frequency-cpu-costs"
+                    )
+                latency_masks = _generate_latency_aware_frequency_moe_masks(
+                    route_samples[:, moe_layers, :], num_gpu_experts, costs
+                )
                 moe_scores = activation_freq[moe_layers]
-                normalized_scores = moe_scores / moe_scores.sum(
-                    dim=1, keepdim=True
+                global_masks = _generate_global_frequency_moe_masks(
+                    moe_scores, num_gpu_experts
                 )
-                selected = torch.argsort(
-                    normalized_scores.reshape(-1),
-                    descending=True,
-                    stable=True,
-                )[:num_gpu_experts]
-                moe_layer_offsets = torch.div(
-                    selected, num_experts, rounding_mode="floor"
+                cost_tensor = torch.tensor(costs, dtype=torch.float64)
+                buffered_routes = route_samples[:, moe_layers, :].to(
+                    dtype=torch.long, device="cpu"
                 )
-                expert_ids = selected.remainder(num_experts)
-                layer_ids = torch.tensor(moe_layers, dtype=torch.long)[
-                    moe_layer_offsets
-                ]
-                masks[layer_ids, expert_ids] = True
+                latency_cost, _ = _latency_profile_metrics(
+                    buffered_routes, latency_masks, cost_tensor
+                )
+                global_cost, _ = _latency_profile_metrics(
+                    buffered_routes, global_masks, cost_tensor
+                )
+                if latency_cost <= global_cost:
+                    masks[moe_layers] = latency_masks
+                else:
+                    logger.warning(
+                        "KT latency-aware allocation did not improve its "
+                        "profile objective (%.3f > %.3f); retaining the "
+                        "frequency-global mask",
+                        latency_cost,
+                        global_cost,
+                    )
+                    masks[moe_layers] = global_masks
+            elif strategy == "frequency-global":
+                moe_scores = activation_freq[moe_layers]
+                masks[moe_layers] = _generate_global_frequency_moe_masks(
+                    moe_scores, num_gpu_experts
+                )
             else:
                 base_per_layer, remainder = divmod(
                     num_gpu_experts, num_moe_layers
@@ -4692,7 +4858,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             "total GPU experts in MoE layers = %d",
             strategy, num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
         )
-        if strategy in ("frequency", "frequency-global"):
+        if strategy in frequency_strategies:
             moe_scores = activation_freq[moe_layers]
             moe_masks = masks[moe_layers]
             routed = moe_scores.sum()
@@ -4705,7 +4871,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                 float(routed),
                 100.0 * float(selected_routes / routed),
             )
-            if strategy == "frequency-global":
+            if strategy in ("frequency-global", "frequency-global-latency"):
                 baseline_masks = torch.zeros_like(moe_masks)
                 base_per_layer, remainder = divmod(
                     num_gpu_experts, num_moe_layers
@@ -4735,6 +4901,37 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                     int(layer_counts.max()),
                     baseline_coverage,
                     global_coverage - baseline_coverage,
+                )
+            if strategy == "frequency-global-latency":
+                costs = torch.tensor(
+                    server_args.kt_expert_frequency_cpu_costs,
+                    dtype=torch.float64,
+                    device="cpu",
+                )
+                buffered_routes = route_samples[:, moe_layers, :].to(
+                    dtype=torch.long, device="cpu"
+                )
+                global_masks = _generate_global_frequency_moe_masks(
+                    moe_scores, num_gpu_experts
+                )
+                baseline_cost, baseline_hist = _latency_profile_metrics(
+                    buffered_routes, global_masks, costs
+                )
+                optimized_cost, optimized_hist = _latency_profile_metrics(
+                    buffered_routes, moe_masks, costs
+                )
+                improvement = 100.0 * (
+                    baseline_cost - optimized_cost
+                ) / baseline_cost
+                logger.info(
+                    "KT latency-aware allocation: modeled CPU time "
+                    "%.3f -> %.3f per token (%+.2f%%), frequency-global "
+                    "cpu_topk=%s, optimized cpu_topk=%s",
+                    baseline_cost,
+                    optimized_cost,
+                    improvement,
+                    baseline_hist.tolist(),
+                    optimized_hist.tolist(),
                 )
 
     return _KT_GPU_EXPERTS_MASKS

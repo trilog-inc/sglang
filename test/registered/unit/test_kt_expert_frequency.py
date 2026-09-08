@@ -13,6 +13,7 @@ def _server_args(
     num_gpu_experts,
     strategy="frequency",
     max_tokens=None,
+    cpu_costs=None,
 ):
     return SimpleNamespace(
         get_hf_config=lambda: hf_config,
@@ -21,6 +22,7 @@ def _server_args(
         kt_expert_placement_strategy=strategy,
         kt_expert_frequency_file=str(profile),
         kt_expert_frequency_max_tokens=max_tokens,
+        kt_expert_frequency_cpu_costs=cpu_costs,
         init_expert_location="trivial",
     )
 
@@ -180,6 +182,73 @@ def test_global_frequency_placement_moves_budget_between_layers(tmp_path, monkey
         [True, False, False, False],
     ]
     assert masks.sum().item() == 6
+
+
+def test_latency_aware_placement_uses_route_cooccurrence(tmp_path, monkeypatch):
+    samples = torch.tensor(
+        [
+            [[1, 1, 0, 0], [1, 1, 0, 0]],
+            [[1, 1, 0, 0], [1, 1, 0, 0]],
+            [[0, 0, 1, 1], [0, 0, 1, 1]],
+            [[0, 0, 1, 1], [0, 0, 1, 1]],
+        ]
+    )
+    profile = tmp_path / "buffered_distribution.pt"
+    torch.save({"logical_count": samples}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=2,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+    )
+
+    masks = _run_placement(
+        monkeypatch,
+        _server_args(
+            profile,
+            hf_config,
+            num_gpu_experts=1,
+            strategy="frequency-global-latency",
+            max_tokens=1,
+            cpu_costs=[0.0, 1.0, 10.0],
+        ),
+    )
+
+    assert masks.tolist() == [
+        [True, False, True, False],
+        [False, False, False, False],
+    ]
+    assert masks.sum().item() == 2
+
+
+def test_latency_aware_placement_requires_complete_cost_curve(
+    tmp_path, monkeypatch
+):
+    profile = tmp_path / "buffered_distribution.pt"
+    torch.save({"logical_count": torch.tensor([[[1, 1, 0]]])}, profile)
+    hf_config = SimpleNamespace(
+        num_hidden_layers=1,
+        num_hash_layers=0,
+        first_k_dense_replace=0,
+        moe_layer_freq=1,
+        n_routed_experts=3,
+        num_experts_per_tok=2,
+    )
+
+    with pytest.raises(ValueError, match="CPU top-k 0 through 2"):
+        _run_placement(
+            monkeypatch,
+            _server_args(
+                profile,
+                hf_config,
+                num_gpu_experts=1,
+                strategy="frequency-global-latency",
+                max_tokens=1,
+                cpu_costs=[0.0, 1.0],
+            ),
+        )
 
 
 def test_frequency_placement_rejects_incomplete_profile(tmp_path, monkeypatch):

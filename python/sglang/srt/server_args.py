@@ -23,6 +23,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import tempfile
@@ -738,6 +739,7 @@ class ServerArgs:
     kt_expert_placement_strategy: str = "uniform"
     kt_expert_frequency_file: Optional[str] = None
     kt_expert_frequency_max_tokens: Optional[int] = None
+    kt_expert_frequency_cpu_costs: Optional[List[float]] = None
     kt_lora_path: Optional[str] = None
     kt_expert_lora_path: Optional[str] = None
 
@@ -2990,6 +2992,7 @@ class ServerArgs:
             "random",
             "frequency",
             "frequency-global",
+            "frequency-global-latency",
         )
         if strategy not in allowed:
             raise ValueError(
@@ -3007,6 +3010,10 @@ class ServerArgs:
                 raise ValueError(
                     "--kt-expert-frequency-max-tokens requires --kt-weight-path."
                 )
+            if self.kt_expert_frequency_cpu_costs is not None:
+                raise ValueError(
+                    "--kt-expert-frequency-cpu-costs requires --kt-weight-path."
+                )
             return
 
         if self.enable_eplb or self.init_expert_location != "trivial":
@@ -3017,7 +3024,12 @@ class ServerArgs:
                 "use --kt-expert-frequency-file for frequency placement."
             )
 
-        if strategy in ("frequency", "frequency-global"):
+        frequency_strategies = (
+            "frequency",
+            "frequency-global",
+            "frequency-global-latency",
+        )
+        if strategy in frequency_strategies:
             if not self.kt_expert_frequency_file:
                 raise ValueError(
                     f"--kt-expert-placement-strategy {strategy} requires "
@@ -3031,15 +3043,49 @@ class ServerArgs:
                 raise ValueError(
                     "--kt-expert-frequency-max-tokens must be positive."
                 )
+            if strategy == "frequency-global-latency":
+                if self.kt_expert_frequency_max_tokens != 1:
+                    raise ValueError(
+                        "--kt-expert-placement-strategy "
+                        "frequency-global-latency requires "
+                        "--kt-expert-frequency-max-tokens 1."
+                    )
+                costs = self.kt_expert_frequency_cpu_costs
+                if costs is None:
+                    raise ValueError(
+                        "--kt-expert-placement-strategy "
+                        "frequency-global-latency requires "
+                        "--kt-expert-frequency-cpu-costs."
+                    )
+                if (
+                    len(costs) < 2
+                    or any(not math.isfinite(cost) or cost < 0 for cost in costs)
+                    or any(left > right for left, right in zip(costs, costs[1:]))
+                    or costs[0] == costs[-1]
+                ):
+                    raise ValueError(
+                        "--kt-expert-frequency-cpu-costs must be a finite, "
+                        "nonnegative, nondecreasing, nonconstant latency curve."
+                    )
+            elif self.kt_expert_frequency_cpu_costs is not None:
+                raise ValueError(
+                    "--kt-expert-frequency-cpu-costs is only used with "
+                    "--kt-expert-placement-strategy frequency-global-latency."
+                )
         elif self.kt_expert_frequency_file is not None:
             raise ValueError(
                 "--kt-expert-frequency-file is only used with "
-                "--kt-expert-placement-strategy frequency or frequency-global."
+                "a frequency-based --kt-expert-placement-strategy."
             )
         elif self.kt_expert_frequency_max_tokens is not None:
             raise ValueError(
                 "--kt-expert-frequency-max-tokens is only used with "
-                "--kt-expert-placement-strategy frequency or frequency-global."
+                "a frequency-based --kt-expert-placement-strategy."
+            )
+        elif self.kt_expert_frequency_cpu_costs is not None:
+            raise ValueError(
+                "--kt-expert-frequency-cpu-costs is only used with "
+                "--kt-expert-placement-strategy frequency-global-latency."
             )
 
     def _handle_elastic_ep(self):
@@ -5352,6 +5398,7 @@ class ServerArgs:
             choices=[
                 "frequency",
                 "frequency-global",
+                "frequency-global-latency",
                 "front-loading",
                 "uniform",
                 "random",
@@ -5360,6 +5407,9 @@ class ServerArgs:
                  "frequency: Select top-k per layer from --kt-expert-frequency-file. "
                  "frequency-global: Optimize the same total GPU expert budget "
                  "across all MoE layers. "
+                 "frequency-global-latency: Use buffered batch-1 route "
+                 "co-occurrence and --kt-expert-frequency-cpu-costs to "
+                 "minimize modeled CPU latency. "
                  "front-loading: Fill layers from first MoE layer onwards. "
                  "uniform: Equal experts per layer. "
                  "random: Random placement with fixed seed.",
@@ -5381,6 +5431,16 @@ class ServerArgs:
                  "Use 1 to optimize static placement for batch-1 decode. The "
                  "profile must contain three-dimensional buffered logical_count "
                  "data.",
+        )
+        parser.add_argument(
+            "--kt-expert-frequency-cpu-costs",
+            type=float,
+            nargs="+",
+            default=ServerArgs.kt_expert_frequency_cpu_costs,
+            help="[ktransformers parameter] Measured relative or millisecond "
+                 "cost for CPU top-k 0, 1, ... used by "
+                 "frequency-global-latency placement. Values must be "
+                 "nonnegative and nondecreasing.",
         )
         parser.add_argument(
             "--kt-lora-path",
