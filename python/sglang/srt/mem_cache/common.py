@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
@@ -22,6 +23,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 # Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
 MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
@@ -30,6 +32,14 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+class RetractionBackup(NamedTuple):
+    cpu_tensors: Any = None
+    host_indices: Optional[torch.Tensor] = None
+    pool_transfers: Optional[list[PoolTransfer]] = None
+    # Set when the KV pool leaves the recurrent state to the caller.
+    mamba_cpu: Any = None
 
 
 def kv_to_page_indices(kv_indices: torch.Tensor, page_size: int) -> np.ndarray:
@@ -127,6 +137,81 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         available_size = allocator.available_size()
         if available_size < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
+
+
+def dsv41_dspark_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return False
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+
+
+def retraction_backup(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> bool:
+    """Returns False when the host pool cannot hold the backup; the caller
+    aborts the request since its KV cannot be preserved."""
+    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
+        # Drain the in-flight verify before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
+    if backend == "cpu_tensor":
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return True
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return True
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    return req.kv.retraction_backup is not None
+
+
+def retraction_restore(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    backend: str,
+) -> None:
+    if backend == "cpu_tensor":
+        req.load_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.seqlen <= 1:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    assert req.kv.retraction_backup is not None
+    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    req.kv.retraction_backup = None
+
+
+def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+    if backend == "cpu_tensor":
+        req.kv.retraction_backup = None
+        return
+    if backend != "host_pool":
+        raise ValueError(f"Unknown retraction backup backend: {backend}")
+    if req.kv.retraction_backup is None:
+        return
+
+    unified_cache = cast("UnifiedRadixCache", tree_cache)
+    unified_cache.retraction_discard(req.kv.retraction_backup)
+    req.kv.retraction_backup = None
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
