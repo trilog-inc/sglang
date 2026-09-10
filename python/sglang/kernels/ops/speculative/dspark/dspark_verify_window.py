@@ -604,6 +604,30 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
+def build_unified_commit_inject_layout(
+    *,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    block_pos_offsets: torch.Tensor,
+    commit_lens: torch.Tensor,
+    stride: int,
+    ring_stride: int,
+) -> CommitInjectLayoutResult:
+    """Build static-shape DSpark commit rows for the unified SWA ring."""
+    bs = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+    positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
+    positions = positions_2d.reshape(-1).to(torch.int64)
+    state_slot = (
+        req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
+    )
+    loc = state_slot * ring_stride + positions % ring_stride
+    col = torch.arange(stride, device=device).view(1, -1)
+    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
+    swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
+    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+
+
 class BuildCommitInjectLayout:
     @classmethod
     def execute(cls, *args, **kwargs) -> CommitInjectLayoutResult:

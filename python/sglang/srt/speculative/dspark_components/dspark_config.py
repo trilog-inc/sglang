@@ -21,6 +21,11 @@ SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
 DSV4_DRAFT_ATTENTION_BACKEND = "dsv4"
 
 
+def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
+    """Return whether a DSpark checkpoint samples the anchor query row."""
+    return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
+
+
 def draft_is_deepseek_v4(*, server_args: ServerArgs) -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config

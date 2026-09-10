@@ -8,10 +8,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
@@ -31,6 +33,15 @@ def gather_and_crop_vocab(
     return full_logits[..., : int(lm_head.org_vocab_size)]
 
 
+def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """Project through a plain or quantized target language-model head."""
+    quant_method = lm_head.quant_method
+    if should_apply_lm_head_quant_method(lm_head, quant_method):
+        return quant_method.apply(lm_head, hidden, None)
+    weight = lm_head.weight
+    return torch.matmul(hidden.to(weight.dtype), weight.T)
+
+
 def run_markov_block(
     head: nn.Module,
     base_logits: torch.Tensor,
@@ -38,7 +49,8 @@ def run_markov_block(
     first_prev_tokens: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    collect_corrected: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
@@ -56,11 +68,12 @@ def run_markov_block(
         )
         next_tokens = sampler(step_logits, step_idx)
         sampled_tokens.append(next_tokens)
-        corrected_logits.append(step_logits.unsqueeze(1))
+        if collect_corrected:
+            corrected_logits.append(step_logits.unsqueeze(1))
         prev_tokens = next_tokens
     return (
         torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1),
+        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
     )
 
 
@@ -120,13 +133,15 @@ class VanillaMarkov(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
 
 
@@ -230,7 +245,8 @@ class RNNHead(VanillaMarkov):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
         batch_size, proposal_len = base_logits.shape[:2]
@@ -255,11 +271,12 @@ class RNNHead(VanillaMarkov):
             step_logits = base_logits[:, step_idx, :] + bias
             next_tokens = sampler(step_logits, step_idx)
             sampled_tokens.append(next_tokens)
-            corrected_logits.append(step_logits.unsqueeze(1))
+            if collect_corrected:
+                corrected_logits.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
         return (
             torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1),
+            torch.cat(corrected_logits, dim=1) if collect_corrected else None,
         )
 
 
@@ -361,9 +378,11 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = (
 
 
 class DSparkDraftMixin:
+    supports_pre_gather_target_hidden_projection = True
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
             raise ValueError(
@@ -371,9 +390,11 @@ class DSparkDraftMixin:
                 f"got markov_rank={dspark_config.markov_rank}."
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        self.num_stages = int(config.num_hidden_layers)
 
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
@@ -511,8 +532,13 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
-        ctx_hidden = self.project_target_hidden(target_hidden)
+        ctx_hidden = (
+            target_hidden
+            if target_hidden_is_projected
+            else self.project_target_hidden(target_hidden)
+        )
         stacked = self._stacked_ctx_kv_params()
         if stacked is not None:
             k_all, v_all = self._project_ctx_kv_stacked(
