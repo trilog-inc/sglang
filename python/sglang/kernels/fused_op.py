@@ -67,6 +67,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.JIT: "forward_jit",
     KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
+    KernelBackend.KDA: "forward_kda",
     KernelBackend.FLASHINFER: "forward_flashinfer",
     KernelBackend.DEEPGEMM: "forward_deepgemm",
     KernelBackend.AITER: "forward_aiter",

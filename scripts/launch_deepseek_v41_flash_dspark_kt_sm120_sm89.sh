@@ -102,7 +102,6 @@ check_host() {
   grep -qm1 -w avx512f /proc/cpuinfo || fail "CPU does not advertise AVX512-F"
   grep -qm1 -w avx512bw /proc/cpuinfo || fail "CPU does not advertise AVX512-BW"
   grep -qm1 -w avx512_vnni /proc/cpuinfo || fail "CPU does not advertise AVX512-VNNI"
-  grep -qm1 -w avx512_vbmi /proc/cpuinfo || fail "CPU does not advertise AVX512-VBMI"
   grep -qm1 -w avx512_bf16 /proc/cpuinfo || fail "CPU does not advertise AVX512-BF16"
 
   local mem_available_kib mem_available_gib
