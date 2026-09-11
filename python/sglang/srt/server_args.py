@@ -1754,7 +1754,7 @@ class ServerArgs:
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
             choices=DSA_TOPK_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
@@ -2146,6 +2146,14 @@ class ServerArgs:
         "Attention backend for speculative decoding drafting.",
         NS("spec"),
     ] = None
+    speculative_dsa_topk_backend: A[
+        str,
+        Arg(
+            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=DSA_TOPK_BACKEND_CHOICES,
+        ),
+        NS("spec"),
+    ] = "sgl-kernel"
     speculative_draft_window_size: A[
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
