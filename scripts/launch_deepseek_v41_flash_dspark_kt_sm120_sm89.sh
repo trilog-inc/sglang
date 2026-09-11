@@ -38,7 +38,11 @@ KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS="${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS:-
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
 DISABLE_DSPARK="${DISABLE_DSPARK:-0}"
 HOST_MEM_MIN_GIB="${HOST_MEM_MIN_GIB:-384}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.86}"
+# The target weights plus two KT MXFP4 prefill slots consume about 88.8 GiB on
+# the 96 GiB Blackwell card.  0.86 leaves no KV budget; 0.96 retains several
+# GiB outside the static pool for activations while clearing the profiled 0.943
+# minimum on this topology.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.96}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
