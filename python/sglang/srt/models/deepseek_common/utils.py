@@ -72,6 +72,16 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
+    """Return whether a projection uses two-dimensional block FP8 scales."""
+    if not hasattr(proj, "weight") or proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    weight_scale = getattr(proj, "weight_scale", None)
+    if weight_scale is None or weight_scale.dim() != 2:
+        return False
+    return weight_scale.shape[-1] > 1
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device
@@ -135,6 +145,14 @@ def is_wint4afp8_or_wint4a16_config(
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
 
 
+def quant_blocks_shared_experts_fusion(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether checkpoint quantization forbids shared-expert fusion."""
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is not None and not can_fuse_fn()
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
@@ -148,3 +166,17 @@ def _get_llama_4_scaling(
         1 + torch.floor(positions / original_max_position_embeddings)
     )
     return scaling[..., None, None]
+
+
+def tiny_router_gemm_max_tokens(
+    *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
+) -> int:
+    """Return the measured tiny-router GEMM row limit, or -1 when unsupported."""
+    if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
+        return -1
+
+    from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
+
+    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+        return -1
+    return 16

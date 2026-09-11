@@ -315,6 +315,38 @@ class Fp8GemmRunnerBackend(Enum):
         return self == Fp8GemmRunnerBackend.AITER
 
 
+class Mxfp8DenseGemmBackend(Enum):
+    """MXFP8 dense-linear backend identifiers used by DeepSeek V4.1."""
+
+    FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    DEEP_GEMM = "deep_gemm"
+    GFX95_DOT_SCALED = "gfx95_dot_scaled"
+    UNSUPPORTED = "unsupported"
+
+    def is_flashinfer_cutlass(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_trtllm(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer(self) -> bool:
+        return self.value.startswith("flashinfer_")
+
+    def is_deep_gemm(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.DEEP_GEMM
+
+    def is_gfx95_dot_scaled(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    def is_unsupported(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.UNSUPPORTED
+
+
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 _FP8_GEMM_RUNNER_BACKEND_OVERRIDE: ContextVar[Fp8GemmRunnerBackend | None] = ContextVar(
     "sglang_fp8_gemm_runner_backend_override", default=None
