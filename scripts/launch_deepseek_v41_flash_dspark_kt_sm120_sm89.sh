@@ -10,7 +10,7 @@ fi
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-13.3}"
 TARGET_GPU="${TARGET_GPU:-0}"
-DRAFT_GPU="${DRAFT_GPU:-1}"
+DRAFT_GPU="${DRAFT_GPU:-2}"
 MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4.1-Flash}"
 KT_WEIGHT_PATH="${KT_WEIGHT_PATH:-${MODEL_PATH}}"
 KT_KERNEL_ROOT="${KT_KERNEL_ROOT:-}"
@@ -113,7 +113,7 @@ check_host() {
   echo "validated: CUDA ${nvcc_release}"
   echo "validated: target physical GPU ${TARGET_GPU}: ${target_name} (SM120)"
   echo "validated: draft physical GPU ${DRAFT_GPU}: ${draft_name} (SM89)"
-  echo "validated: AMX-TILE/INT8/BF16, AVX512-VNNI/VBMI/BF16, ${mem_available_gib} GiB host RAM available"
+  echo "validated: AMX-TILE/INT8/BF16, AVX512-F/BW/VNNI/BF16, ${mem_available_gib} GiB host RAM available"
 }
 
 build_kt() {
