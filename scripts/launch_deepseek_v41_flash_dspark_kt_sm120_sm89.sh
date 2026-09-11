@@ -31,8 +31,8 @@ CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v41-flash}"
-HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-30000}"
+SGLANG_BIND_HOST="${SGLANG_BIND_HOST:-0.0.0.0}"
+SGLANG_BIND_PORT="${SGLANG_BIND_PORT:-30000}"
 
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -191,8 +191,8 @@ serve() {
     --reasoning-parser deepseek-v41 \
     --tool-call-parser deepseekv41 \
     --watchdog-timeout 18000 \
-    --host "${HOST}" \
-    --port "${PORT}" \
+    --host "${SGLANG_BIND_HOST}" \
+    --port "${SGLANG_BIND_PORT}" \
     "$@"
 }
 
