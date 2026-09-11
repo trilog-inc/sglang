@@ -55,6 +55,12 @@ export CUDA_VISIBLE_DEVICES="${TARGET_GPU},${DRAFT_GPU}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-8.9 12.0f}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9;12.0+PTX}"
 export KT_MXFP4_BACKEND=amx
+# V4.1 has two roughly 94 GiB Engram tables.  Keep them in pinned host memory
+# so the 96 GiB target GPU remains available for dense weights, GPU experts,
+# KV cache, and CUDA graphs.  Private layout uses this host's anonymous THP.
+export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE="${SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE:-1}"
+export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT="${SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT:-private}"
+export SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN="${SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN:-1}"
 
 fail() {
   echo "error: $*" >&2
