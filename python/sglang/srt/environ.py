@@ -1688,6 +1688,33 @@ class Envs:
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
 
+    # ===================================================================
+    # Optimized-fork compatibility
+    # ===================================================================
+    # These switches are still consumed by this fork's retained GLM, DSV4,
+    # MegaMoE, allocator, and heterogeneous-DSpark paths.  Keep their
+    # pre-V4.1 defaults when importing the upstream environment registry.
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
+    SGLANG_CUTLASS_MOE = EnvBool(False)
+    SGLANG_WARMUP_MAX_NEW_TOKENS = EnvInt(8)
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_TRITON_FUSED_MHC = EnvBool(True)
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
+    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
