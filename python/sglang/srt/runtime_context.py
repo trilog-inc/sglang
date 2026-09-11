@@ -474,6 +474,9 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # LayerNorm sequence-parallel region. TP=1 leaves this false, but
+        # V4.1 model code reads it while selecting its wo_a output path.
+        "sp_active": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -488,6 +491,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "sp_active",
         }
     )
 
