@@ -1114,6 +1114,21 @@ def max_speculative_num_draft_tokens() -> int | None:
     return get_server_args().max_speculative_num_draft_tokens
 
 
+def mamba_extra_buffer_enabled() -> bool:
+    """Return whether the Mamba radix cache keeps an extra state buffer."""
+    return get_server_args().enable_mamba_extra_buffer()
+
+
+def mamba_extra_buffer_lazy_enabled() -> bool:
+    """Return whether the Mamba extra state buffer is allocated lazily."""
+    return get_server_args().enable_mamba_extra_buffer_lazy()
+
+
+def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
+    """Return the configured activation reserve used before graph capture."""
+    return get_server_args().pre_capture_activation_reserve_mb(gpu_mem)
+
+
 def attention_backends() -> tuple:
     """Return the resolved (prefill, decode) attention backend pair."""
     return get_server_args().get_attention_backends()
