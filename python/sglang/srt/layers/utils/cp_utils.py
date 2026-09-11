@@ -9,7 +9,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    _tbo_event,
     attn_cp_all_gather_into_tensor,
+    attn_cp_overlap_all_gather_into_tensor,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -282,6 +284,39 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     )
 
     return outputs
+
+
+def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
+    """Start a round-robin CP all-gather and return a completion handle.
+
+    This compatibility implementation uses the fork's existing attention CP
+    communicator. The V4.1 call site is ROCm-only; NVIDIA deployments keep CP
+    disabled and therefore never execute this path.
+    """
+    group = get_parallel().attn_cp_group
+    input_tensor = input_tensor.contiguous()
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+    comm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm_stream):
+        attn_cp_overlap_all_gather_into_tensor(output_tensor, input_tensor)
+        event = _tbo_event(event_key)
+        event.record(comm_stream)
+    return (output_tensor, input_tensor, event, cp_size)
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange it."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    out_shape = output_tensor.shape
+    return (
+        output_tensor.view(cp_size, -1, *out_shape[1:])
+        .transpose(0, 1)
+        .reshape(out_shape)
+    )
 
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
