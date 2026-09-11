@@ -17,6 +17,11 @@ from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
 
 
+def resolve_rocm_forward_method(method: AttnForwardMethod) -> AttnForwardMethod:
+    """Keep the fork's established ROCm dispatch; NVIDIA returns unchanged."""
+    return method
+
+
 class AttentionBackendRegistry:
     _handlers = {}
 

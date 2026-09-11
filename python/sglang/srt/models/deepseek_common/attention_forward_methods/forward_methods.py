@@ -16,6 +16,12 @@ class AttnForwardMethod(IntEnum):
     # when the sequence lengths are below the threshold.
     MHA_ONE_SHOT = auto()
 
+    # Dedicated ROCm methods used by newer DeepSeek model dispatch. The Trilog
+    # NVIDIA deployment never selects these compatibility enum values.
+    MHA_ROCM = auto()
+    MHA_ONE_SHOT_ROCM = auto()
+    MLA_ROCM = auto()
+
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE_ROCM = auto()
 
