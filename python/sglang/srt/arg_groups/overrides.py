@@ -233,6 +233,11 @@ def resolved_view(server_args: Any) -> ResolvedView:
     return ResolvedView(server_args, overlay=_declaration_overlay(server_args))
 
 
+def resolving_view(server_args: Any) -> ResolvedView:
+    """Backward-compatible name for the live configuration resolution view."""
+    return resolved_view(server_args)
+
+
 def attention_backends_of(cfg: Any) -> tuple:
     """(prefill, decode) attention backends of a config-shaped object (a
     ResolvedView mid-resolution, or pristine server_args at dispatch time):
