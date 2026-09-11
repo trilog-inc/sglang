@@ -1109,6 +1109,11 @@ def get_spec() -> _ConfigBag:
     return _CONTEXT.config_bag("spec")
 
 
+def max_speculative_num_draft_tokens() -> int | None:
+    """Return the largest draft-token count reserved by this configuration."""
+    return get_server_args().max_speculative_num_draft_tokens
+
+
 def attention_backends() -> tuple:
     """Return the resolved (prefill, decode) attention backend pair."""
     return get_server_args().get_attention_backends()
