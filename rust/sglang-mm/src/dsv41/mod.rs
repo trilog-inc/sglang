@@ -1,6 +1,7 @@
 //! V4.1 PIL bicubic resize, centered padding and CHW patch packing.
-use crate::common::{par, resize};
+use crate::common::{self, resize};
 use half::bf16;
+use rayon::prelude::*;
 
 pub struct ImagePlan {
     pub out_h: usize,
@@ -48,42 +49,50 @@ pub fn resize_patchify(
         .checked_mul(out_w)
         .and_then(|n| n.checked_mul(3))
         .ok_or("V4.1 output size overflow")?;
-    let resized = resize::resize_rgb(
-        rgb,
-        h,
-        w,
-        resize_h,
-        resize_w,
-        resize::Resample::Pil(resize::Filter::Bicubic),
-    );
+    let resized = common::pool().install(|| {
+        resize::resize_rgb(
+            rgb,
+            h,
+            w,
+            resize_h,
+            resize_w,
+            resize::Resample::Pil(resize::Filter::Bicubic),
+        )
+    });
     let lut: [u16; 256] =
         core::array::from_fn(|i| bf16::from_f32(((i as f32 / 255.0) - 0.5) / 0.5).to_bits());
     let mut out = vec![0u16; len];
     let patch_len = 3 * ps * ps;
     let grid_w = out_w / ps;
-    par::for_chunks_mut(&mut out, patch_len, |index, patch| {
-        let py = index / grid_w * ps;
-        let px = index % grid_w * ps;
-        for c in 0..3 {
-            for y in 0..ps {
-                for x in 0..ps {
-                    let iy = py + y;
-                    let ix = px + x;
-                    let value =
-                        if iy >= top && iy < top + resize_h && ix >= left && ix < left + resize_w {
-                            resized[((iy - top) * resize_w + ix - left) * 3 + c]
-                        } else {
-                            127
-                        };
-                    patch[(c * ps + y) * ps + x] = lut[value as usize];
+    common::pool().install(|| {
+        out.par_chunks_mut(patch_len)
+            .enumerate()
+            .for_each(|(index, patch)| {
+                let py = index / grid_w * ps;
+                let px = index % grid_w * ps;
+                for c in 0..3 {
+                    for y in 0..ps {
+                        for x in 0..ps {
+                            let iy = py + y;
+                            let ix = px + x;
+                            let value = if iy >= top
+                                && iy < top + resize_h
+                                && ix >= left
+                                && ix < left + resize_w
+                            {
+                                resized[((iy - top) * resize_w + ix - left) * 3 + c]
+                            } else {
+                                127
+                            };
+                            patch[(c * ps + y) * ps + x] = lut[value as usize];
+                        }
+                    }
                 }
-            }
-        }
+            });
     });
     Ok(out)
 }
 
-#[cfg(feature = "python")]
 mod python {
     use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
     use pyo3::{exceptions::PyValueError, prelude::*};
@@ -135,5 +144,4 @@ mod python {
         parent.add_submodule(&m)
     }
 }
-#[cfg(feature = "python")]
 pub use python::register;

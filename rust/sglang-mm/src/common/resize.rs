@@ -2,6 +2,33 @@ use rayon::prelude::*;
 
 const PRECISION_BITS: i32 = 32 - 8 - 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Lanczos,
+    Bicubic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resample {
+    Pil(Filter),
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Self::Lanczos => 3.0,
+            Self::Bicubic => 2.0,
+        }
+    }
+
+    fn eval(self, x: f64) -> f64 {
+        match self {
+            Self::Lanczos => lanczos(x),
+            Self::Bicubic => bicubic(x),
+        }
+    }
+}
+
 fn sinc(x: f64) -> f64 {
     if x == 0.0 {
         return 1.0;
@@ -18,16 +45,28 @@ fn lanczos(x: f64) -> f64 {
     }
 }
 
+fn bicubic(x: f64) -> f64 {
+    const A: f64 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        (((x - 5.0) * x + 8.0) * x - 4.0) * A
+    } else {
+        0.0
+    }
+}
+
 struct Coeffs {
     bounds: Vec<(usize, usize)>,
     kk: Vec<i32>,
     ksize: usize,
 }
 
-fn precompute_coeffs(in_size: usize, out_size: usize) -> Coeffs {
+fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Coeffs {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = if scale < 1.0 { 1.0 } else { scale };
-    let support = 3.0 * filterscale;
+    let support = filter.support() * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let ss = 1.0 / filterscale;
 
@@ -47,7 +86,7 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Coeffs {
         let k = &mut kkf[xx * ksize..(xx + 1) * ksize];
         let mut ww = 0.0f64;
         for (x, kv) in k[..count].iter_mut().enumerate() {
-            let w = lanczos((x as f64 + xmin as f64 - center + 0.5) * ss);
+            let w = filter.eval((x as f64 + xmin as f64 - center + 0.5) * ss);
             *kv = w;
             ww += w;
         }
@@ -131,23 +170,35 @@ fn resample_vertical(src: &[u8], w: usize, out_h: usize, c: &Coeffs) -> Vec<u8> 
     out
 }
 
-pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
+pub fn resize_rgb(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+    resample: Resample,
+) -> Vec<u8> {
+    let Resample::Pil(filter) = resample;
     let need_h = out_w != w;
     let need_v = out_h != h;
     if need_h && need_v {
-        let ch = precompute_coeffs(w, out_w);
+        let ch = precompute_coeffs(w, out_w, filter);
         let tmp = resample_horizontal(src, h, w, out_w, &ch);
-        let cv = precompute_coeffs(h, out_h);
+        let cv = precompute_coeffs(h, out_h, filter);
         resample_vertical(&tmp, out_w, out_h, &cv)
     } else if need_h {
-        let ch = precompute_coeffs(w, out_w);
+        let ch = precompute_coeffs(w, out_w, filter);
         resample_horizontal(src, h, w, out_w, &ch)
     } else if need_v {
-        let cv = precompute_coeffs(h, out_h);
+        let cv = precompute_coeffs(h, out_h, filter);
         resample_vertical(src, w, out_h, &cv)
     } else {
         src.to_vec()
     }
+}
+
+pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
+    resize_rgb(src, h, w, out_h, out_w, Resample::Pil(Filter::Lanczos))
 }
 
 pub fn scaled_dims(w: usize, h: usize, frac: Option<f64>, cap: Option<i64>) -> (usize, usize) {

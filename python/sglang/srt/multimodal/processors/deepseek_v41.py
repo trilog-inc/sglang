@@ -1,6 +1,7 @@
 """260903 image preprocessing, preserving raw token IDs for Engram."""
 
 import asyncio
+import importlib
 import logging
 from functools import partial
 
@@ -24,8 +25,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.runtime_context import get_mm
-from sglang.srt.rust_extensions import load_rust_extension
-
 logger = logging.getLogger(__name__)
 
 
@@ -48,9 +47,7 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
             # the preprocessing cache fingerprint. Image-processing errors are
             # not caught here or retried with a different backend.
             try:
-                extension = load_rust_extension(
-                    "sglang.srt.rust_extensions._multimodal"
-                )
+                extension = importlib.import_module("sglang.srt.multimodal._core")
                 resize_patchify = extension.dsv41.resize_patchify
             except (ImportError, OSError, RuntimeError, AttributeError) as error:
                 logger.warning(
