@@ -210,6 +210,11 @@ def _sm120_sparse_decode_fwd(
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 _triton_dual_prefill_fallback_logged = False
 
+# FlashInfer uses its split-K decode kernel through this token count and its
+# paged prefill kernel above it. DeepSeek V4.1 uses the same boundary to avoid
+# decode-only padding on larger target-verify batches.
+SM120_DECODE_MAX_TOKENS = 64
+
 
 def _flashinfer_supports_dsv4_dual_prefill(
     *, num_heads: int, main_topk: int, extra_page_block_size: int
