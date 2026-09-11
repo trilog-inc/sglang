@@ -357,6 +357,24 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
     return moe.speculative_a2a_backend
 
 
+def is_shared_experts_fusion_disabled() -> bool:
+    """Return the active model-build decision for shared-expert fusion.
+
+    This fork does not yet publish the newer per-runner construction flag, so
+    fall back to the resolved execution configuration unless that flag exists.
+    """
+    from sglang.srt.model_executor.forward_context import has_forward_context
+
+    if has_forward_context():
+        raise AssertionError(
+            "is_shared_experts_fusion_disabled() is construction-time state"
+        )
+    active = getattr(get_flags().moe, "disable_shared_experts_fusion", None)
+    if active is None:
+        return get_exec().moe.disable_shared_experts_fusion
+    return active
+
+
 def get_deepep_mode() -> DeepEPMode:
     moe = get_flags().moe
     if moe.deepep_mode is None:
