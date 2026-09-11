@@ -2739,6 +2739,11 @@ class ServerArgs:
         "Enable global multimodal embedding cache to skip redundant ViT inference.",
         NS("mm"),
     ] = False
+    image_processor_backend: A[
+        Literal["auto", "torchvision", "pil"],
+        "Image processor backend. 'auto' selects the best available backend.",
+        NS("mm"),
+    ] = "auto"
     disable_fast_image_processor: A[
         bool, "Adopt base image processor instead of fast image processor.", NS("mm")
     ] = False
