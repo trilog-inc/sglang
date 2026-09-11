@@ -10,7 +10,13 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.moe import moe_route_radix
+
+try:
+    from sglang.kernels.ops.moe import moe_route_radix
+except ImportError:
+    # The pre-package-reorganization fork does not carry the Kimi-K3-only
+    # 896-expert radix router.  Other expert counts use the Triton path below.
+    moe_route_radix = None
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -410,7 +416,9 @@ def moe_fused_gate(
             routed_scaling_factor,
             apply_routed_scaling_factor_on_output,
         )
-        if moe_route_radix.covered(scores, bias, topk):
+        if moe_route_radix is not None and moe_route_radix.covered(
+            scores, bias, topk
+        ):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
 
     M, N = scores.shape
