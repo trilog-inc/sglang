@@ -248,6 +248,3 @@ class DeepseekV4ForCausalLM(nn.Module):
         except AttributeError:
             language_model = super().__getattr__("language_model")
             return getattr(language_model, name)
-
-
-EntryClass = [DeepseekV4ForCausalLM]

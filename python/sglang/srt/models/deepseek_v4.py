@@ -5061,6 +5061,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
 
+EntryClass = [DeepseekV4ForCausalLM]
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
