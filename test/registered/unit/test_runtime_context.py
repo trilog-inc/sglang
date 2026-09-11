@@ -417,6 +417,7 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
 
         reset_context()
         self.assertTrue(get_moe_a2a_backend().is_none())
+        self.assertFalse(get_moe_a2a_backend().is_deepep_v2())
         self.assertEqual(get_moe_runner_backend().name, "AUTO")
         self.assertFalse(is_tbo_enabled())
 

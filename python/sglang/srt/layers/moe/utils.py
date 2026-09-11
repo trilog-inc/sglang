@@ -54,6 +54,15 @@ class MoeA2ABackend(Enum):
     def is_deepep(self):
         return self == MoeA2ABackend.DEEPEP
 
+    def is_deepep_v2(self):
+        """Return false until this fork carries the DeepEP-v2 backend.
+
+        DeepSeek V4.1 reuses DeepseekV2MoE, whose current implementation probes
+        this predicate even when no MoE all-to-all backend is selected.  Keep
+        that probe compatible without exposing an unsupported backend choice.
+        """
+        return False
+
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
