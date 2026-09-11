@@ -965,6 +965,20 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
 
 
+def attn_cp_overlap_all_gather_into_tensor(
+    output: torch.Tensor, input: torch.Tensor
+):
+    """Compatibility wrapper for builds without a distinct CP overlap group."""
+    return attn_cp_all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_reduce_scatter_tensor(
+    output: torch.Tensor, input: torch.Tensor
+):
+    """Compatibility wrapper for builds without a distinct CP overlap group."""
+    return attn_cp_reduce_scatter_tensor(output, input)
+
+
 def get_moe_cp_group() -> GroupCoordinator:
     """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
     return _get_moe_dp_group()
