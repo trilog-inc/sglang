@@ -4,7 +4,7 @@ import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -511,7 +511,10 @@ if is_sm90_supported() and is_flashinfer_available():
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
 
-def dispatch_w8a8_block_fp8_linear() -> Callable:
+def dispatch_w8a8_block_fp8_linear(
+    weight_block_size: Optional[List[int]] = None,
+    act_scale_ue8m0: bool = False,
+) -> Callable:
     """
     Dispatch to the appropriate FP8 block linear implementation.
 
@@ -519,6 +522,13 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
+    if weight_block_size is not None and weight_block_size != [128, 128]:
+        # DeepGEMM, FlashInfer groupwise, and the SM120 CUTLASS kernel consume
+        # 128x128 scales. The Triton kernel reads the checkpoint block size.
+        return partial(
+            triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0
+        )
+
     backend = get_fp8_gemm_runner_backend()
 
     # Handle explicit backend selection via --fp8-gemm-backend
@@ -1129,14 +1139,22 @@ def triton_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
 ) -> torch.Tensor:
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
+    if act_scale_ue8m0:
+        # DeepSeek-V4.1's ue8m0 checkpoint requires power-of-two activation
+        # scales, stored as fp32 for this Triton block-FP8 kernel.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], scale_ue8m0=True
+        )
+    else:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
     output = w8a8_block_fp8_matmul_triton(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
     )

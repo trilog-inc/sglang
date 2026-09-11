@@ -235,6 +235,7 @@ class Fp8Config(QuantizationConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
         is_fp4_experts: bool = False,
+        scale_fmt: Optional[str] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -258,6 +259,8 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        # V4.1's ue8m0 checkpoints require power-of-two activation scales.
+        self.scale_fmt = scale_fmt
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -322,6 +325,7 @@ class Fp8Config(QuantizationConfig):
                 normalized.append(f"model.{base}")
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -337,6 +341,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            scale_fmt=scale_fmt,
         )
 
     def get_quant_method(
@@ -467,7 +472,11 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
-            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
+                weight_block_size=self.weight_block_size,
+                act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0",
+            )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
