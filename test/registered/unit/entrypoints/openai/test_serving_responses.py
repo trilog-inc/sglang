@@ -332,7 +332,12 @@ class MultimodalRequestTestCase(unittest.TestCase):
                 self.assertEqual(processed.prompt, "")
                 self.assertEqual(request_prompts, [[1, 2, 3]])
                 self.assertEqual(engine_prompts, [[1, 2, 3]])
-                self.assertEqual(processed.image_data, images or None)
+                self.assertEqual(
+                    [item.url for item in processed.image_data]
+                    if processed.image_data
+                    else None,
+                    images or None,
+                )
                 rendered_prompt = tokenizer.encode.call_args.args[0]
                 self.assertIn("describe it", rendered_prompt)
                 if with_image:

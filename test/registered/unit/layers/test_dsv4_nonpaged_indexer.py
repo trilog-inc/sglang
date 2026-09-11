@@ -47,6 +47,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                use_topk_v2=False,
                 force_deep_gemm_metadata=True,
             )
 
@@ -68,6 +69,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
                 page_size=256,
                 page_table=torch.zeros((1, 1), dtype=torch.int32),
                 c4_seq_lens=torch.tensor([65], dtype=torch.int32),
+                use_topk_v2=False,
             )
 
         self.assertIsNone(metadata.deep_gemm_metadata)
@@ -83,6 +85,7 @@ class TestDSV4TopKDispatch(CustomTestCase):
 
         indexer_metadata = object.__new__(PagedIndexerMetadata)
         indexer_metadata.page_size = 256
+        indexer_metadata.index_page_size = 64
         indexer_metadata.page_table = page_table
         indexer_metadata.c4_seq_lens = c4_seq_lens
         indexer_metadata.topk_metadata = topk_metadata
@@ -122,7 +125,7 @@ class TestDSV4TopKDispatch(CustomTestCase):
                 f"{_INDEXER}.get_global_indexer_capturer",
                 return_value=indexer_capturer,
             ),
-            patch(f"{_INDEXER}.topk_transform_paged") as topk_v1,
+            patch(f"{_INDEXER}.topk_transform_512") as topk_v1,
             patch(f"{_INDEXER}.topk_transform_512_v2") as topk_v2,
         ):
             backend.forward_c4_indexer(
