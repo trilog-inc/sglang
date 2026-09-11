@@ -43,12 +43,17 @@ def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> in
     return 2 * get_alloc_len_per_decode(server_args)
 
 
-def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
+def get_req_to_token_extra_context_len(
+    server_args: Optional[ServerArgs] = None,
+) -> int:
     """req_to_token row headroom beyond the model context length.
 
     Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
     draft footprint can outgrow the default num_draft_tokens headroom.
     """
+    if server_args is None:
+        server_args = get_server_args()
+
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
     if server_args.speculative_algorithm is not None and server_args.page_size > 1:
