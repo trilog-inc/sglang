@@ -21,7 +21,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

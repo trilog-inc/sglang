@@ -9,7 +9,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
-from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.moe import moe_route_radix
 
 if TYPE_CHECKING:
