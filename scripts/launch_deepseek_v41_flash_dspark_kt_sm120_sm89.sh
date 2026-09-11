@@ -3,6 +3,19 @@
 # on RTX 4090 (SM89) and native MXFP4/AMX expert offload to system RAM.
 set -euo pipefail
 
+physical_cpu_count() {
+  local count=""
+  if command -v lscpu >/dev/null 2>&1; then
+    count="$(lscpu -p=NODE,CORE,ONLINE 2>/dev/null \
+      | awk -F, '$1 !~ /^#/ && $3 == "Y" { seen[$1 FS $2] = 1 } END { print length(seen) }')"
+  fi
+  if [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${count}"
+  else
+    getconf _NPROCESSORS_ONLN
+  fi
+}
+
 ACTION="${1:-check}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -14,7 +27,7 @@ DRAFT_GPU="${DRAFT_GPU:-2}"
 MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V4.1-Flash}"
 KT_WEIGHT_PATH="${KT_WEIGHT_PATH:-${MODEL_PATH}}"
 KT_KERNEL_ROOT="${KT_KERNEL_ROOT:-}"
-KT_CPU_THREADS="${KT_CPU_THREADS:-$(getconf _NPROCESSORS_ONLN)}"
+KT_CPU_THREADS="${KT_CPU_THREADS:-$(physical_cpu_count)}"
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUMA_NODES="${KT_NUMA_NODES:-}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-96}"
@@ -104,6 +117,13 @@ check_host() {
   grep -qm1 -w avx512_vnni /proc/cpuinfo || fail "CPU does not advertise AVX512-VNNI"
   grep -qm1 -w avx512_bf16 /proc/cpuinfo || fail "CPU does not advertise AVX512-BF16"
 
+  local physical_cpus
+  physical_cpus="$(physical_cpu_count)"
+  [[ "${KT_CPU_THREADS}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "KT_CPU_THREADS must be a positive integer; got ${KT_CPU_THREADS}"
+  (( KT_CPU_THREADS <= physical_cpus )) \
+    || fail "KT_CPU_THREADS=${KT_CPU_THREADS} exceeds the ${physical_cpus} physical CPU cores available"
+
   local mem_available_kib mem_available_gib
   mem_available_kib="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
   mem_available_gib="$((mem_available_kib / 1024 / 1024))"
@@ -113,7 +133,7 @@ check_host() {
   echo "validated: CUDA ${nvcc_release}"
   echo "validated: target physical GPU ${TARGET_GPU}: ${target_name} (SM120)"
   echo "validated: draft physical GPU ${DRAFT_GPU}: ${draft_name} (SM89)"
-  echo "validated: AMX-TILE/INT8/BF16, AVX512-F/BW/VNNI/BF16, ${mem_available_gib} GiB host RAM available"
+  echo "validated: AMX-TILE/INT8/BF16, AVX512-F/BW/VNNI/BF16, ${physical_cpus} physical CPU cores, ${mem_available_gib} GiB host RAM available"
 }
 
 build_kt() {
