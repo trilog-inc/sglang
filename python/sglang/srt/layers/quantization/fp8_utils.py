@@ -114,6 +114,15 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     return scale.t().contiguous().t() if scale.dim() == 2 else scale
 
 
+def view_aiter_fused_rms_transposed_fp8_scale(
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Expose an AITER transposed group scale with logical row-major indices."""
+    if scale.dim() != 2:
+        return scale
+    return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
+
+
 def materialize_bpreshuffle_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
@@ -123,6 +132,13 @@ def materialize_bpreshuffle_fp8_scale_tuple(
         materialize_bpreshuffle_fp8_scale(value[1]),
         *value[2:],
     )
+
+
+def emit_transposed_bpreshuffle_scale(
+    m: int, *, on_bpreshuffle_gfx95: bool
+) -> bool:
+    """Use the zero-copy transposed scale layout where gfx95 supports it."""
+    return on_bpreshuffle_gfx95 and m >= 2
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
