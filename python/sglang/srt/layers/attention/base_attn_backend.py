@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from abc import ABC
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
@@ -12,8 +13,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading scheduler-shared data."""
+
+    PRE_REPLAY = 1
+    IN_REPLAY = 2
+    POST_REPLAY = 3
+    UNKNOWN = 4
+
+    @staticmethod
+    def max_of(items: Iterable["SharedReadEnds"]) -> "SharedReadEnds":
+        return max(items, key=lambda item: item.value)
 
 
 class AttentionBackend(ABC):
@@ -105,6 +119,17 @@ class AttentionBackend(ABC):
     # those tensor addresses. Such backends opt in here, create the metadata
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        """Declare the latest point at which shared scheduler data is read."""
+        if fm.is_decode() or fm.is_target_verify():
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        """Allow backends to snapshot late prefill reads before replay."""
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
