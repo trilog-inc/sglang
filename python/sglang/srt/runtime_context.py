@@ -1022,8 +1022,42 @@ _PARALLEL = ParallelContext()
 _CONTEXT = RuntimeContext(parallel=_PARALLEL)
 
 
+_PLATFORM_COMPAT_PROBES = {
+    "is_cuda": "is_cuda",
+    "is_hip": "is_hip",
+    "is_npu": "is_npu",
+    "is_xpu": "is_xpu",
+    "is_sm90": "is_sm90_supported",
+    "is_sm100": "is_sm100_supported",
+    "is_sm120": "is_sm120_supported",
+    "is_blackwell": "is_blackwell_supported",
+}
+
+
+class _PlatformCompat:
+    """Property-style platform facts for code backported from newer SGLang."""
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> bool:
+        probe_name = _PLATFORM_COMPAT_PROBES.get(name)
+        if probe_name is None:
+            raise AttributeError(f"platform context has no fact {name!r}")
+        from sglang.srt.utils import common
+
+        return bool(getattr(common, probe_name)())
+
+
+_PLATFORM_COMPAT = _PlatformCompat()
+
+
 def get_context() -> RuntimeContext:
     return _CONTEXT
+
+
+def get_platform() -> _PlatformCompat:
+    """Return process-static hardware facts using the newer property API."""
+    return _PLATFORM_COMPAT
 
 
 def get_parallel() -> ParallelContext:
