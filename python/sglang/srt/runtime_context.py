@@ -47,6 +47,7 @@ test-only ``override(**kw)``.
 from __future__ import annotations
 
 import dataclasses
+import math
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -1107,6 +1108,23 @@ def get_memory() -> _ConfigBag:
 
 def get_spec() -> _ConfigBag:
     return _CONTEXT.config_bag("spec")
+
+
+def mamba_cache_chunk_size() -> int:
+    """Return the configured Mamba state checkpoint granularity."""
+    return get_server_args().mamba_cache_chunk_size
+
+
+def mamba_checkpoint_grid(tree_page: int) -> int:
+    """Return a checkpoint depth aligned to both Mamba and tree pages."""
+    return math.lcm(mamba_cache_chunk_size(), tree_page)
+
+
+def mamba_track_grid(tree_page: int) -> int:
+    """Also align donated decode checkpoints to the tracking interval."""
+    return math.lcm(
+        mamba_checkpoint_grid(tree_page), get_exec().mamba.mamba_track_interval
+    )
 
 
 def max_speculative_num_draft_tokens() -> int | None:
