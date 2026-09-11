@@ -5,6 +5,7 @@ import torch
 import triton
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,20 @@ _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
 _TRITON_MHC_POST_PRE_OPS = None
 _TRITON_MHC_POST_PRE_RUNTIME_DISABLED = False
+
+
+def _is_fused_mhc_post_pre_enabled() -> bool:
+    """Return whether the production TileLang post+pre path is available."""
+    return (
+        envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+        and envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get()
+        and (envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get() or is_sm120_supported())
+    )
+
+
+def is_cross_layer_mhc_fusion_enabled() -> bool:
+    """Whether DeepSeek V4 may defer mHC post across a layer boundary."""
+    return _is_fused_mhc_post_pre_enabled()
 
 
 def _get_triton_mhc_post_pre_ops():
@@ -156,3 +171,55 @@ def try_fused_hc_post_pre(
         return None
 
     return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"], False
+
+
+def apply_mhc_post_pre_boundary(
+    layer_input: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+    norm_weight: Optional[torch.Tensor],
+    norm_eps: Optional[float],
+    *,
+    fn_transpose: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
+    """Apply the production TileLang fused mHC boundary when enabled."""
+    if not _is_fused_mhc_post_pre_enabled():
+        return None
+
+    # Imported lazily to avoid a circular module import and optional CUDA
+    # runtime initialization during model-registry discovery.
+    from sglang.srt.models.deepseek_v4 import _get_mhc_ops
+
+    post_in = post.unsqueeze(-1) if post.ndim == 2 else post
+    (
+        residual,
+        post_out,
+        comb_out,
+        layer_input_out,
+    ) = _get_mhc_ops().mhc_fused_post_pre(
+        layer_input,
+        residual,
+        post_in,
+        comb,
+        hc_fn.T if fn_transpose else hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        hc_eps,
+        hc_post_mult,
+        sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    post_out = post_out.squeeze(-1) if post_out.ndim == 3 else post_out
+    return residual, layer_input_out, post_out, comb_out, True
