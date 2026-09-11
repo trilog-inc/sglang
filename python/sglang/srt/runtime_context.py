@@ -1109,6 +1109,11 @@ def get_spec() -> _ConfigBag:
     return _CONTEXT.config_bag("spec")
 
 
+def attention_backends() -> tuple:
+    """Return the resolved (prefill, decode) attention backend pair."""
+    return get_server_args().get_attention_backends()
+
+
 def get_lora() -> _ConfigBag:
     return _CONTEXT.config_bag("lora")
 
