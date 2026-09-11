@@ -40,6 +40,11 @@ from .topk import (
 )
 from .utils import make_name
 
+# Compatibility names used by the V4.1 indexer. The top-k kernel rework renamed
+# these entry points without changing the call shape used here.
+topk_transform_512 = topk_transform_paged
+topk_transform_512_v2 = topk_transform_paged_v2
+
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
@@ -62,6 +67,8 @@ __all__ = [
     "topk_transform_paged",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
+    "topk_transform_512",
+    "topk_transform_512_v2",
     "plan_topk_v2",
     "hash_topk",
     "mega_moe_pre_dispatch",
