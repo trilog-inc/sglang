@@ -3311,12 +3311,6 @@ class DeepseekV4AttnBackend(
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_c4_seq_len
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Every reachable block is a candidate inside the window, so the
-            # two-level selection collapses to the plain top-k below.
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
 
         num_tokens, num_heads = q.shape[0], q.shape[1]
         q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
@@ -3335,6 +3329,7 @@ class DeepseekV4AttnBackend(
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
         columns = torch.arange(width, device=lens.device)
+        published_chunks = [] if indexer.is_candidate_source else None
         for rows, plan in metadata.row_chunks():
             logits = _fp4_paged_mqa_logits(
                 (q_fp4[rows], q_sf[rows]),
@@ -3346,6 +3341,25 @@ class DeepseekV4AttnBackend(
                 width,
             )
             lens_c = lens[rows].unsqueeze(-1)
+            if indexer.is_candidate_source or indexer.uses_candidates:
+                published = (
+                    self.candidate_masks[rows]
+                    if indexer.uses_candidates
+                    and not indexer.is_candidate_source
+                    and torch.is_tensor(self.candidate_masks)
+                    else None
+                )
+                logits, published_chunk = two_level_decode_logits(
+                    logits,
+                    lens[rows],
+                    is_candidate_source=indexer.is_candidate_source,
+                    uses_candidates=indexer.uses_candidates,
+                    topk_blocks=indexer.candidate_topk_blocks,
+                    block_size=indexer.candidate_block_size,
+                    published=published,
+                )
+                if published_chunks is not None and published_chunk is not None:
+                    published_chunks.append(published_chunk)
             # Columns past a row's length hold garbage.
             s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
             idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
@@ -3356,6 +3370,8 @@ class DeepseekV4AttnBackend(
             page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
             if raw_indices is not None:
                 raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)
+        if published_chunks:
+            self.candidate_masks = torch.cat(published_chunks)
 
     def _low_ratio_index_topk_decode(self, layer, x, q_lora, pos) -> None:
         from sglang.srt.model_executor.runner_utils.capture_mode import (
