@@ -40,7 +40,6 @@ from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
     get_pp_group,
@@ -160,9 +159,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
@@ -213,7 +209,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
@@ -662,21 +657,16 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
 def deepseek_v4_attention_with_output(
     query: torch.Tensor,
     key_value: torch.Tensor,
     output: torch.Tensor,
-    layer_id: int,
+    attention_layer: Any,
+    forward_batch: ForwardBatch,
     compress_ratio: int,
     attn_sink: torch.Tensor,
     save_kv_cache: bool,
 ) -> None:
-    context = get_tc_piecewise_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
     if real_num_tokens == 0:
@@ -718,10 +708,11 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
-def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
+def deepseek_v4_low_ratio_sources(
+    layer, x, q_lora, positions, forward_batch: ForwardBatch
+) -> None:
     # The compressor and prefill indexer sync with the host: run them outside
     # the prefill CUDA graph on the live batch, like the attention.
-    forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.num_token_non_padded_cpu
     if real_num_tokens == 0:
         return
@@ -737,10 +728,11 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
 bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
 
 
-def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
+def deepseek_v4_engram_hash_ids(
+    hasher, input_ids: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
     # The hasher reads per-request rows: run it outside the prefill CUDA graph
     # on the live batch.
-    forward_batch = get_tc_piecewise_forward_context().forward_batch
     return hasher(input_ids, forward_batch)
 
 
@@ -1831,7 +1823,9 @@ class MQALayer(MqaAttentionBase):
                 and is_in_breakable_cuda_graph()
                 and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
-                bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
+                bcg_deepseek_v4_low_ratio_sources(
+                    self, x, q_lora, positions, forward_batch
+                )
             elif src_stream is not None:
                 # Joined right below, before this function returns; attention is
                 # the first reader of anything written here.
@@ -2017,7 +2011,8 @@ class MQALayer(MqaAttentionBase):
                     attn_q,
                     attn_k,
                     o,
-                    self.attn_mqa.layer_id,
+                    self.attn_mqa,
+                    forward_batch,
                     self.compress_ratio,
                     attn_sink,
                     save_kv_cache,
@@ -3644,7 +3639,7 @@ class DeepseekV4Model(nn.Module):
                 forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             ):
                 hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
+                    self.engram_hasher, input_ids, forward_batch
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
