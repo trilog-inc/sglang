@@ -30,31 +30,32 @@ KT_KERNEL_ROOT="${KT_KERNEL_ROOT:-}"
 KT_CPU_THREADS="${KT_CPU_THREADS:-$(physical_cpu_count)}"
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUMA_NODES="${KT_NUMA_NODES:-}"
-KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-96}"
+KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-104}"
 KT_AMX_MIN_TOKENS_PER_EXPERT="${KT_AMX_MIN_TOKENS_PER_EXPERT:-4}"
 # Keep speculative decode on the NUMA-local AMX path while steering ordinary
 # text and image prefills through the preallocated SM120 layerwise slots.  The
 # latter avoids transient host allocations that can exhaust a 768 GiB system.
 KT_GPU_PREFILL_TOKEN_THRESHOLD="${KT_GPU_PREFILL_TOKEN_THRESHOLD:-64}"
-KT_MXFP4_PREFILL_SLOTS="${KT_MXFP4_PREFILL_SLOTS:-auto}"
+KT_MXFP4_PREFILL_SLOTS="${KT_MXFP4_PREFILL_SLOTS:-1}"
 KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS="${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS:-8}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
 DISABLE_DSPARK="${DISABLE_DSPARK:-0}"
 HOST_MEM_MIN_GIB="${HOST_MEM_MIN_GIB:-384}"
-# The target weights plus two KT MXFP4 prefill slots consume about 88.8 GiB on
-# the 96 GiB Blackwell card.  0.86 leaves no KV budget; 0.96 retains several
-# GiB outside the static pool for activations while clearing the profiled 0.943
-# minimum on this topology.
+# The target weights plus one KT MXFP4 prefill slot consume about 87.3 GiB on
+# the 96 GiB Blackwell card.  Auto-selecting two slots raises this to about
+# 94.0 GiB and requires an unsafe ~0.998 static fraction just to create a KV
+# cache.  One slot at 0.96 leaves 3.7-3.8 GiB for CUDA runtime/activations.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.96}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-256}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 DISABLE_FLASHINFER_AUTOTUNE="${DISABLE_FLASHINFER_AUTOTUNE:-1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v41-flash}"
 SGLANG_BIND_HOST="${SGLANG_BIND_HOST:-0.0.0.0}"
 SGLANG_BIND_PORT="${SGLANG_BIND_PORT:-30000}"
+INTERLEAVE_HOST_MEMORY="${INTERLEAVE_HOST_MEMORY:-1}"
 
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -65,6 +66,10 @@ export CUDA_VISIBLE_DEVICES="${TARGET_GPU},${DRAFT_GPU}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-8.9 12.0f}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9;12.0+PTX}"
 export KT_MXFP4_BACKEND=amx
+# The scheduler must retain the launcher's interleaved memory policy.  Binding
+# it back to one NUMA node can exhaust that node while hundreds of GiB remain
+# available on the other socket.
+export SGLANG_AUTO_NUMA_BIND="${SGLANG_AUTO_NUMA_BIND:-0}"
 # V4.1 has two roughly 94 GiB Engram tables.  Keep them in pinned host memory
 # so the 96 GiB target GPU remains available for dense weights, GPU experts,
 # KV cache, and CUDA graphs.  Private layout uses this host's anonymous THP.
@@ -178,6 +183,12 @@ serve() {
   local speculative_args=()
   local cuda_graph_args=()
   local flashinfer_autotune_args=()
+  local host_memory_prefix=()
+  if [[ "${INTERLEAVE_HOST_MEMORY}" == "1" ]]; then
+    command -v numactl >/dev/null 2>&1 \
+      || fail "numactl is required when INTERLEAVE_HOST_MEMORY=1"
+    host_memory_prefix=(numactl --interleave=all)
+  fi
   if [[ -n "${KT_NUMA_NODES}" ]]; then
     local numa_nodes=()
     read -r -a numa_nodes <<<"${KT_NUMA_NODES}"
@@ -207,7 +218,7 @@ serve() {
   # The checkpoint advertises gamma=5. DSPARK_BLOCK_SIZE defaults to 3 here
   # because the public SM120 depth-5 correctness report is still open. Raise it
   # only after comparing deterministic outputs against a non-speculative run.
-  exec python3 -m sglang.launch_server \
+  exec "${host_memory_prefix[@]}" python3 -m sglang.launch_server \
     --trust-remote-code \
     --model-path "${MODEL_PATH}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
