@@ -1155,7 +1155,13 @@ class DeepseekV4AttnBackend(
         # Per-request candidate masks the candidate_source layer publishes for the
         # index_source layers after it (torch indexer scratch).
         self.candidate_masks: Optional[List[torch.Tensor]] = None
-        self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        # The request-token table may reserve extra rows for speculative verify
+        # padding.  Those rows are storage capacity, not legal model context,
+        # and using them as the graph metadata width can exceed DSV4.1's fixed
+        # candidate window at the configured context limit.
+        self.MAX_SEQ_LEN_FOR_CAPTURE = min(
+            self.max_context_len, self.req_to_token.shape[1]
+        )
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
