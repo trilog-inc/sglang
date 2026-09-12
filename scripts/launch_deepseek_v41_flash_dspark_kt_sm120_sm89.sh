@@ -47,6 +47,7 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
+DISABLE_FLASHINFER_AUTOTUNE="${DISABLE_FLASHINFER_AUTOTUNE:-1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v41-flash}"
 SGLANG_BIND_HOST="${SGLANG_BIND_HOST:-0.0.0.0}"
 SGLANG_BIND_PORT="${SGLANG_BIND_PORT:-30000}"
@@ -171,6 +172,7 @@ serve() {
 
   local numa_args=()
   local speculative_args=()
+  local flashinfer_autotune_args=()
   if [[ -n "${KT_NUMA_NODES}" ]]; then
     local numa_nodes=()
     read -r -a numa_nodes <<<"${KT_NUMA_NODES}"
@@ -183,6 +185,9 @@ serve() {
       --speculative-draft-device cuda:1
       --speculative-moe-runner-backend marlin
     )
+  fi
+  if [[ "${DISABLE_FLASHINFER_AUTOTUNE}" == "1" ]]; then
+    flashinfer_autotune_args=(--disable-flashinfer-autotune)
   fi
 
   # The checkpoint advertises gamma=5. DSPARK_BLOCK_SIZE defaults to 3 here
@@ -211,6 +216,7 @@ serve() {
     --kt-threadpool-count "${KT_THREADPOOL_COUNT}" \
     "${numa_args[@]}" \
     --disable-shared-experts-fusion \
+    "${flashinfer_autotune_args[@]}" \
     --weight-loader-drop-cache-after-load \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
