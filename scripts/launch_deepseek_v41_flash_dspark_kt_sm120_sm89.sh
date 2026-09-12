@@ -47,6 +47,7 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
+DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
 DISABLE_FLASHINFER_AUTOTUNE="${DISABLE_FLASHINFER_AUTOTUNE:-1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-v41-flash}"
 SGLANG_BIND_HOST="${SGLANG_BIND_HOST:-0.0.0.0}"
@@ -172,6 +173,7 @@ serve() {
 
   local numa_args=()
   local speculative_args=()
+  local cuda_graph_args=()
   local flashinfer_autotune_args=()
   if [[ -n "${KT_NUMA_NODES}" ]]; then
     local numa_nodes=()
@@ -188,6 +190,15 @@ serve() {
   fi
   if [[ "${DISABLE_FLASHINFER_AUTOTUNE}" == "1" ]]; then
     flashinfer_autotune_args=(--disable-flashinfer-autotune)
+  fi
+  if [[ "${DISABLE_CUDA_GRAPH}" == "1" ]]; then
+    cuda_graph_args=(--disable-cuda-graph)
+  else
+    cuda_graph_args=(
+      --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
+      --cuda-graph-backend-decode breakable
+      --cuda-graph-backend-prefill disabled
+    )
   fi
 
   # The checkpoint advertises gamma=5. DSPARK_BLOCK_SIZE defaults to 3 here
@@ -222,9 +233,7 @@ serve() {
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --context-length "${CONTEXT_LENGTH}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
-    --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}" \
-    --cuda-graph-backend-decode breakable \
-    --cuda-graph-backend-prefill disabled \
+    "${cuda_graph_args[@]}" \
     --swa-full-tokens-ratio 0.1 \
     --reasoning-parser deepseek-v41 \
     --tool-call-parser deepseekv41 \
