@@ -23,6 +23,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
     DSparkWorkerV2,
+    _resolve_target_device,
     _should_capture_dspark_draft_cuda_graph,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +33,11 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestResolveSpeculativeDraftDevice(CustomTestCase):
+    def test_target_cuda_device_is_explicitly_indexed(self):
+        self.assertEqual(str(_resolve_target_device("cuda", 0)), "cuda:0")
+        self.assertEqual(str(_resolve_target_device("cuda", 2)), "cuda:2")
+        self.assertEqual(str(_resolve_target_device("cpu", 2)), "cpu")
+
     def test_two_device_draft_keeps_only_draft_graph_eager(self):
         self.assertFalse(
             _should_capture_dspark_draft_cuda_graph(

@@ -140,6 +140,14 @@ def _should_capture_dspark_draft_cuda_graph(
     return not target_decode_graph_disabled and draft_helper_gpu_id is None
 
 
+def _resolve_target_device(device: str | torch.device, gpu_id: int) -> torch.device:
+    """Keep an unindexed ``cuda`` target stable across draft device contexts."""
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        return torch.device("cuda", gpu_id)
+    return resolved
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -159,7 +167,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
-        self._target_device = torch.device(self.device)
+        self._target_device = _resolve_target_device(self.device, gpu_id)
         self.draft_gpu_id = (
             resolve_speculative_draft_device(server_args.speculative_draft_device)
             if server_args.speculative_draft_device is not None
