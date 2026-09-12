@@ -24,7 +24,7 @@ def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-@lru_cache(2)
+@lru_cache(4)
 def precompute_freqs_cis(
     dim,
     seqlen,
@@ -33,6 +33,7 @@ def precompute_freqs_cis(
     factor,
     beta_fast,
     beta_slow,
+    device=None,
 ) -> torch.Tensor:
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
@@ -50,11 +51,18 @@ def precompute_freqs_cis(
     def linear_ramp_factor(min, max, dim):
         if min == max:
             max += 0.001
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        linear_func = (
+            torch.arange(dim, dtype=torch.float32, device=device) - min
+        ) / (max - min)
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freqs = 1.0 / (
+        base
+        ** (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
+        )
+    )
     if original_seq_len > 0:
         low, high = find_correction_range(
             beta_fast, beta_slow, dim, base, original_seq_len
@@ -62,7 +70,7 @@ def precompute_freqs_cis(
         smooth = 1 - linear_ramp_factor(low, high, dim // 2)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen)
+    t = torch.arange(seqlen, device=device)
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis

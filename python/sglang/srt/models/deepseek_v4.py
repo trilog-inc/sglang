@@ -933,6 +933,7 @@ class MqaAttentionBase(nn.Module):
             factor=scaling.get("factor", 1.0),
             beta_fast=scaling.get("beta_fast", 32),
             beta_slow=scaling.get("beta_slow", 1),
+            device=torch.empty(0).device,
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
