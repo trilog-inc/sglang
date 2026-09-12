@@ -25,7 +25,14 @@ logger = logging.getLogger(__name__)
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
     export_name, kernel_name = tup
-    return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
+    # Newer JIT sources place their host launchers in ``sglang``. Keep the
+    # generated export in that namespace too; unqualified lookup still finds
+    # legacy launchers in the enclosing global namespace.
+    return (
+        "namespace sglang { "
+        f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name})); "
+        "}  // namespace sglang"
+    )
 
 
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
