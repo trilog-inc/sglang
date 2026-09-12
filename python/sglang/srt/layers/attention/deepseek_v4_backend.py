@@ -2599,6 +2599,14 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        # Decode/verify builders deliberately return Raw metadata so a full
+        # CUDA graph can record the upgrade.  BCG attention runs eagerly at
+        # graph breaks, where replay cannot reproduce the Python assignment
+        # from Raw to DSV4Metadata.  Materialize the graph-stable object now;
+        # replay refreshes it in place below.
+        self.init_forward_metadata_in_graph(forward_batch)
+        assert isinstance(self.forward_metadata, DSV4Metadata)
+        self._current_capture_raw = None
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
                 self._source_projection_buffers(
@@ -2651,6 +2659,12 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        self.forward_metadata = static_metadata
+        self.init_forward_metadata_in_graph(
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
+        static_metadata = self.forward_metadata
+        assert isinstance(static_metadata, DSV4Metadata)
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
@@ -4466,22 +4480,14 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
             )
 
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
-
-    def init_forward_metadata_out_graph(
-        self,
-        forward_batch: ForwardBatch,
-        in_capture: bool = False,
-    ):
+    @staticmethod
+    def _inner_forward_batch(forward_batch):
+        """Present the outer draft graph as one decode batch to each step."""
         from types import SimpleNamespace
 
-        inner_fb = SimpleNamespace(
+        return SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            # Propagate the real runtime mode so inner backends can detect IDLE
-            # and apply their idle substitution.
             actual_forward_mode=getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             ),
@@ -4495,6 +4501,17 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             spec_info=forward_batch.spec_info,
         )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        inner_fb = self._inner_forward_batch(forward_batch)
         if in_capture:
             for i in range(self.speculative_num_steps):
                 self.attn_backends[i].init_forward_metadata_out_graph(
@@ -4519,12 +4536,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        inner_fb = self._inner_forward_batch(forward_batch)
         ret = []
         for i in range(self.speculative_num_steps - 1):
             ret.append(
                 self.attn_backends[
                     i
-                ].init_forward_metadata_for_breakable_cuda_graph_capture(forward_batch)
+                ].init_forward_metadata_for_breakable_cuda_graph_capture(inner_fb)
             )
         return ret
 
@@ -4536,13 +4554,19 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
         assert len(capture_metadata) == self.speculative_num_steps - 1
+        inner_fb = self._inner_forward_batch(forward_batch)
+        static_inner_fb = self._inner_forward_batch(
+            static_forward_batch
+            if static_forward_batch is not None
+            else forward_batch
+        )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[
                 i
             ].prepare_forward_metadata_for_breakable_cuda_graph_replay(
                 capture_metadata[i],
-                forward_batch,
-                static_forward_batch=static_forward_batch,
+                inner_fb,
+                static_forward_batch=static_inner_fb,
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):

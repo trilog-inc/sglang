@@ -29,7 +29,7 @@ import contextlib
 import inspect
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -397,6 +397,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        # DSV4 attention breaks execute eagerly between BCG segments and
+        # therefore need the exact full metadata object captured for each
+        # graph shape.  The regular out-of-graph path intentionally leaves
+        # RawDecode/RawVerify metadata for an in-graph upgrade; replaying only
+        # the CUDA work cannot replay the accompanying Python object swap.
+        self.use_captured_attn_metadata = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
+            {} if self.use_captured_attn_metadata else None
+        )
 
         # --- capture --------------------------------------------------
         try:
@@ -928,6 +940,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        shape_key = self._make_graph_key(
+            self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+            stream_idx,
+            variant_label,
+        )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -938,7 +955,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            if self.use_captured_attn_metadata:
+                metadata = (
+                    attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                        forward_batch
+                    )
+                )
+                assert self.attn_metadata_buffers is not None
+                self.attn_metadata_buffers[shape_key] = metadata
+            else:
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
 
             def run_once():
                 # Graph-recordable metadata-prep hook. The unified memory pool
@@ -998,11 +1026,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -1184,7 +1207,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
+        if self.use_captured_attn_metadata:
+            assert self.attn_metadata_buffers is not None
+            graph_key = self._make_graph_key(
+                graph_size_key,
+                get_current_stream_idx() if self.enable_pdmux else None,
+                self._resolve_lora_variant(forward_batch),
+            )
+            attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                self.attn_metadata_buffers[graph_key],
+                forward_batch,
+                static_forward_batch=fb_view,
+            )
+        else:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
