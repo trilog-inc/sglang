@@ -186,6 +186,11 @@ class BaseMultimodalProcessor(ABC):
     auto_mm_io_worker_num = 4
     supports_mm_processor_concurrency = False
 
+    @property
+    def keep_mm_features_on_device(self) -> bool:
+        """Whether feature transport expects processor outputs to stay on GPU."""
+        return self.mm_feature_transport == "cuda_ipc"
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
