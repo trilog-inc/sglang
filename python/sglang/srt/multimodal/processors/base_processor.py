@@ -1364,6 +1364,22 @@ class BaseMultimodalProcessor(ABC):
             return tensor
         return tensor.cpu()
 
+    def _prepare_mm_items_for_transport(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> List[MultimodalDataItem]:
+        """Prepare processor-created items for the configured feature transport."""
+        if not self.use_cuda_ipc:
+            return mm_items
+
+        for item in mm_items:
+            if isinstance(item.feature, torch.Tensor):
+                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+            if isinstance(item.precomputed_embeddings, torch.Tensor):
+                item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                    item.precomputed_embeddings
+                )
+        return mm_items
+
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
 
