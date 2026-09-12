@@ -404,6 +404,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the CUDA work cannot replay the accompanying Python object swap.
         self.use_captured_attn_metadata = (
             isinstance(self.backend, BreakableCudaGraphBackend)
+            # A DSpark draft with no eager graph breaks is already a complete
+            # CUDA graph; its Raw->Full upgrade must remain recorded in that
+            # graph.  Only the heterogeneous target has eager attention/MoE
+            # breaks that need a live Python metadata object at replay.
+            and not model_runner.is_draft_worker
             and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (

@@ -678,6 +678,10 @@ class DSV4AttnMetadata:
             "c2_out_loc",
             "c2_topk_lengths_clamp1",
             "c2_sparse_topk_lengths",
+            # Python assigns this field while materializing Raw metadata.  BCG
+            # replay can launch the tensor work but cannot replay that object
+            # assignment, so refresh the graph-stable tensor explicitly.
+            "swa_out_cache_loc",
         ]
         reference_assign_fields = [
             "page_table",
