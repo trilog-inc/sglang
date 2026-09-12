@@ -252,6 +252,25 @@ def _flash_mla_sm120_prefill(
         if extra_indices is not None and extra_indices.dim() == 3
         else extra_indices
     )
+    extra_pbs = (
+        extra_k_cache.shape[1]
+        if extra_k_cache is not None and extra_k_cache.ndim >= 3
+        else 0
+    )
+    # This branch stores the C128 secondary cache in 128-token footer pages,
+    # while FlashInfer 0.6.18 instantiates DSV4 dual-cache prefill for a
+    # secondary page size of 64 or 2. Splitting 128 -> 64 preserves token-level
+    # indices and feeds the supported native configuration.
+    extra_kv_native = (
+        _split_kv_pages_to_64(
+            extra_kv_u8,
+            extra_pbs,
+            touched_indices=extra_idx,
+            buffer_name="extra",
+        )
+        if extra_kv_u8 is not None and extra_pbs not in (0, 2, _PBS_DST)
+        else extra_kv_u8
+    )
     output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
     _sparse_mla_sm120_paged_attention(
@@ -263,7 +282,7 @@ def _flash_mla_sm120_prefill(
         softmax_scale,
         topk_length=topk_length,
         attn_sink=attn_sink,
-        extra_kv_cache=extra_kv_u8,
+        extra_kv_cache=extra_kv_native,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
         mid_out=None,
@@ -458,6 +477,7 @@ def _split_kv_pages_to_64(
     kv_u8: torch.Tensor,
     src_pbs: int,
     touched_indices: torch.Tensor | None = None,
+    buffer_name: str = "main",
 ) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
@@ -478,7 +498,10 @@ def _split_kv_pages_to_64(
     # Pre-allocated grow-only buffer for page-split output per device.
     dev = kv_u8.device
     buffers = get_resources().buffers
-    key = f"flash_mla_sm120_split:{dev}"
+    # Main and DSV4's secondary sparse cache can both need conversion during
+    # the same call.  Keep their grow-only buffers distinct: aliasing them
+    # would overwrite the main cache before attention consumes it.
+    key = f"flash_mla_sm120_split:{buffer_name}:{dev}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
         # These persistent workspaces are mutated across calls and CUDA-graph
@@ -505,7 +528,7 @@ def _split_kv_pages_to_64(
     use_page_mask = touched_indices is not None and touched_indices.numel() > 0
     page_mask_ptr = src_2d  # Dummy pointer for the unmasked specialization.
     if use_page_mask:
-        mask_key = f"flash_mla_sm120_mask:{dev}"
+        mask_key = f"flash_mla_sm120_mask:{buffer_name}:{dev}"
         page_mask = buffers.get(mask_key)
         if page_mask is None or page_mask.shape[0] < N:
             with torch.inference_mode(False):
