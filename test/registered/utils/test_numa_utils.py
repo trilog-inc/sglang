@@ -566,5 +566,19 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             mock_mp.assert_not_called()
 
 
+class TestConfigureSubprocessAutoBind(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {"SGLANG_AUTO_NUMA_BIND": "0", "SGLANG_NUMA_BIND_V2": "1"},
+    )
+    @patch("sglang.srt.utils.numa_utils.get_numa_node_if_available")
+    @patch("sglang.srt.utils.numa_utils._mp_set_executable")
+    def test_disabled_preserves_external_policy(self, mock_mp, mock_get_node):
+        with configure_subprocess(MagicMock(), 0):
+            pass
+        mock_get_node.assert_not_called()
+        mock_mp.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

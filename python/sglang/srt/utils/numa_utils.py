@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
+    # Respect an external NUMA policy (for example ``numactl --interleave``)
+    # when automatic binding is disabled.  This is important for very large
+    # host-resident allocations that must span NUMA nodes instead of following
+    # the target GPU onto a single node.
+    if not envs.SGLANG_AUTO_NUMA_BIND.get():
+        yield
+        return
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
