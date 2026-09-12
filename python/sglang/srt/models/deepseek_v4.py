@@ -4346,9 +4346,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # Target verification can retain the request's MM metadata, but its
+        # input IDs are speculative vocabulary tokens rather than image spans.
         if (
             self.vision is not None
             and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
             and any(x is not None for x in forward_batch.mm_inputs)
         ):
