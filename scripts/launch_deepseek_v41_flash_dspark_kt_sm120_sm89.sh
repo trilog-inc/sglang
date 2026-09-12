@@ -30,24 +30,25 @@ KT_KERNEL_ROOT="${KT_KERNEL_ROOT:-}"
 KT_CPU_THREADS="${KT_CPU_THREADS:-$(physical_cpu_count)}"
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUMA_NODES="${KT_NUMA_NODES:-}"
-KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-104}"
+KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-95}"
 KT_AMX_MIN_TOKENS_PER_EXPERT="${KT_AMX_MIN_TOKENS_PER_EXPERT:-4}"
 # Keep speculative decode on the NUMA-local AMX path while steering ordinary
 # text and image prefills through the preallocated SM120 layerwise slots.  The
 # latter avoids transient host allocations that can exhaust a 768 GiB system.
 KT_GPU_PREFILL_TOKEN_THRESHOLD="${KT_GPU_PREFILL_TOKEN_THRESHOLD:-64}"
-KT_MXFP4_PREFILL_SLOTS="${KT_MXFP4_PREFILL_SLOTS:-1}"
+KT_MXFP4_PREFILL_SLOTS="${KT_MXFP4_PREFILL_SLOTS:-2}"
 KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS="${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS:-8}"
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-3}"
 DISABLE_DSPARK="${DISABLE_DSPARK:-0}"
 HOST_MEM_MIN_GIB="${HOST_MEM_MIN_GIB:-384}"
-# The target weights plus one KT MXFP4 prefill slot consume about 87.3 GiB on
-# the 96 GiB Blackwell card.  Auto-selecting two slots raises this to about
-# 94.0 GiB and requires an unsafe ~0.998 static fraction just to create a KV
-# cache.  One slot at 0.96 leaves 3.7-3.8 GiB for CUDA runtime/activations.
+# Two prepared MXFP4 slots are required to overlap the next layer's host write,
+# H2D copy, and repack with the current layer's GPU compute.  Keeping 95 routed
+# experts per layer on the target leaves room for both slots and an 8192-token
+# prefill activation at the full 262k context length.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.96}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-256}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-${CONTEXT_LENGTH}}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
 DISABLE_CUDA_GRAPH="${DISABLE_CUDA_GRAPH:-1}"
@@ -66,6 +67,7 @@ export CUDA_VISIBLE_DEVICES="${TARGET_GPU},${DRAFT_GPU}"
 export FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST:-8.9 12.0f}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9;12.0+PTX}"
 export KT_MXFP4_BACKEND=amx
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # The scheduler must retain the launcher's interleaved memory policy.  Binding
 # it back to one NUMA node can exhaust that node while hundreds of GiB remain
 # available on the other socket.
@@ -102,6 +104,16 @@ enabled = compiled and variant == "amx"
 print(f"KT CPU variant: {variant}; AMX MXFP4 kernel: {compiled}")
 sys.exit(0 if enabled else 1)
 ' || fail "KT-Kernel was not built with native AMX-BF16 support; run '$0 build-kt' first"
+}
+
+check_flashinfer_runtime() {
+  python3 -c '
+from importlib.metadata import version
+from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+actual = version("flashinfer-python").split("+", 1)[0]
+print(f"FlashInfer runtime: {actual}; SM120 sparse MLA: available")
+raise SystemExit(0 if actual == "0.6.18" else 1)
+' || fail "FlashInfer 0.6.18 with SM120 sparse MLA is required; reinstall the SGLang Python dependencies"
 }
 
 check_host() {
@@ -178,6 +190,7 @@ build_kt() {
 serve() {
   check_host
   check_kt_runtime
+  check_flashinfer_runtime
 
   local numa_args=()
   local speculative_args=()
@@ -246,6 +259,7 @@ serve() {
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --context-length "${CONTEXT_LENGTH}" \
+    --max-total-tokens "${MAX_TOTAL_TOKENS}" \
     --max-running-requests "${MAX_RUNNING_REQUESTS}" \
     "${cuda_graph_args[@]}" \
     --swa-full-tokens-ratio 0.1 \

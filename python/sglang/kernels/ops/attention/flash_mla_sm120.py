@@ -216,6 +216,62 @@ _triton_dual_prefill_fallback_logged = False
 SM120_DECODE_MAX_TOKENS = 64
 
 
+def _flash_mla_sm120_prefill(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+):
+    """Run FlashInfer's native SM120 paged kernel for prefill-sized batches."""
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+
+    q2 = q.squeeze(1) if q.ndim == 4 else q
+    num_tokens, num_heads, _ = q2.shape
+    dev = q2.device
+    kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    kv_64 = (
+        _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
+        if src_pbs != _PBS_DST
+        else kv_u8
+    )
+    extra_kv_u8 = (
+        extra_k_cache.view(torch.uint8)
+        if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
+        else extra_k_cache
+    )
+    extra_idx = (
+        extra_indices.squeeze(1)
+        if extra_indices is not None and extra_indices.dim() == 3
+        else extra_indices
+    )
+    output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
+    _sparse_mla_sm120_paged_attention(
+        q2,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_u8,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+        mid_out=None,
+        mid_lse=None,
+    )
+    return (output.unsqueeze(1), None)
+
+
 def _flashinfer_supports_dsv4_dual_prefill(
     *, num_heads: int, main_topk: int, extra_page_block_size: int
 ) -> bool:
@@ -251,6 +307,19 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_topk_length = kwargs.get("extra_topk_length")
 
     if _sm120_default_backend == "flashinfer":
+        if q.shape[0] > SM120_DECODE_MAX_TOKENS:
+            return _flash_mla_sm120_prefill(
+                q,
+                k_cache,
+                indices,
+                topk_length,
+                attn_sink,
+                head_dim_v,
+                softmax_scale,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_length,
+            )
         return _flash_mla_flashinfer(
             q,
             k_cache,
