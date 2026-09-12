@@ -211,6 +211,7 @@ serve() {
     --kt-threadpool-count "${KT_THREADPOOL_COUNT}" \
     "${numa_args[@]}" \
     --disable-shared-experts-fusion \
+    --weight-loader-drop-cache-after-load \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
     --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
     --context-length "${CONTEXT_LENGTH}" \

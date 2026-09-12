@@ -1082,6 +1082,21 @@ class ModelRunner:
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
+        # Post-load transforms (notably KTransformers expert preparation) can
+        # read checkpoint shards again after the regular safetensors iterator
+        # has already applied its per-file DONTNEED advice.  Repeat the cache
+        # eviction once the complete model load has returned so those pages do
+        # not remain resident through CUDA-graph warmup.
+        if get_model().weight_loader_drop_cache_after_load:
+            from sglang.srt.layers.engram import drop_checkpoint_page_cache
+
+            files, nbytes = drop_checkpoint_page_cache(self.model_config.model_path)
+            logger.info(
+                "Post-load checkpoint cache eviction: %d files (%.0f GiB)",
+                files,
+                nbytes / 2**30,
+            )
+
         report_online_quantization(model=self.model, server_args=self.server_args)
 
         maybe_register_debug_tensor_dump_hook(
