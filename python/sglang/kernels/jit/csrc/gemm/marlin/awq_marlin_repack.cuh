@@ -6,6 +6,8 @@
 
 #include "marlin.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -182,6 +184,8 @@ __global__ void awq_marlin_repack_kernel(
     }
   }
 }
+
+}  // namespace sglang
 #endif
 
 }  // namespace device::marlin

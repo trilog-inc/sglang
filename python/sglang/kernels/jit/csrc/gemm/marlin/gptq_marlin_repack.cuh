@@ -27,6 +27,8 @@
 
 #include "marlin.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -441,6 +443,8 @@ void mxfp4_marlin_repack(
     Panic("Unsupported direct MXFP4 repack config");
   }
 }
+
+}  // namespace sglang
 
 #undef CALL_IF_REPACK
 #undef CALL_IF_N_MAJOR_REPACK
