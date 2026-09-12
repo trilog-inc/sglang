@@ -166,8 +166,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
-        self.device = target_worker.device
-        self._target_device = _resolve_target_device(self.device, gpu_id)
+        self.device = _resolve_target_device(target_worker.device, gpu_id)
+        self._target_device = self.device
         self.draft_gpu_id = (
             resolve_speculative_draft_device(server_args.speculative_draft_device)
             if server_args.speculative_draft_device is not None
