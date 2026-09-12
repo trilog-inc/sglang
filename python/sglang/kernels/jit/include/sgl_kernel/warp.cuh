@@ -8,6 +8,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace device::warp {
 
 /// \brief Full warp active mask.
@@ -120,3 +122,5 @@ SGL_DEVICE T reduce_min(T value, mask_t active_mask = kFullMask) {
 }
 
 }  // namespace device::warp
+
+}  // namespace sglang
