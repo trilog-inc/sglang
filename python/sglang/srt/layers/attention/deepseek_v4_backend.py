@@ -394,17 +394,15 @@ def _dense_fp4_mqa_logits(
     return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
 
 
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
+def _low_ratio_source_projections(
+    layer, x, q_lora, positions, bufs, forward_batch: ForwardBatch
+):
     """Projections of a ratio-1/2 source layer, run as an eager break on the
     live rows into static buffers: the compressor's kv / score and the indexer's
     query and head weights. These GEMMs pick their algorithm by M, so at the
     bucket size their rows differ from eager; everything downstream is
     row-independent. Padded rows are zeroed."""
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-        get_tc_piecewise_forward_context,
-    )
-
-    real = get_tc_piecewise_forward_context().forward_batch.num_token_non_padded_cpu
+    real = forward_batch.num_token_non_padded_cpu
     if real is None:
         real = x.shape[0]
 
@@ -2780,7 +2778,9 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, forward_batch
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
