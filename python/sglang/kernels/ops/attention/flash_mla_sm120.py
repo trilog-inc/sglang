@@ -238,7 +238,13 @@ def _flash_mla_sm120_prefill(
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
     idx = indices.squeeze(1) if indices.dim() == 3 else indices
     kv_64 = (
-        _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
+        # Prefill metadata and cache writes can be produced on auxiliary
+        # streams. Refresh the complete compact pool here so a page-mask pass
+        # cannot expose stale page fragments to FlashInfer. Decode retains the
+        # cheaper touched-page refresh in _flash_mla_flashinfer below.
+        _split_kv_pages_to_64(
+            kv_u8, src_pbs, touched_indices=None, buffer_name="main"
+        )
         if src_pbs != _PBS_DST
         else kv_u8
     )
@@ -265,7 +271,7 @@ def _flash_mla_sm120_prefill(
         _split_kv_pages_to_64(
             extra_kv_u8,
             extra_pbs,
-            touched_indices=extra_idx,
+            touched_indices=None,
             buffer_name="extra",
         )
         if extra_kv_u8 is not None and extra_pbs not in (0, 2, _PBS_DST)
