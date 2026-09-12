@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 // Hash routing ignores scores, so an all-underflowed row would renorm 0/0 to NaN.
 constexpr float kRenormalizeSumEpsilon = 1e-20f;
@@ -215,4 +215,4 @@ struct MaskKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang
