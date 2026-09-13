@@ -79,6 +79,9 @@ class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
             )
 
         class _Graph:
+            def __init__(self, *args, **kwargs):
+                pass
+
             def replay(self):
                 pass
 
