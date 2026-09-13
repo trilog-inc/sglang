@@ -54,6 +54,16 @@ class TestResolveSpeculativeDraftDevice(CustomTestCase):
                 target_decode_graph_disabled=True, draft_helper_gpu_id=None
             )
         )
+        with patch.object(
+            dspark_worker_module.envs.SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH,
+            "get",
+            return_value=True,
+        ):
+            self.assertFalse(
+                _should_capture_dspark_draft_cuda_graph(
+                    target_decode_graph_disabled=False, draft_helper_gpu_id=None
+                )
+            )
 
     def test_logical_indices(self):
         with patch("torch.cuda.device_count", return_value=3):

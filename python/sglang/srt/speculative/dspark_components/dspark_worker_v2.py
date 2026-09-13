@@ -137,7 +137,11 @@ def _should_capture_dspark_draft_cuda_graph(
     *, target_decode_graph_disabled: bool, draft_helper_gpu_id: Optional[int]
 ) -> bool:
     """A helper-sharded draft stays eager; an independent primary draft can graph."""
-    return not target_decode_graph_disabled and draft_helper_gpu_id is None
+    return (
+        not target_decode_graph_disabled
+        and draft_helper_gpu_id is None
+        and not envs.SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH.get()
+    )
 
 
 def _resolve_target_device(device: str | torch.device, gpu_id: int) -> torch.device:
@@ -652,6 +656,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             logger.info(
                 "Keeping the helper-sharded DSpark draft eager while the target "
                 "decode CUDA graph remains enabled."
+            )
+        elif (
+            envs.SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH.get()
+            and self._decode_graph_allowed
+        ):
+            logger.info(
+                "Keeping the DSpark draft eager because "
+                "SGLANG_DSPARK_DISABLE_DRAFT_CUDA_GRAPH=1."
             )
         available_mem = 0.0
         if is_cuda() and capture_decode_cuda_graph:
