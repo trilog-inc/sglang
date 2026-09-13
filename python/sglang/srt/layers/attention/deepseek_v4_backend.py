@@ -2656,9 +2656,16 @@ class DeepseekV4AttnBackend(
             if static_forward_batch is not None
             else forward_batch
         )
-        if hasattr(replay_batch, "forward_mode") and not _get_logical_forward_mode(
-            replay_batch
-        ).is_prefill():
+        replay_mode = (
+            _get_logical_forward_mode(replay_batch)
+            if hasattr(replay_batch, "forward_mode")
+            else None
+        )
+        if replay_mode is not None and (
+            replay_mode.is_decode_or_idle()
+            or replay_mode.is_target_verify()
+            or replay_mode.is_draft_extend_v2()
+        ):
             assert isinstance(capture_metadata, DSV4Metadata)
             self.forward_metadata = capture_metadata
             return
