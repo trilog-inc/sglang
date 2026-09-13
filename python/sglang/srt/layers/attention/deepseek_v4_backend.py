@@ -2603,14 +2603,6 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
-        # Decode/verify builders deliberately return Raw metadata so a full
-        # CUDA graph can record the upgrade.  BCG attention runs eagerly at
-        # graph breaks, where replay cannot reproduce the Python assignment
-        # from Raw to DSV4Metadata.  Materialize the graph-stable object now;
-        # replay refreshes it in place below.
-        self.init_forward_metadata_in_graph(forward_batch)
-        assert isinstance(self.forward_metadata, DSV4Metadata)
-        self._current_capture_raw = None
         if self.low_ratio_prefill_graph and forward_batch.forward_mode.is_extend():
             for ratio in self.low_ratios:
                 self._source_projection_buffers(
@@ -2655,6 +2647,15 @@ class DeepseekV4AttnBackend(
         *,
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
+        # Decode BCG retains the Full object produced while recording the
+        # Raw->Full upgrade.  The caller has already refreshed the stable Raw
+        # buffers; segment 0 will replay all tensor computations into this
+        # captured Full object before the first eager attention break.
+        if not _get_logical_forward_mode(forward_batch).is_prefill():
+            assert isinstance(capture_metadata, DSV4Metadata)
+            self.forward_metadata = capture_metadata
+            return
+
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
@@ -2663,12 +2664,6 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
-        self.forward_metadata = static_metadata
-        self.init_forward_metadata_in_graph(
-            static_forward_batch if static_forward_batch is not None else forward_batch
-        )
-        static_metadata = self.forward_metadata
-        assert isinstance(static_metadata, DSV4Metadata)
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata

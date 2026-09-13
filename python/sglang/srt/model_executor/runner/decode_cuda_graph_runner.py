@@ -960,18 +960,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            if self.use_captured_attn_metadata:
-                metadata = (
-                    attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
-                        forward_batch
-                    )
-                )
-                assert self.attn_metadata_buffers is not None
-                self.attn_metadata_buffers[shape_key] = metadata
-            else:
-                attn_backend.init_forward_metadata_out_graph(
-                    forward_batch, in_capture=True
-                )
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
                 # Graph-recordable metadata-prep hook. The unified memory pool
@@ -1048,6 +1037,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                if self.use_captured_attn_metadata:
+                    # init_forward_metadata_in_graph performs a Python Raw->Full
+                    # object swap while recording the first BCG segment.  CUDA
+                    # replay reproduces its tensor work, but not that assignment;
+                    # retain the exact Full object used by the eager breaks.
+                    assert self.attn_metadata_buffers is not None
+                    self.attn_metadata_buffers[shape_key] = attn_backend.forward_metadata
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -1212,6 +1208,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        # First copy live request data into the graph-stable Raw metadata
+        # buffers, exactly as a full CUDA graph replay does.
+        attn_backend.init_forward_metadata_out_graph(fb_view)
         if self.use_captured_attn_metadata:
             assert self.attn_metadata_buffers is not None
             graph_key = self._make_graph_key(
@@ -1224,8 +1223,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch,
                 static_forward_batch=fb_view,
             )
-        else:
-            attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
