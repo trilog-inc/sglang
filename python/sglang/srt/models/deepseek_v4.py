@@ -2929,16 +2929,28 @@ class DeepseekV4DecoderLayer(nn.Module):
             # The predecessor-pre path returns ffn_pre to the following layer,
             # while residual/post/comb are read immediately after the KT seam.
             # All four therefore need graph-stable, owner-retained addresses.
-            residual = kt_graph_method.bridge_cuda_graph_tensor(
-                "ffn_residual", residual
+            # The coefficient tensors are produced on stats_stream; enqueue the
+            # copies there as well so they cannot race the producer. The BCG
+            # seam auto-joins captured side streams, and the existing join below
+            # covers eager execution.
+            bridge_stream = (
+                torch.cuda.stream(stats_stream)
+                if stats_stream is not None
+                else nullcontext()
             )
-            ffn_pre = kt_graph_method.bridge_cuda_graph_tensor("ffn_pre", ffn_pre)
-            ffn_post = kt_graph_method.bridge_cuda_graph_tensor(
-                "ffn_post", ffn_post
-            )
-            ffn_comb = kt_graph_method.bridge_cuda_graph_tensor(
-                "ffn_comb", ffn_comb
-            )
+            with bridge_stream:
+                residual = kt_graph_method.bridge_cuda_graph_tensor(
+                    "ffn_residual", residual
+                )
+                ffn_pre = kt_graph_method.bridge_cuda_graph_tensor(
+                    "ffn_pre", ffn_pre
+                )
+                ffn_post = kt_graph_method.bridge_cuda_graph_tensor(
+                    "ffn_post", ffn_post
+                )
+                ffn_comb = kt_graph_method.bridge_cuda_graph_tensor(
+                    "ffn_comb", ffn_comb
+                )
             debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
         x = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
