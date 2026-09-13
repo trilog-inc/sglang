@@ -552,12 +552,17 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend._build_forward_metadata = mock.Mock(
             side_effect=AssertionError("decode replay must use captured tensor updates")
         )
-        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        # The scheduler's outer verify batch can retain EXTEND while the static
+        # graph view carries the actual captured TARGET_VERIFY mode.
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        static_forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY
+        )
 
         backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             capture_metadata,
             forward_batch,
-            static_forward_batch=forward_batch,
+            static_forward_batch=static_forward_batch,
         )
 
         backend._build_forward_metadata.assert_not_called()

@@ -2651,8 +2651,13 @@ class DeepseekV4AttnBackend(
         # Raw->Full upgrade.  The caller has already refreshed the stable Raw
         # buffers; segment 0 will replay all tensor computations into this
         # captured Full object before the first eager attention break.
-        if hasattr(forward_batch, "forward_mode") and not _get_logical_forward_mode(
-            forward_batch
+        replay_batch = (
+            static_forward_batch
+            if static_forward_batch is not None
+            else forward_batch
+        )
+        if hasattr(replay_batch, "forward_mode") and not _get_logical_forward_mode(
+            replay_batch
         ).is_prefill():
             assert isinstance(capture_metadata, DSV4Metadata)
             self.forward_metadata = capture_metadata
@@ -2662,7 +2667,7 @@ class DeepseekV4AttnBackend(
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
+            replay_batch,
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
