@@ -108,6 +108,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     uses_per_rank_fused_shared_slots,
@@ -154,6 +155,7 @@ from sglang.srt.model_executor.runner import (
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    debug_break_graph,
     eager_on_graph,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -2552,6 +2554,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        kt_graph_method = getattr(
+            getattr(self.mlp, "experts", None), "quant_method", None
+        )
+        use_kt_graph_bridge = (
+            isinstance(kt_graph_method, KTEPWrapperMethod)
+            and forward_batch.forward_mode.is_target_verify()
+            and is_in_breakable_cuda_graph()
+        )
 
         if prev_residual is not None and use_fused:
             # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
@@ -2643,6 +2653,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        if use_kt_graph_bridge:
+            debug_break_graph(f"dsv4_attention_input[layer={self.layer_id}]")
+
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -2650,6 +2663,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=x_quant,
             )
+
+        if use_kt_graph_bridge:
+            debug_break_graph(f"dsv4_attention_output[layer={self.layer_id}]")
 
         if use_fused:
             post_attn_norm_weight = (
@@ -2705,6 +2721,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
+        if use_kt_graph_bridge:
+            # These MHC tensors are produced before KT's eager graph break and
+            # consumed after it (or by the following layer). They are not KT
+            # call arguments, so the generic break bridge cannot retain them.
+            residual = kt_graph_method.bridge_cuda_graph_tensor(
+                "ffn_residual", residual
+            )
+            post = kt_graph_method.bridge_cuda_graph_tensor("ffn_post", post)
+            comb = kt_graph_method.bridge_cuda_graph_tensor("ffn_comb", comb)
+            debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
+
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
@@ -2714,6 +2741,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            if use_kt_graph_bridge:
+                debug_break_graph(f"dsv4_decoder_output[layer={self.layer_id}]")
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -2859,6 +2888,14 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where attention consumes the previous FFN's pre-mix and
         the FFN consumes this attention's. Returns (hidden_states, ffn_pre)."""
+        kt_graph_method = getattr(
+            getattr(self.mlp, "experts", None), "quant_method", None
+        )
+        use_kt_graph_bridge = (
+            isinstance(kt_graph_method, KTEPWrapperMethod)
+            and forward_batch.forward_mode.is_target_verify()
+            and is_in_breakable_cuda_graph()
+        )
         stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
         residual = hidden_states
         x, attn_pre, attn_post, attn_comb = self._hc_mix_and_combine(
@@ -2888,12 +2925,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm=self.post_attention_layernorm,
             stats_stream=stats_stream,
         )
+        if use_kt_graph_bridge:
+            # The predecessor-pre path returns ffn_pre to the following layer,
+            # while residual/post/comb are read immediately after the KT seam.
+            # All four therefore need graph-stable, owner-retained addresses.
+            residual = kt_graph_method.bridge_cuda_graph_tensor(
+                "ffn_residual", residual
+            )
+            ffn_pre = kt_graph_method.bridge_cuda_graph_tensor("ffn_pre", ffn_pre)
+            ffn_post = kt_graph_method.bridge_cuda_graph_tensor(
+                "ffn_post", ffn_post
+            )
+            ffn_comb = kt_graph_method.bridge_cuda_graph_tensor(
+                "ffn_comb", ffn_comb
+            )
+            debug_break_graph(f"dsv4_ffn_input[layer={self.layer_id}]")
         x = self._run_moe_ffn_dp_sync(
             x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        if use_kt_graph_bridge:
+            debug_break_graph(f"dsv4_decoder_output[layer={self.layer_id}]")
         return hidden_states, ffn_pre
 
     def _run_moe_ffn_dp_sync(
