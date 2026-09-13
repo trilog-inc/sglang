@@ -18,6 +18,62 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
+    def test_capture_drains_final_warmup_before_graph_construction(self):
+        call_log = []
+        backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
+        backend._device_module = SimpleNamespace(
+            synchronize=lambda: call_log.append("synchronize")
+        )
+        backend._tp_group = SimpleNamespace(
+            barrier=lambda: call_log.append("barrier")
+        )
+        backend._debug_eager = False
+        backend._pool = None
+        backend._capture_stream = None
+        backend._shared_output_buffer = None
+        backend._use_shared_output_buffer = None
+        backend._graphs = {}
+        backend._outputs = {}
+        backend._capture_inputs = {}
+
+        def forward_fn():
+            call_log.append("forward")
+            return None
+
+        def post_warmup_hook():
+            call_log.append("post_warmup_hook")
+
+        class _Graph:
+            def __init__(self, *args, **kwargs):
+                call_log.append("graph_create")
+
+        with (
+            patch.object(bcg_module, "BreakableCUDAGraph", _Graph),
+            patch.object(
+                bcg_module,
+                "BreakableCUDAGraphCapture",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            backend.capture_one(
+                ShapeKey(size=4),
+                forward_fn,
+                post_warmup_hook=post_warmup_hook,
+            )
+
+        graph_idx = call_log.index("graph_create")
+        last_hook_idx = max(
+            i for i, value in enumerate(call_log) if value == "post_warmup_hook"
+        )
+        sync_idx = call_log.index("synchronize", last_hook_idx + 1, graph_idx)
+        barrier_idx = call_log.index("barrier", sync_idx + 1, graph_idx)
+
+        self.assertEqual(call_log.count("forward"), 3)
+        self.assertEqual(call_log.count("post_warmup_hook"), 2)
+        self.assertLess(last_hook_idx, sync_idx)
+        self.assertLess(sync_idx, barrier_idx)
+        self.assertLess(barrier_idx, graph_idx)
+
     def test_debug_eager_suspends_nested_graph_breaks(self):
         class _Graph:
             def __init__(self):

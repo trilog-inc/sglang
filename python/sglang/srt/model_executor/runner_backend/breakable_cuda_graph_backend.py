@@ -121,6 +121,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        # Drain work still in flight from the final warmup (and its hook)
+        # before entering capture.  This is especially important for models
+        # whose warmup triggers asynchronous JIT compilation or side-stream
+        # state preparation.  Align TP ranks only after the device is drained
+        # so no rank starts capturing while another is finishing warmup.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+
         graph = BreakableCUDAGraph(debug_name=f"shape={shape_key!r}")
         captured_fn = (
             eager_on_graph(True, suspend_nested_capture=True)(forward_fn)
