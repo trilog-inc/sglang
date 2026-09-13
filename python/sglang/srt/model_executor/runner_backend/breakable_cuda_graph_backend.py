@@ -123,7 +123,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
 
         graph = BreakableCUDAGraph(debug_name=f"shape={shape_key!r}")
         captured_fn = (
-            eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
+            eager_on_graph(True, suspend_nested_capture=True)(forward_fn)
+            if self._debug_eager
+            else forward_fn
         )
         size = shape_key.size
         supports_shared_output = self._supports_shared_output(warmup_out)

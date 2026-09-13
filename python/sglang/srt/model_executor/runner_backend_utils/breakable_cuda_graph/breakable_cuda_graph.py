@@ -245,7 +245,12 @@ def _format_break_label(inner: Callable, args: tuple[Any, ...]) -> str:
     return name
 
 
-def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
+def eager_on_graph(
+    enable: bool,
+    capture_stub: Optional[Callable] = None,
+    *,
+    suspend_nested_capture: bool = False,
+):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -271,10 +276,21 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             # addresses recorded. A capture_stub replaces the body during
             # capture (contents are never consumed; warmup and replay run
             # the real inner), letting rank-coupled bodies skip the work.
-            if capture_stub is not None:
-                output = capture_stub(*args, **kwargs)
-            else:
-                output = inner(*args, **kwargs)
+            # The debug-eager backend wraps the whole model in one graph break.
+            # Hide this outer capture while the model runs so nested KTEP graph
+            # breaks behave like ordinary eager calls instead of attempting to
+            # split a segment that the outer wrapper has already ended.
+            nested_token = None
+            if suspend_nested_capture:
+                nested_token = _current_capture_var.set(None)
+            try:
+                if capture_stub is not None:
+                    output = capture_stub(*args, **kwargs)
+                else:
+                    output = inner(*args, **kwargs)
+            finally:
+                if nested_token is not None:
+                    _current_capture_var.reset(nested_token)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
