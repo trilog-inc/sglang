@@ -18,6 +18,31 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
+    def test_debug_eager_can_replay_with_live_forward_batch(self):
+        backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
+        backend._debug_eager = True
+        backend._outputs = {ShapeKey(size=1): "output"}
+        captured_batch = SimpleNamespace(marker="captured")
+        live_batch = SimpleNamespace(marker="live")
+        replay_markers = []
+        backend._capture_inputs = {ShapeKey(size=1): captured_batch}
+        backend._graphs = {
+            ShapeKey(size=1): SimpleNamespace(
+                replay=lambda: replay_markers.append(captured_batch.marker)
+            )
+        }
+
+        with patch.object(
+            bcg_module,
+            "get_bool_env_var",
+            side_effect=lambda name: name
+            == "SGLANG_BCG_DEBUG_USE_LIVE_FORWARD_BATCH",
+        ):
+            output = backend.replay(ShapeKey(size=1), live_batch)
+
+        self.assertEqual(output, "output")
+        self.assertEqual(replay_markers, ["live"])
+
     def test_capture_drains_final_warmup_before_graph_construction(self):
         call_log = []
         backend = object.__new__(bcg_module.BreakableCudaGraphBackend)

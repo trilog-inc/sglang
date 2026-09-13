@@ -295,6 +295,19 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        # Diagnostic escape hatch: --debug-cuda-graph already makes the model
+        # forward an eager graph break.  Optionally replace the capture-time
+        # ForwardBatch fields with their live replay values as well, allowing
+        # graph-stable input rails to be isolated from replay-prepared attention
+        # metadata without changing the production capture path.
+        if self._debug_eager and get_bool_env_var(
+            "SGLANG_BCG_DEBUG_USE_LIVE_FORWARD_BATCH"
+        ):
+            captured_forward_batch = self._capture_inputs.get(shape_key)
+            if captured_forward_batch is not None:
+                captured_forward_batch.__dict__.update(
+                    static_forward_batch.__dict__
+                )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
