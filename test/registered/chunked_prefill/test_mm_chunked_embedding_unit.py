@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.managers import mm_utils
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
@@ -30,6 +31,12 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _single_rank_parallel_context():
+    with get_parallel().override(attn_tp_rank=0):
+        yield
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:
