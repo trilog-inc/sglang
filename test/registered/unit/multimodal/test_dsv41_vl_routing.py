@@ -44,6 +44,32 @@ def _make_moe(
 
 
 class TestDsv41VisionTopK(CustomTestCase):
+    @patch(
+        "sglang.srt.multimodal.dsv41.vl_routing.get_global_expert_distribution_recorder"
+    )
+    @patch(
+        "sglang.srt.multimodal.dsv41.vl_routing.capture_routed_experts_if_allowed"
+    )
+    @patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False)
+    def test_records_only_routed_experts(
+        self, _mock_is_cuda, mock_capture, mock_get_recorder
+    ):
+        torch.manual_seed(0)
+        logits = torch.randn(8, NUM_EXPERTS)
+        moe = _make_moe(1)
+        moe.layer_id = 7
+
+        out = vision_topk(moe, logits, None)
+
+        recorded = mock_get_recorder.return_value.on_select_experts.call_args.kwargs[
+            "topk_ids"
+        ]
+        torch.testing.assert_close(recorded, out.topk_ids[:, :-1])
+        captured = mock_capture.call_args.args
+        self.assertIs(captured[0], moe.topk.topk_config)
+        self.assertEqual(captured[1], 7)
+        torch.testing.assert_close(captured[2], out.topk_ids[:, :-1])
+
     @patch("sglang.srt.multimodal.dsv41.vl_routing.is_cuda", return_value=False)
     def test_fused_shared_expert_slot(self, _mock_is_cuda):
         torch.manual_seed(0)

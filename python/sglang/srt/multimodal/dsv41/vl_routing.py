@@ -1,11 +1,15 @@
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
+    capture_routed_experts_if_allowed,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.utils import is_cuda
@@ -18,6 +22,27 @@ def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_facto
     if num_fused_shared_experts and scaling_factor is not None:
         weights[:, -num_fused_shared_experts:] *= scaling_factor
     return weights
+
+
+def _record_routed_experts(moe, indices, num_fused_shared_experts):
+    """Run routing observers skipped by the dedicated DSV4.1 VL gate.
+
+    ``vision_topk`` does not pass through the generic ``select_experts``
+    post-processing path, so its fused CUDA result must explicitly feed the
+    routed-expert capturer and distribution recorder.  Shared slots are not
+    physical routed experts and must be excluded from both observers.
+    """
+    routed_indices = (
+        indices[:, :-num_fused_shared_experts]
+        if num_fused_shared_experts
+        else indices
+    )
+    config = moe.topk.topk_config
+    layer_id = getattr(moe, "layer_id", None)
+    capture_routed_experts_if_allowed(config, layer_id, routed_indices)
+    get_global_expert_distribution_recorder().on_select_experts(
+        topk_ids=routed_indices
+    )
 
 
 def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
@@ -52,6 +77,7 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
             num_fused_shared_experts,
             config.fused_shared_experts_scaling_factor,
         )
+        _record_routed_experts(moe, indices, num_fused_shared_experts)
         return StandardTopKOutput(weights, indices, logits)
     scores = F.softplus(logits.float()).sqrt()
     if input_ids is None:
@@ -89,4 +115,5 @@ def vision_topk(moe, logits, input_ids, num_token_non_padded=None):
     if num_token_non_padded is not None:
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
+    _record_routed_experts(moe, indices, num_fused_shared_experts)
     return StandardTopKOutput(weights, indices, logits)
