@@ -31,6 +31,12 @@ KT_CPU_THREADS="${KT_CPU_THREADS:-$(physical_cpu_count)}"
 KT_THREADPOOL_COUNT="${KT_THREADPOOL_COUNT:-2}"
 KT_NUMA_NODES="${KT_NUMA_NODES:-}"
 KT_NUM_GPU_EXPERTS="${KT_NUM_GPU_EXPERTS:-95}"
+KT_GPU_EXPERT_DEVICES="${KT_GPU_EXPERT_DEVICES:-}"
+KT_NUM_GPU_EXPERTS_PER_DEVICE="${KT_NUM_GPU_EXPERTS_PER_DEVICE:-}"
+KT_GPU_EXPERT_BACKENDS="${KT_GPU_EXPERT_BACKENDS:-}"
+KT_EXPERT_PLACEMENT_STRATEGY="${KT_EXPERT_PLACEMENT_STRATEGY:-uniform}"
+KT_EXPERT_FREQUENCY_FILE="${KT_EXPERT_FREQUENCY_FILE:-}"
+KT_EXPERT_DISTRIBUTION_RECORDER_MODE="${KT_EXPERT_DISTRIBUTION_RECORDER_MODE:-}"
 KT_AMX_MIN_TOKENS_PER_EXPERT="${KT_AMX_MIN_TOKENS_PER_EXPERT:-4}"
 # Keep speculative decode on the NUMA-local AMX path while steering ordinary
 # text and image prefills through the preallocated SM120 layerwise slots.  The
@@ -196,6 +202,9 @@ serve() {
   local speculative_args=()
   local cuda_graph_args=()
   local flashinfer_autotune_args=()
+  local expert_placement_args=()
+  local expert_topology_args=()
+  local expert_recorder_args=()
   local host_memory_prefix=()
   if [[ "${INTERLEAVE_HOST_MEMORY}" == "1" ]]; then
     command -v numactl >/dev/null 2>&1 \
@@ -228,6 +237,58 @@ serve() {
     )
   fi
 
+  case "${KT_EXPERT_PLACEMENT_STRATEGY}" in
+    uniform|front-loading|random)
+      [[ -z "${KT_EXPERT_FREQUENCY_FILE}" ]] \
+        || fail "KT_EXPERT_FREQUENCY_FILE requires KT_EXPERT_PLACEMENT_STRATEGY=frequency"
+      ;;
+    frequency)
+      [[ -n "${KT_EXPERT_FREQUENCY_FILE}" ]] \
+        || fail "KT_EXPERT_PLACEMENT_STRATEGY=frequency requires KT_EXPERT_FREQUENCY_FILE"
+      expert_placement_args+=(--kt-expert-frequency-file "${KT_EXPERT_FREQUENCY_FILE}")
+      ;;
+    *)
+      fail "KT_EXPERT_PLACEMENT_STRATEGY must be uniform, front-loading, random, or frequency"
+      ;;
+  esac
+  expert_placement_args=(
+    --kt-expert-placement-strategy "${KT_EXPERT_PLACEMENT_STRATEGY}"
+    "${expert_placement_args[@]}"
+  )
+
+  local topology_values_set=0
+  [[ -n "${KT_GPU_EXPERT_DEVICES}" ]] && ((topology_values_set += 1))
+  [[ -n "${KT_NUM_GPU_EXPERTS_PER_DEVICE}" ]] && ((topology_values_set += 1))
+  [[ -n "${KT_GPU_EXPERT_BACKENDS}" ]] && ((topology_values_set += 1))
+  if (( topology_values_set != 0 && topology_values_set != 3 )); then
+    fail "set KT_GPU_EXPERT_DEVICES, KT_NUM_GPU_EXPERTS_PER_DEVICE, and KT_GPU_EXPERT_BACKENDS together"
+  fi
+  if (( topology_values_set == 3 )); then
+    local expert_devices=()
+    local expert_counts=()
+    local expert_backends=()
+    read -r -a expert_devices <<<"${KT_GPU_EXPERT_DEVICES}"
+    read -r -a expert_counts <<<"${KT_NUM_GPU_EXPERTS_PER_DEVICE}"
+    read -r -a expert_backends <<<"${KT_GPU_EXPERT_BACKENDS}"
+    (( ${#expert_devices[@]} > 0 )) \
+      || fail "KT expert topology lists cannot be empty"
+    (( ${#expert_devices[@]} == ${#expert_counts[@]} \
+      && ${#expert_devices[@]} == ${#expert_backends[@]} )) \
+      || fail "KT expert topology lists must have the same length"
+    expert_topology_args=(
+      --kt-gpu-expert-devices "${expert_devices[@]}"
+      --kt-num-gpu-experts-per-device "${expert_counts[@]}"
+      --kt-gpu-expert-backends "${expert_backends[@]}"
+    )
+  else
+    expert_topology_args=(--kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS}")
+  fi
+  if [[ -n "${KT_EXPERT_DISTRIBUTION_RECORDER_MODE}" ]]; then
+    expert_recorder_args=(
+      --expert-distribution-recorder-mode "${KT_EXPERT_DISTRIBUTION_RECORDER_MODE}"
+    )
+  fi
+
   # The checkpoint advertises gamma=5. DSPARK_BLOCK_SIZE defaults to 3 here
   # because the public SM120 depth-5 correctness report is still open. Raise it
   # only after comparing deterministic outputs against a non-speculative run.
@@ -247,8 +308,9 @@ serve() {
     --kt-gpu-prefill-token-threshold "${KT_GPU_PREFILL_TOKEN_THRESHOLD}" \
     --kt-mxfp4-prefill-slots "${KT_MXFP4_PREFILL_SLOTS}" \
     --kt-mxfp4-prefill-host-staging-experts "${KT_MXFP4_PREFILL_HOST_STAGING_EXPERTS}" \
-    --kt-num-gpu-experts "${KT_NUM_GPU_EXPERTS}" \
-    --kt-expert-placement-strategy uniform \
+    "${expert_topology_args[@]}" \
+    "${expert_placement_args[@]}" \
+    "${expert_recorder_args[@]}" \
     --init-expert-location trivial \
     --kt-cpuinfer "${KT_CPU_THREADS}" \
     --kt-threadpool-count "${KT_THREADPOOL_COUNT}" \
