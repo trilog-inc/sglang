@@ -4646,7 +4646,9 @@ class TestGetStructureConstraint(unittest.TestCase):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
 
         parser = self._make_parser("inkling", strict=False)
-        result = parser.get_structure_constraint("auto")
+        result = parser.get_structure_constraint(
+            "auto", thinking_mode=True, parallel_tool_calls=False
+        )
 
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
@@ -4663,6 +4665,13 @@ class TestGetStructureConstraint(unittest.TestCase):
         )
         schema = tag["content"]["json_schema"]
         self.assertEqual(schema["required"], ["name", "args"])
+
+    def test_auto_detector_hook_accepts_reasoning_and_parallel_metadata(self):
+        parser = self._make_parser("deepseekv41", strict=False)
+        result = parser.get_structure_constraint(
+            "auto", thinking_mode=True, parallel_tool_calls=False
+        )
+        self.assertIsNone(result)
         self.assertFalse(schema["additionalProperties"])
 
     def test_kimi_named_tool_choice_returns_structural_tag(self):

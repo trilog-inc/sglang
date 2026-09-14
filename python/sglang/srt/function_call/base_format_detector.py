@@ -411,7 +411,10 @@ class BaseFormatDetector(ABC):
         )
 
     def get_auto_tool_call_structural_tag(
-        self, tools: Union[List[Tool], None] = None
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         """Return an always-on structural tag for automatic tool choice.
 
@@ -420,4 +423,5 @@ class BaseFormatDetector(ABC):
         token that unambiguously starts a tool payload can override this hook
         to constrain only the payload after that token.
         """
+        del tools, thinking_mode, parallel_tool_calls
         return None
