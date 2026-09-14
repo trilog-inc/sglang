@@ -286,6 +286,10 @@ serve() {
   if [[ -n "${KT_EXPERT_DISTRIBUTION_RECORDER_MODE}" ]]; then
     expert_recorder_args=(
       --expert-distribution-recorder-mode "${KT_EXPERT_DISTRIBUTION_RECORDER_MODE}"
+      # Arm the hot-path hooks before server warmup/CUDA-graph capture. Starting
+      # only through the HTTP endpoint afterwards can leave cached decode paths
+      # without recorder work and produce a valid-looking all-zero profile.
+      --enable-expert-distribution-metrics
     )
   fi
 
