@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tune DSV4 decode-sized Triton W8A8 GEMMs on an RTX 4090.
+"""Tune DSV4 decode-sized Triton W8A8 GEMMs on consumer NVIDIA GPUs.
 
 The benchmark evicts L2 before every timed launch, takes the median within
 three rounds, then selects from candidates within one percent of the fastest
@@ -35,7 +35,7 @@ DEFAULT_SHAPES = (
     (4096, 2048),
     (8192, 1024),
 )
-M_VALUES = (1, 2, 4, 8)
+DEFAULT_M_VALUES = (1, 2, 4, 8)
 DEFAULT_CONFIG = {
     "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 128,
@@ -60,7 +60,7 @@ def candidate_configs():
         }
 
 
-def launch(a, b, out, a_scale, b_scale, config):
+def launch(a, b, out, a_scale, b_scale, config, block_n, block_k):
     m, k = a.shape
     n = b.shape[0]
     grid = (
@@ -75,8 +75,8 @@ def launch(a, b, out, a_scale, b_scale, config):
         m,
         n,
         k,
-        128,
-        128,
+        block_n,
+        block_k,
         a.stride(0),
         a.stride(1),
         b.stride(1),
@@ -137,7 +137,7 @@ def choose_stable_fastest(results):
 def tune_shape(n, k, args, flush):
     tuned = {}
     measurements = {}
-    for m in M_VALUES:
+    for m in args.m_values:
         torch.manual_seed(args.seed + m)
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16).to(
             torch.float8_e4m3fn
@@ -145,17 +145,44 @@ def tune_shape(n, k, args, flush):
         b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16).to(
             torch.float8_e4m3fn
         )
-        a_scale = torch.rand(m, k // 128, device="cuda", dtype=torch.float32) + 0.5
+        a_scale = (
+            torch.rand(m, k // args.block_k, device="cuda", dtype=torch.float32)
+            + 0.5
+        )
         b_scale = (
-            torch.rand(n // 128, k // 128, device="cuda", dtype=torch.float32) + 0.5
+            torch.rand(
+                n // args.block_n,
+                k // args.block_k,
+                device="cuda",
+                dtype=torch.float32,
+            )
+            + 0.5
         )
         out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
 
-        launch(a, b, out, a_scale, b_scale, DEFAULT_CONFIG)
+        launch(
+            a,
+            b,
+            out,
+            a_scale,
+            b_scale,
+            DEFAULT_CONFIG,
+            args.block_n,
+            args.block_k,
+        )
         torch.cuda.synchronize()
         reference = out.clone()
         default_time_us = cold_l2_time_us(
-            lambda: launch(a, b, out, a_scale, b_scale, DEFAULT_CONFIG),
+            lambda: launch(
+                a,
+                b,
+                out,
+                a_scale,
+                b_scale,
+                DEFAULT_CONFIG,
+                args.block_n,
+                args.block_k,
+            ),
             flush,
             args.rounds,
             args.samples,
@@ -165,13 +192,31 @@ def tune_shape(n, k, args, flush):
         rejected = []
         for config in candidate_configs():
             try:
-                launch(a, b, out, a_scale, b_scale, config)
+                launch(
+                    a,
+                    b,
+                    out,
+                    a_scale,
+                    b_scale,
+                    config,
+                    args.block_n,
+                    args.block_k,
+                )
                 torch.cuda.synchronize()
                 torch.testing.assert_close(
                     out, reference, rtol=args.rtol, atol=args.atol
                 )
                 time_us = cold_l2_time_us(
-                    lambda: launch(a, b, out, a_scale, b_scale, config),
+                    lambda: launch(
+                        a,
+                        b,
+                        out,
+                        a_scale,
+                        b_scale,
+                        config,
+                        args.block_n,
+                        args.block_k,
+                    ),
                     flush,
                     args.rounds,
                     args.samples,
@@ -225,6 +270,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n", type=int, action="append")
     parser.add_argument("--k", type=int, action="append")
+    parser.add_argument("--m", dest="m_values", type=int, action="append")
+    parser.add_argument("--block-n", type=int, default=128)
+    parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -249,6 +297,8 @@ def parse_args():
         parser.error("--n and --k must be supplied together")
     if args.n is not None and len(args.n) != len(args.k):
         parser.error("the number of --n and --k arguments must match")
+    if args.m_values is None:
+        args.m_values = list(DEFAULT_M_VALUES)
     return args
 
 
@@ -256,9 +306,10 @@ def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if torch.cuda.get_device_capability() != (8, 9):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((8, 9), (12, 0)):
         raise RuntimeError(
-            f"this tuner targets SM89, got {torch.cuda.get_device_capability()}"
+            f"this tuner targets SM89 or SM120, got {capability}"
         )
     shapes = tuple(zip(args.n, args.k)) if args.n is not None else DEFAULT_SHAPES
     device_name = torch.cuda.get_device_name().replace(" ", "_")
@@ -268,12 +319,15 @@ def main():
     flush = torch.empty(args.flush_mib * 1024 * 1024, dtype=torch.uint8, device="cuda")
 
     for n, k in shapes:
-        if n % 128 or k % 128:
-            raise ValueError(f"N and K must be divisible by 128, got N={n}, K={k}")
+        if n % args.block_n or k % args.block_k:
+            raise ValueError(
+                f"N and K must be divisible by block shape "
+                f"[{args.block_n}, {args.block_k}], got N={n}, K={k}"
+            )
         tuned, measurements = tune_shape(n, k, args, flush)
         filename = (
             f"N={n},K={k},device_name={device_name},dtype=fp8_w8a8,"
-            "block_shape=[128, 128].json"
+            f"block_shape=[{args.block_n}, {args.block_k}].json"
         )
         output_path = args.output_dir / filename
         output_path.write_text(json.dumps(tuned, indent=4) + "\n")
