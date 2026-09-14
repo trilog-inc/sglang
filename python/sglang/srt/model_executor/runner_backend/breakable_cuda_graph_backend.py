@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -323,9 +324,30 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     name: getattr(captured_forward_batch, name, None)
                     for name in graph_owned_fields
                 }
-                captured_forward_batch.__dict__.update(
-                    static_forward_batch.__dict__
+                fields_file = os.getenv(
+                    "SGLANG_BCG_DEBUG_LIVE_FORWARD_BATCH_FIELDS_FILE"
                 )
+                if fields_file:
+                    try:
+                        with open(fields_file) as f:
+                            live_fields = {
+                                field.strip()
+                                for field in f.read().split(",")
+                                if field.strip()
+                            }
+                    except OSError:
+                        live_fields = set()
+                    for name in live_fields:
+                        if name in static_forward_batch.__dict__:
+                            setattr(
+                                captured_forward_batch,
+                                name,
+                                getattr(static_forward_batch, name),
+                            )
+                else:
+                    captured_forward_batch.__dict__.update(
+                        static_forward_batch.__dict__
+                    )
                 captured_forward_batch.__dict__.update(graph_owned)
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]

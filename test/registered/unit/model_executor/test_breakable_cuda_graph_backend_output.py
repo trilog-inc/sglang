@@ -3,7 +3,7 @@
 import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import torch
 
@@ -46,6 +46,59 @@ class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
 
         self.assertEqual(output, "output")
         self.assertEqual(replay_markers, [("live", "capture-control")])
+
+    def test_debug_eager_can_select_live_forward_batch_fields(self):
+        backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
+        backend._debug_eager = True
+        backend._outputs = {ShapeKey(size=1): "output"}
+        captured_batch = SimpleNamespace(
+            marker="captured",
+            untouched="captured",
+            dp_padding_mode="capture-control",
+        )
+        live_batch = SimpleNamespace(
+            marker="live",
+            untouched="live",
+            dp_padding_mode=None,
+        )
+        replay_values = []
+        backend._capture_inputs = {ShapeKey(size=1): captured_batch}
+        backend._graphs = {
+            ShapeKey(size=1): SimpleNamespace(
+                replay=lambda: replay_values.append(
+                    (
+                        captured_batch.marker,
+                        captured_batch.untouched,
+                        captured_batch.dp_padding_mode,
+                    )
+                )
+            )
+        }
+
+        with (
+            patch.object(
+                bcg_module,
+                "get_bool_env_var",
+                side_effect=lambda name: name
+                == "SGLANG_BCG_DEBUG_USE_LIVE_FORWARD_BATCH",
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_BCG_DEBUG_LIVE_FORWARD_BATCH_FIELDS_FILE": (
+                        "/tmp/live-fields"
+                    )
+                },
+            ),
+            patch("builtins.open", mock_open(read_data="marker")),
+        ):
+            output = backend.replay(ShapeKey(size=1), live_batch)
+
+        self.assertEqual(output, "output")
+        self.assertEqual(
+            replay_values,
+            [("live", "captured", "capture-control")],
+        )
 
     def test_capture_drains_final_warmup_before_graph_construction(self):
         call_log = []
