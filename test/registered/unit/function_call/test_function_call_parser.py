@@ -4665,6 +4665,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         )
         schema = tag["content"]["json_schema"]
         self.assertEqual(schema["required"], ["name", "args"])
+        self.assertFalse(schema["additionalProperties"])
 
     def test_auto_detector_hook_accepts_reasoning_and_parallel_metadata(self):
         parser = self._make_parser("deepseekv41", strict=False)
@@ -4672,7 +4673,6 @@ class TestGetStructureConstraint(unittest.TestCase):
             "auto", thinking_mode=True, parallel_tool_calls=False
         )
         self.assertIsNone(result)
-        self.assertFalse(schema["additionalProperties"])
 
     def test_kimi_named_tool_choice_returns_structural_tag(self):
         from sglang.srt.entrypoints.openai.protocol import (
