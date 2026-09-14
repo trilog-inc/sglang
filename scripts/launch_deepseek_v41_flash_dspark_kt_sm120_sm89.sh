@@ -84,6 +84,11 @@ export SGLANG_AUTO_NUMA_BIND="${SGLANG_AUTO_NUMA_BIND:-0}"
 export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE="${SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE:-1}"
 export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT="${SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT:-private}"
 export SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN="${SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN:-1}"
+# Candidate-block pooling can otherwise request a 1 GiB temporary while an
+# 8192-token prefill chunk already holds context-width indexer logits. Reserve
+# the upstream default for generic launches; this 96 GiB topology uses smaller
+# scratch chunks to keep long-context prefills out of the allocator cliff.
+export SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB="${SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB:-256}"
 
 fail() {
   echo "error: $*" >&2

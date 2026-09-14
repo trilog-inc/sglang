@@ -1404,6 +1404,10 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Maximum float32 scratch chunk used while pooling DSV4 prefill indexer
+    # scores into candidate blocks. The dense logits tensor is separate. Keep
+    # the upstream 1 GiB behavior unless a memory-constrained launcher opts in.
+    SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB = EnvInt(1024)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

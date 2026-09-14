@@ -347,8 +347,15 @@ def two_level_decode_logits(
     return logits.masked_fill(~published[:, : logits.shape[-1]], -torch.inf), None
 
 
-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
-_TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
+def _torch_indexer_score_budget_bytes() -> int:
+    """Bound eager candidate pooling without consuming all runtime HBM slack."""
+    budget_mb = envs.SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB.get()
+    if budget_mb <= 0:
+        raise ValueError(
+            "SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB must be positive, "
+            f"got {budget_mb}."
+        )
+    return budget_mb << 20
 
 
 def _mask_topk_scores(
@@ -3306,7 +3313,7 @@ class DeepseekV4AttnBackend(
             # the block selection tells unreachable positions apart by -inf
             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
-            step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            step = max(1, _torch_indexer_score_budget_bytes() // (lc * 4))
             masks = [
                 select_candidate_blocks(
                     scores[start : start + step],
@@ -3643,7 +3650,7 @@ class DeepseekV4AttnBackend(
             # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
             rows_per_chunk = max(
                 1,
-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
+                _torch_indexer_score_budget_bytes() // (q.shape[1] * lc * 2),
             )
             masks = [] if publish is not None else None
             for start in range(0, tok.numel(), rows_per_chunk):
