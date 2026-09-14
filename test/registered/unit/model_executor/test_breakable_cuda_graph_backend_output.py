@@ -18,6 +18,27 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
+    def test_replay_refreshes_live_non_padded_token_count(self):
+        backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
+        backend._debug_eager = False
+        backend._outputs = {ShapeKey(size=1): "output"}
+        captured_batch = SimpleNamespace(num_token_non_padded_cpu=None)
+        live_batch = SimpleNamespace(num_token_non_padded_cpu=4)
+        replay_counts = []
+        backend._capture_inputs = {ShapeKey(size=1): captured_batch}
+        backend._graphs = {
+            ShapeKey(size=1): SimpleNamespace(
+                replay=lambda: replay_counts.append(
+                    captured_batch.num_token_non_padded_cpu
+                )
+            )
+        }
+
+        output = backend.replay(ShapeKey(size=1), live_batch)
+
+        self.assertEqual(output, "output")
+        self.assertEqual(replay_counts, [4])
+
     def test_debug_eager_can_replay_with_live_forward_batch(self):
         backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
         backend._debug_eager = True

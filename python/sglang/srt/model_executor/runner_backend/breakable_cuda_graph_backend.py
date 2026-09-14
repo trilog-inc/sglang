@@ -360,6 +360,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                         static_forward_batch.__dict__
                     )
                 captured_forward_batch.__dict__.update(graph_owned)
+
+        # Python eager breaks close over the capture-time ForwardBatch object,
+        # not the live object passed to replay.  Keep the real row count live:
+        # DSV4 uses it to slice low-ratio source projections and attention.
+        # Leaving the capture-time None here makes those breaks process padded
+        # graph rows as real tokens and corrupts target-verify output.
+        captured_forward_batch = self._capture_inputs.get(shape_key)
+        if (
+            captured_forward_batch is not None
+            and static_forward_batch is not None
+            and hasattr(static_forward_batch, "num_token_non_padded_cpu")
+        ):
+            captured_forward_batch.num_token_non_padded_cpu = (
+                static_forward_batch.num_token_non_padded_cpu
+            )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
