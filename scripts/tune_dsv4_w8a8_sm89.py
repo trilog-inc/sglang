@@ -46,14 +46,16 @@ DEFAULT_CONFIG = {
 }
 
 
-def candidate_configs():
+def candidate_configs(block_k):
     for block_m, block_n, num_warps, num_stages in itertools.product(
         (16, 32, 64), (32, 64, 128), (4, 8), (2, 3, 4)
     ):
         yield {
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_n,
-            "BLOCK_SIZE_K": 128,
+            # The kernel applies one scale per K tile. A tile larger than the
+            # quantization group silently reuses the wrong scale values.
+            "BLOCK_SIZE_K": block_k,
             "GROUP_SIZE_M": 1,
             "num_warps": num_warps,
             "num_stages": num_stages,
@@ -137,6 +139,11 @@ def choose_stable_fastest(results):
 def tune_shape(n, k, args, flush):
     tuned = {}
     measurements = {}
+    default_config = {
+        **DEFAULT_CONFIG,
+        "BLOCK_SIZE_N": args.block_n,
+        "BLOCK_SIZE_K": args.block_k,
+    }
     for m in args.m_values:
         torch.manual_seed(args.seed + m)
         a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16).to(
@@ -166,7 +173,7 @@ def tune_shape(n, k, args, flush):
             out,
             a_scale,
             b_scale,
-            DEFAULT_CONFIG,
+            default_config,
             args.block_n,
             args.block_k,
         )
@@ -179,7 +186,7 @@ def tune_shape(n, k, args, flush):
                 out,
                 a_scale,
                 b_scale,
-                DEFAULT_CONFIG,
+                default_config,
                 args.block_n,
                 args.block_k,
             ),
@@ -190,7 +197,7 @@ def tune_shape(n, k, args, flush):
         )
         results = []
         rejected = []
-        for config in candidate_configs():
+        for config in candidate_configs(args.block_k):
             try:
                 launch(
                     a,
@@ -262,7 +269,7 @@ def tune_shape(n, k, args, flush):
 
     # The loader chooses the closest M key.  This key restores the old default
     # for every M >= 9, including all ordinary prefill batches.
-    tuned["9"] = DEFAULT_CONFIG
+    tuned["9"] = default_config
     return tuned, measurements
 
 

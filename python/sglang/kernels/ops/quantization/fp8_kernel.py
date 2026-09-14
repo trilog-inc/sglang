@@ -1236,16 +1236,19 @@ def get_w8a8_block_fp8_configs(
         sanitized = {}
         clamped_ms = []
         for m_key, cfg in raw.items():
-            if cfg["BLOCK_SIZE_K"] < block_k and (
-                not _is_cuda or block_k % cfg["BLOCK_SIZE_K"] != 0
+            config_block_k = cfg["BLOCK_SIZE_K"]
+            if config_block_k <= 0 or config_block_k > block_k or (
+                config_block_k < block_k
+                and (not _is_cuda or block_k % config_block_k != 0)
             ):
-                clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
+                clamped_ms.append((m_key, config_block_k))
                 cfg = {**cfg, "BLOCK_SIZE_K": block_k}
             sanitized[m_key] = cfg
         if clamped_ms:
             logger.warning(
-                "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
-                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
+                "Clamped BLOCK_SIZE_K to %d in tuned config %s for entries %s "
+                "(scale stepping requires a positive CUDA K tile no larger "
+                "than block_k and evenly dividing it).",
                 block_k,
                 json_file_name,
                 clamped_ms,
