@@ -306,6 +306,17 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             captured_forward_batch = self._capture_inputs.get(shape_key)
             if captured_forward_batch is not None:
+                capture_input_snapshots = getattr(
+                    self, "_debug_capture_input_snapshots", None
+                )
+                if capture_input_snapshots is None:
+                    capture_input_snapshots = {}
+                    self._debug_capture_input_snapshots = capture_input_snapshots
+                captured_fields = capture_input_snapshots.setdefault(
+                    shape_key, captured_forward_batch.__dict__.copy()
+                )
+                captured_forward_batch.__dict__.clear()
+                captured_forward_batch.__dict__.update(captured_fields)
                 # These fields are runner-owned graph controls/buffers rather
                 # than request data.  A live ForwardBatch legitimately leaves
                 # several of them unset; preserve their capture-time values so

@@ -100,6 +100,33 @@ class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
             [("live", "captured", "capture-control")],
         )
 
+        with (
+            patch.object(
+                bcg_module,
+                "get_bool_env_var",
+                side_effect=lambda name: name
+                == "SGLANG_BCG_DEBUG_USE_LIVE_FORWARD_BATCH",
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_BCG_DEBUG_LIVE_FORWARD_BATCH_FIELDS_FILE": (
+                        "/tmp/live-fields"
+                    )
+                },
+            ),
+            patch("builtins.open", mock_open(read_data="untouched")),
+        ):
+            backend.replay(ShapeKey(size=1), live_batch)
+
+        self.assertEqual(
+            replay_values,
+            [
+                ("live", "captured", "capture-control"),
+                ("captured", "live", "capture-control"),
+            ],
+        )
+
     def test_capture_drains_final_warmup_before_graph_construction(self):
         call_log = []
         backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
