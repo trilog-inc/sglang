@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import call, patch
 
 import torch
 
+from sglang.kernels.ops.quantization import fp8_kernel
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
@@ -114,6 +116,24 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
 
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
+    def test_config_lookup_uses_tensor_device_index(self):
+        fp8_kernel.get_w8a8_block_fp8_configs.cache_clear()
+        with (
+            patch.object(
+                fp8_kernel,
+                "get_device_name",
+                side_effect=lambda index: f"test-gpu-{index}",
+            ) as get_device_name,
+            patch.object(fp8_kernel.os.path, "exists", return_value=False),
+        ):
+            fp8_kernel.get_w8a8_block_fp8_configs(1280, 5120, 32, 32, 1)
+            fp8_kernel.get_w8a8_block_fp8_configs(1280, 5120, 32, 32, 0)
+
+        self.assertEqual(
+            get_device_name.call_args_list,
+            [call(1), call(0)],
+        )
+
     def test_w8a8_block_fp8_matmul(self):
         if _is_cuda and torch.cuda.get_device_capability()[0] < 9:
             return

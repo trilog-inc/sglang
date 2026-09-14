@@ -1201,7 +1201,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
 
 @functools.lru_cache
 def get_w8a8_block_fp8_configs(
-    N: int, K: int, block_n: int, block_k: int
+    N: int, K: int, block_n: int, block_k: int, device_index: int = 0
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the w8a8 block fp8 kernel.
@@ -1219,7 +1219,11 @@ def get_w8a8_block_fp8_configs(
 
     # First look up if an optimized configuration is available in the configs
     # directory
-    device_name = get_device_name().replace(" ", "_")
+    # A target and a heterogeneous speculative draft can execute this kernel
+    # on different GPU architectures in the same process.  Key both the
+    # lru_cache and the config filename by the tensor's actual device instead
+    # of always resolving CUDA device 0.
+    device_name = get_device_name(device_index).replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
     config_file_path = os.path.join(
@@ -1404,7 +1408,13 @@ def w8a8_block_fp8_matmul_triton(
 
     block_n, block_k = block_size
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    configs = get_w8a8_block_fp8_configs(
+        N,
+        K,
+        block_size[0],
+        block_size[1],
+        A.device.index or 0,
+    )
     if configs:
         # If an optimal configuration map has been found, look up the
         # optimal config
