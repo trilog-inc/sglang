@@ -22,13 +22,17 @@ class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
         backend = object.__new__(bcg_module.BreakableCudaGraphBackend)
         backend._debug_eager = True
         backend._outputs = {ShapeKey(size=1): "output"}
-        captured_batch = SimpleNamespace(marker="captured")
-        live_batch = SimpleNamespace(marker="live")
+        captured_batch = SimpleNamespace(
+            marker="captured", dp_padding_mode="capture-control"
+        )
+        live_batch = SimpleNamespace(marker="live", dp_padding_mode=None)
         replay_markers = []
         backend._capture_inputs = {ShapeKey(size=1): captured_batch}
         backend._graphs = {
             ShapeKey(size=1): SimpleNamespace(
-                replay=lambda: replay_markers.append(captured_batch.marker)
+                replay=lambda: replay_markers.append(
+                    (captured_batch.marker, captured_batch.dp_padding_mode)
+                )
             )
         }
 
@@ -41,7 +45,7 @@ class TestBreakableCudaGraphStructuredOutput(CustomTestCase):
             output = backend.replay(ShapeKey(size=1), live_batch)
 
         self.assertEqual(output, "output")
-        self.assertEqual(replay_markers, ["live"])
+        self.assertEqual(replay_markers, [("live", "capture-control")])
 
     def test_capture_drains_final_warmup_before_graph_construction(self):
         call_log = []

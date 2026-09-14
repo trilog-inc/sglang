@@ -305,9 +305,28 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             captured_forward_batch = self._capture_inputs.get(shape_key)
             if captured_forward_batch is not None:
+                # These fields are runner-owned graph controls/buffers rather
+                # than request data.  A live ForwardBatch legitimately leaves
+                # several of them unset; preserve their capture-time values so
+                # run_once still executes with the graph runner's contract.
+                graph_owned_fields = (
+                    "capture_hidden_mode",
+                    "dp_padding_mode",
+                    "global_dp_buffer_len",
+                    "global_forward_mode",
+                    "global_num_tokens_cpu",
+                    "global_num_tokens_for_logprob_gpu",
+                    "global_num_tokens_gpu",
+                    "next_token_logits_buffer",
+                )
+                graph_owned = {
+                    name: getattr(captured_forward_batch, name, None)
+                    for name in graph_owned_fields
+                }
                 captured_forward_batch.__dict__.update(
                     static_forward_batch.__dict__
                 )
+                captured_forward_batch.__dict__.update(graph_owned)
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
