@@ -68,6 +68,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
+    select_candidate_block_mask,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -356,6 +357,40 @@ def _torch_indexer_score_budget_bytes() -> int:
             f"got {budget_mb}."
         )
     return budget_mb << 20
+
+
+def _mask_logits_with_candidate_block_mask_(
+    logits: torch.Tensor, block_mask: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    """Mask logits in place without expanding a block mask over every token."""
+    if logits.ndim != 2 or block_mask.ndim != 2:
+        raise ValueError(
+            f"candidate masking expects rank-2 tensors, got {logits.shape=} "
+            f"and {block_mask.shape=}"
+        )
+    if logits.shape[0] != block_mask.shape[0] or block_size <= 0:
+        raise ValueError(
+            f"incompatible candidate mask: {logits.shape=}, "
+            f"{block_mask.shape=}, {block_size=}"
+        )
+
+    width = logits.shape[1]
+    full_blocks, tail = divmod(width, block_size)
+    required_blocks = full_blocks + int(tail != 0)
+    if block_mask.shape[1] < required_blocks:
+        raise ValueError(
+            f"candidate block mask is too narrow: need {required_blocks}, "
+            f"got {block_mask.shape[1]}"
+        )
+    if full_blocks:
+        logits[:, : full_blocks * block_size].view(
+            logits.shape[0], full_blocks, block_size
+        ).masked_fill_(~block_mask[:, :full_blocks, None], -torch.inf)
+    if tail:
+        logits[:, full_blocks * block_size :].masked_fill_(
+            ~block_mask[:, full_blocks : full_blocks + 1], -torch.inf
+        )
+    return logits
 
 
 def _mask_topk_scores(
@@ -3307,23 +3342,38 @@ class DeepseekV4AttnBackend(
                 continue
             scores = logits[rows, :lc]
             if publish is None:
-                scores.masked_fill_(~self.candidate_masks[b], -torch.inf)
+                candidate_mask = self.candidate_masks[b]
+                block_size = indexer.candidate_block_size
+                block_width = (lc + block_size - 1) // block_size
+                if candidate_mask.shape[1] >= lc:
+                    # Accept a dense mask published by an older/fallback path.
+                    scores.masked_fill_(~candidate_mask[:, :lc], -torch.inf)
+                else:
+                    _mask_logits_with_candidate_block_mask_(
+                        scores, candidate_mask[:, :block_width], block_size
+                    )
                 continue
             lens = compress_lens[rows, None]
             # the block selection tells unreachable positions apart by -inf
             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _torch_indexer_score_budget_bytes() // (lc * 4))
-            masks = [
-                select_candidate_blocks(
-                    scores[start : start + step],
-                    lens[start : start + step],
-                    topk_blocks=indexer.candidate_topk_blocks,
-                    block_size=indexer.candidate_block_size,
+            block_size = indexer.candidate_block_size
+            block_width = (lc + block_size - 1) // block_size
+            block_mask = torch.empty(
+                (t_len, block_width), dtype=torch.bool, device=logits.device
+            )
+            for start in range(0, t_len, step):
+                end = min(start + step, t_len)
+                block_mask[start:end].copy_(
+                    select_candidate_block_mask(
+                        scores[start:end],
+                        lens[start:end],
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=block_size,
+                    )
                 )
-                for start in range(0, t_len, step)
-            ]
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
+            publish.append(block_mask)
         if publish is not None:
             self.candidate_masks = publish
 

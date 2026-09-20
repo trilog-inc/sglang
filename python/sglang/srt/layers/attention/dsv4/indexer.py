@@ -971,16 +971,20 @@ class C4Indexer(nn.Module):
         )
 
 
-def select_candidate_blocks(
+def select_candidate_block_mask(
     logits: torch.Tensor,
     compress_lens: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Level one of the two-level top-k: a bool mask over positions keeping the
-    topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
-    in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
+    """Return one boolean per candidate block instead of per token position.
+
+    Unreachable positions are already -inf in ``logits``, so an all -inf block
+    means not reachable yet. The block holding the newest visible position is
+    always kept. Keeping this representation block-granular is important for
+    long eager prefills: expanding an 8-token block mask for an 8k x 200k score
+    matrix otherwise consumes more than 1.5 GiB.
+    """
     width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -992,7 +996,23 @@ def select_candidate_blocks(
     )
 
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
+    return torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
+    )
+
+
+def select_candidate_blocks(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor | int,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Return the historical token-granular candidate mask."""
+    width = logits.size(-1)
+    keep = select_candidate_block_mask(
+        logits,
+        compress_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
     )
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
