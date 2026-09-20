@@ -1010,10 +1010,27 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if confidence_head is None:
             return None
         bs = int(anchor_tokens.shape[0])
-        x_post_hc = x_post_hc.view(bs, self.gamma, -1)
+        # ``self.gamma`` is initialized from the draft checkpoint's block size,
+        # while the server may intentionally run a smaller speculative block via
+        # --speculative-num-draft-tokens.  The worker and sampler already use the
+        # runtime width, so derive it from their sampled-token tensor here as
+        # well.  Using the checkpoint width breaks compact-mode CUDA graph
+        # capture when those two settings differ (for example, 5 versus 3).
+        runtime_gamma = int(sampled_tokens.shape[1])
+        if x_post_hc.shape[0] != bs * runtime_gamma:
+            raise ValueError(
+                "DSpark V4 confidence input mismatch: "
+                f"x_post_hc has {x_post_hc.shape[0]} rows for batch size {bs} "
+                f"and runtime gamma {runtime_gamma}."
+            )
+        x_post_hc = x_post_hc.view(bs, runtime_gamma, -1)
         if confidence_head.with_markov:
             prev_seq = torch.cat(
-                [anchor_tokens.view(-1, 1), sampled_tokens[:, : self.gamma - 1]], dim=1
+                [
+                    anchor_tokens.view(-1, 1),
+                    sampled_tokens[:, : runtime_gamma - 1],
+                ],
+                dim=1,
             )
             markov_embed_stack = self.markov_head.get_prev_embeddings(prev_seq)
         else:
