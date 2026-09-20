@@ -1408,6 +1408,10 @@ class Envs:
     # scores into candidate blocks. The dense logits tensor is separate. Keep
     # the upstream 1 GiB behavior unless a memory-constrained launcher opts in.
     SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB = EnvInt(1024)
+    # Maximum float32 output allocated by one dense fp4 prefill-indexer call.
+    # Query rows are sliced to stay under this bound; the external prefill chunk
+    # remains unchanged, so this trades a few launches for bounded context memory.
+    SGLANG_DSV4_TORCH_INDEXER_LOGITS_BUDGET_MB = EnvInt(1024)
     # Keep the DeepSeek-V4.1 engram tables in host memory (layout below) and gather
     # rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)

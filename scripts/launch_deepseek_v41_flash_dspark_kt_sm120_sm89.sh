@@ -89,6 +89,9 @@ export SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN="${SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN:
 # the upstream default for generic launches; this 96 GiB topology uses smaller
 # scratch chunks to keep long-context prefills out of the allocator cliff.
 export SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB="${SGLANG_DSV4_TORCH_INDEXER_SCORE_BUDGET_MB:-256}"
+# Dense fp4 indexer logits grow with query rows times visible context. Keep the
+# public 8192-token prefill chunk while slicing that internal matrix to 1 GiB.
+export SGLANG_DSV4_TORCH_INDEXER_LOGITS_BUDGET_MB="${SGLANG_DSV4_TORCH_INDEXER_LOGITS_BUDGET_MB:-1024}"
 
 fail() {
   echo "error: $*" >&2

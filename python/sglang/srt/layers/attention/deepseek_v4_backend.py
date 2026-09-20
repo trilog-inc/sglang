@@ -359,6 +359,17 @@ def _torch_indexer_score_budget_bytes() -> int:
     return budget_mb << 20
 
 
+def _torch_indexer_logits_budget_bytes() -> int:
+    """Bound each dense fp4 indexer output independently of prefill chunk size."""
+    budget_mb = envs.SGLANG_DSV4_TORCH_INDEXER_LOGITS_BUDGET_MB.get()
+    if budget_mb <= 0:
+        raise ValueError(
+            "SGLANG_DSV4_TORCH_INDEXER_LOGITS_BUDGET_MB must be positive, "
+            f"got {budget_mb}."
+        )
+    return budget_mb << 20
+
+
 def _mask_logits_with_candidate_block_mask_(
     logits: torch.Tensor, block_mask: torch.Tensor, block_size: int
 ) -> torch.Tensor:
@@ -2901,7 +2912,6 @@ class DeepseekV4AttnBackend(
                 q_lora[:num_local],
                 positions[:num_local].to(torch.int64),
                 forward_batch,
-                torch.tensor(q_lens_cpu, dtype=torch.int32, device=x.device),
                 q_lens_cpu,
             )
 
@@ -3228,17 +3238,16 @@ class DeepseekV4AttnBackend(
     ) -> None:
         tail = self.forward_metadata.late_layer_tail
         if tail is not None:
-            q_lens, q_lens_cpu = tail.extend_seq_lens, tail.extend_seq_lens_cpu
+            q_lens_cpu = tail.extend_seq_lens_cpu
         else:
-            q_lens = forward_batch.extend_seq_lens
             q_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
         assert q_lens_cpu is not None
         self._low_ratio_index_topk_dense(
-            layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+            layer, x, q_lora, pos, forward_batch, q_lens_cpu
         )
 
     def _low_ratio_index_topk_dense(
-        self, layer, x, q_lora, pos, forward_batch, q_lens, q_lens_cpu
+        self, layer, x, q_lora, pos, forward_batch, q_lens_cpu
     ) -> None:
         """Dense fp4 indexer over rows laid out request after request, `q_lens[b]` each."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
@@ -3289,91 +3298,118 @@ class DeepseekV4AttnBackend(
         q_sf = q_sf.view(num_tokens, num_heads)
         weights = indexer.head_weights(x).float()
         compress_lens = ((pos + 1) // ratio).to(torch.int32)
-        ks = torch.repeat_interleave(
-            torch.tensor(starts, dtype=torch.int32, device=device),
-            q_lens.to(torch.int64),
-            output_size=num_tokens,
-        )
-        logits = _dense_fp4_mqa_logits(
-            (q_fp4, q_sf),
-            (k_fp4, k_sf),
-            weights,
-            ks,
-            ks + compress_lens,
-            # the fused top-k reads score rows through 16-byte vectors
-            ceil_align(max(lc_per_req), 4),
-        )
-        if indexer.is_candidate_source or indexer.uses_candidates:
-            self._publish_or_consume_candidates(
-                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-            )
         topk = indexer.index_topk
-        selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = _mask_topk_scores(logits, selected, ks)
-        # ascending positions, padding last: the layout the consumers expect
-        unselected = torch.iinfo(torch.int32).max
-        selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
-        chosen = selected != unselected
-        page_indices[:num_tokens, :topk] = torch.where(
-            chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
-        ).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:num_tokens, :topk] = torch.where(
-                chosen, selected - ks[:, None], -1
-            )
-
-    def _publish_or_consume_candidates(
-        self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-    ) -> None:
-        """Level one of the two-level top-k: publish block masks, or sink non-candidates."""
         publish = [] if indexer.is_candidate_source else None
-        j = torch.arange(logits.shape[1], device=logits.device)
         tok_start = 0
         for b, (lc, t_len) in enumerate(zip(lc_per_req, q_lens_cpu)):
-            rows = slice(tok_start, tok_start + t_len)
-            tok_start += t_len
             if lc == 0 or t_len == 0:
                 if publish is not None:
                     publish.append(empty_mask)
+                tok_start += t_len
                 continue
-            scores = logits[rows, :lc]
-            if publish is None:
-                candidate_mask = self.candidate_masks[b]
-                block_size = indexer.candidate_block_size
-                block_width = (lc + block_size - 1) // block_size
-                if candidate_mask.shape[1] >= lc:
-                    # Accept a dense mask published by an older/fallback path.
-                    scores.masked_fill_(~candidate_mask[:, :lc], -torch.inf)
-                else:
-                    _mask_logits_with_candidate_block_mask_(
-                        scores, candidate_mask[:, :block_width], block_size
-                    )
-                continue
-            lens = compress_lens[rows, None]
-            # the block selection tells unreachable positions apart by -inf
-            scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
-            # the block selection pads and pools a copy of its rows; bound that copy
-            step = max(1, _torch_indexer_score_budget_bytes() // (lc * 4))
+            # Score only this request's K slice. Its local column j maps to
+            # k_slots[k_start + j], exactly as the old global offset did.
+            k_start = starts[b]
+            k_fp4_b = k_fp4[k_start : k_start + lc]
+            k_sf_b = k_sf[k_start : k_start + lc]
+            score_width = ceil_align(lc, 4)
+            rows_per_chunk = max(
+                1, _torch_indexer_logits_budget_bytes() // (score_width * 4)
+            )
             block_size = indexer.candidate_block_size
             block_width = (lc + block_size - 1) // block_size
-            block_mask = torch.empty(
-                (t_len, block_width), dtype=torch.bool, device=logits.device
+            block_mask = (
+                torch.empty((t_len, block_width), dtype=torch.bool, device=device)
+                if publish is not None
+                else None
             )
-            for start in range(0, t_len, step):
-                end = min(start + step, t_len)
-                block_mask[start:end].copy_(
-                    select_candidate_block_mask(
-                        scores[start:end],
-                        lens[start:end],
-                        topk_blocks=indexer.candidate_topk_blocks,
-                        block_size=block_size,
-                    )
+            candidate_mask = (
+                self.candidate_masks[b]
+                if indexer.uses_candidates and not indexer.is_candidate_source
+                else None
+            )
+            columns = torch.arange(lc, device=device)
+
+            for row_start in range(0, t_len, rows_per_chunk):
+                row_end = min(row_start + rows_per_chunk, t_len)
+                rows = slice(tok_start + row_start, tok_start + row_end)
+                row_lens = compress_lens[rows]
+                local_offsets = torch.zeros_like(row_lens)
+                logits = _dense_fp4_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    (k_fp4_b, k_sf_b),
+                    weights[rows],
+                    local_offsets,
+                    row_lens,
+                    # the fused top-k reads score rows through 16-byte vectors
+                    score_width,
                 )
-            publish.append(block_mask)
+                scores = logits[:, :lc]
+                if block_mask is not None:
+                    lens_col = row_lens[:, None]
+                    # Block selection must distinguish unreachable positions
+                    # from low-but-valid scores before max pooling.
+                    scores.masked_fill_(columns[None, :] >= lens_col, -torch.inf)
+                    # Pooling pads and copies score rows, so independently cap
+                    # that temporary below the dense-logits allocation.
+                    pool_step = max(
+                        1, _torch_indexer_score_budget_bytes() // (lc * 4)
+                    )
+                    for pool_start in range(0, row_end - row_start, pool_step):
+                        pool_end = min(pool_start + pool_step, row_end - row_start)
+                        block_mask[
+                            row_start + pool_start : row_start + pool_end
+                        ].copy_(
+                            select_candidate_block_mask(
+                                scores[pool_start:pool_end],
+                                lens_col[pool_start:pool_end],
+                                topk_blocks=indexer.candidate_topk_blocks,
+                                block_size=block_size,
+                            )
+                        )
+                elif candidate_mask is not None:
+                    candidate_rows = candidate_mask[row_start:row_end]
+                    if candidate_rows.shape[1] >= lc:
+                        # Accept a dense mask published by an older/fallback path.
+                        scores.masked_fill_(~candidate_rows[:, :lc], -torch.inf)
+                    else:
+                        _mask_logits_with_candidate_block_mask_(
+                            scores,
+                            candidate_rows[:, :block_width],
+                            block_size,
+                        )
+
+                selected = torch.empty(
+                    (row_end - row_start, topk), dtype=torch.int32, device=device
+                )
+                topk_transform_ragged_v2(
+                    logits,
+                    row_lens,
+                    out_offsets=local_offsets,
+                    out_indices=selected,
+                )
+                if candidate_mask is not None:
+                    selected = _mask_topk_scores(logits, selected)
+                # Ascending request-local positions, padding last: the layout
+                # expected by the sparse attention consumers.
+                unselected = torch.iinfo(torch.int32).max
+                selected = (
+                    selected.masked_fill(selected < 0, unselected)
+                    .sort(dim=-1)
+                    .values
+                )
+                chosen = selected != unselected
+                page_indices[rows, :topk] = torch.where(
+                    chosen,
+                    k_slots[k_start + selected.clamp_max(lc - 1)],
+                    -1,
+                ).to(torch.int32)
+                if raw_indices is not None:
+                    raw_indices[rows, :topk] = torch.where(chosen, selected, -1)
+
+            if publish is not None:
+                publish.append(block_mask)
+            tok_start += t_len
         if publish is not None:
             self.candidate_masks = publish
 
