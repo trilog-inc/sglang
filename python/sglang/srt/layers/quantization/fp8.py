@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -55,11 +56,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    flashinfer_mxfp8_blockscaled_linear,
     get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
@@ -468,6 +471,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
+        self.w8a8_block_fp8_mxfp8_linear = None
         self.w8a8_mxfp8_linear = None
         if self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
@@ -477,6 +481,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
                 and self.quant_config.scale_fmt == "ue8m0",
             )
+            if (
+                self.weight_block_size == [32, 32]
+                and isinstance(self.quant_config, Fp8Config)
+                and self.quant_config.scale_fmt == "ue8m0"
+            ):
+                # Upstream #40039 routes every 32-wide UE8M0 linear through
+                # FlashInfer MXFP8.  On SM120 that regresses six of the seven
+                # V4.1 projection shapes, so preparation below is restricted to
+                # the one shape measured faster across decode and prefill.
+                self.w8a8_block_fp8_mxfp8_linear = partial(
+                    flashinfer_mxfp8_blockscaled_linear, backend="cutlass"
+                )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -717,6 +733,8 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+        self._prepare_sm120_block_fp8_mxfp8(layer)
+
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
@@ -728,6 +746,30 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+
+    def _prepare_sm120_block_fp8_mxfp8(self, layer: Module) -> None:
+        """Prepare the profitable SM120 MXFP8 view of V4.1 q-lora weights."""
+        layer.block_fp8_mxfp8_ready = False
+        if self.w8a8_block_fp8_mxfp8_linear is None:
+            return
+        if tuple(layer.weight.shape) != (1792, 5120) or not layer.weight.is_cuda:
+            return
+        if torch.cuda.get_device_capability(layer.weight.device) != (12, 0):
+            return
+
+        from flashinfer import block_scale_interleave
+
+        scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+            layer.weight_scale_inv.data,
+            tuple(layer.weight.shape),
+            self.weight_block_size,
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight_scale_inv_mxfp8_swizzled",
+            block_scale_interleave(scale_u8).contiguous(),
+        )
+        layer.block_fp8_mxfp8_ready = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -1016,6 +1058,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias,
                     x.dtype,
                     True,  # is_vnni
+                )
+
+            if getattr(layer, "block_fp8_mxfp8_ready", False) and not isinstance(
+                x, tuple
+            ):
+                return self.w8a8_block_fp8_mxfp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv_mxfp8_swizzled,
+                    input_scale=None,
+                    bias=bias,
                 )
 
             if isinstance(x, tuple):

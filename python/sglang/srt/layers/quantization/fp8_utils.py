@@ -539,6 +539,38 @@ def dispatch_w8a8_block_fp8_linear(
     return _dispatch_auto_backend()
 
 
+def block_fp8_scale_to_mxfp8_e8m0(
+    weight_scale: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    weight_block_size: List[int],
+) -> torch.Tensor:
+    """Expand 32x32 block-FP8 power-of-two scales to per-row UE8M0.
+
+    DeepSeek-V4.1 stores one FP32 scale for every 32x32 weight block.  MXFP8
+    consumes the same exponent once per row and 32-wide K group, so the values
+    can be expanded without requantizing the weights.
+    """
+    n, k = weight_shape
+    block_n, block_k = weight_block_size
+    if block_k != 32 or k % 32 != 0:
+        raise ValueError(
+            f"MXFP8 needs a 32-wide K block and K % 32 == 0, got {block_k=} {k=}"
+        )
+    scale = weight_scale.detach().float().contiguous()
+    expected_shape = (ceil_div(n, block_n), k // 32)
+    if tuple(scale.shape) != expected_shape:
+        raise ValueError(
+            f"unexpected block scale shape {tuple(scale.shape)} for weight {weight_shape}"
+        )
+    bits = scale.view(torch.int32)
+    if not bool(torch.all((bits & 0x7FFFFF) == 0)) or not bool(torch.all(scale > 0)):
+        raise ValueError(
+            "block scales are not positive powers of two; cannot encode as UE8M0"
+        )
+    e8m0 = (bits >> 23).to(torch.uint8)
+    return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
     if backend.is_deep_gemm():
@@ -1383,6 +1415,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8."""
     input_2d = input.view(-1, input.shape[-1]).contiguous()
@@ -1414,7 +1447,14 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+    if backend is None:
+        selected = get_fp8_gemm_runner_backend()
+        if selected.is_flashinfer_trtllm():
+            backend = "trtllm"
+        elif selected.is_flashinfer_cutlass():
+            backend = "cutlass"
+
+    if backend == "trtllm":
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1425,7 +1465,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="trtllm",
         )
-    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+    elif backend == "cutlass":
         weight_scale_t = (
             weight_scale.contiguous().t()
             if weight_scale.ndim == 2
@@ -1439,6 +1479,11 @@ def flashinfer_mxfp8_blockscaled_linear(
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
             backend="cutlass",
+        )
+    else:
+        raise RuntimeError(
+            "FlashInfer MXFP8 requires the CUTLASS or TensorRT-LLM backend, "
+            f"got {backend!r}"
         )
 
     if bias is not None:
